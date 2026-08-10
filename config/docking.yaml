@@ -68,6 +68,15 @@ docking_node:
     final_servo.max_yaw_speed: 0.2            # rad/s — (legacy)
     final_servo.distance: 0.20                # m — enter FINAL_SERVO within this distance
 
+    # ── Final Straight (两阶段停泊) ──
+    # 阶段1(APPROACH): 正常带角度修正的接近。
+    # 阶段2(直行): 纯直行前进, 不修正 yaw/横向, 如同停车入库。
+    # 当 dist ≤ start_distance 且航向方阵误差 ≤ yaw_threshold_deg 时激活阶段2。
+    # 到 start_distance 若航向仍超差, 阶段1继续转向修正直到对准, 然后才直行。
+    final_straight.enable: true                       # 两阶段停泊开关; false 恢复单阶段
+    final_straight.start_distance: 0.85               # m — 直行阶段起点 (须 > dock_target.distance)
+    final_straight.yaw_threshold_deg: 3.0             # deg — 进入直行阶段的航向门槛 (方阵误差, 3°@55cm≈1.6cm 横向)
+
     # ── Docking Tolerance ──
     tolerance.position_m: 0.05                # m — 前后 ±5cm 视为到位
     tolerance.yaw_deg: 10.0                   # degrees — ±10° 视为对准

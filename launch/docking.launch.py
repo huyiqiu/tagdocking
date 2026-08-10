@@ -50,6 +50,9 @@ def launch_setup(context):
     cmd_vel_topic = LaunchConfiguration('cmd_vel_topic').perform(context)
     base_type = LaunchConfiguration('base_type').perform(context)
     navigation_enable = LaunchConfiguration('navigation_enable').perform(context).lower() == 'true'
+    dock_distance = float(LaunchConfiguration('dock_distance').perform(context))
+    final_straight_distance = float(LaunchConfiguration('final_straight_distance').perform(context))
+    final_straight_yaw_deg = float(LaunchConfiguration('final_straight_yaw_deg').perform(context))
 
     pkg_share = get_package_share_directory('tagdocking')
     config_path = os.path.join(pkg_share, 'config', 'docking.yaml')
@@ -122,6 +125,10 @@ def launch_setup(context):
                 'base.cmd_vel_topic': cmd_vel_topic,
                 'base.type': base_type,
                 'navigation.enable': navigation_enable,
+                # 两阶段停泊参数 (覆盖 yaml)
+                'dock_target.distance': dock_distance,
+                'final_straight.start_distance': final_straight_distance,
+                'final_straight.yaw_threshold_deg': final_straight_yaw_deg,
             },
         ],
         output='screen',
@@ -151,5 +158,11 @@ def generate_launch_description():
                              description='Chassis type: diff_drive, omni, quadruped'),
         DeclareLaunchArgument('navigation_enable', default_value='true',
                              description='Enable Nav2 pre-docking'),
+        DeclareLaunchArgument('dock_distance', default_value='0.55',
+                             description='最终停泊距离 (m), 底盘距 tag'),
+        DeclareLaunchArgument('final_straight_distance', default_value='0.85',
+                             description='直行阶段起点距离 (m), 到此距离后纯直行不再调角 (须 > dock_distance)'),
+        DeclareLaunchArgument('final_straight_yaw_deg', default_value='3.0',
+                             description='进入直行阶段的航向门槛 (deg, 方阵误差)'),
         OpaqueFunction(function=launch_setup),
     ])

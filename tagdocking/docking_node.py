@@ -274,6 +274,11 @@ class DockingNode(Node):
         self.declare_parameter('final_servo.max_linear_speed', 0.05)
         self.declare_parameter('final_servo.max_yaw_speed', 0.2)
 
+        # Final straight (两阶段停泊: 85cm 对准 → 55cm 纯直行)
+        self.declare_parameter('final_straight.enable', True)
+        self.declare_parameter('final_straight.start_distance', 0.85)
+        self.declare_parameter('final_straight.yaw_threshold_deg', 3.0)
+
         # Stop-and-go params
         self.declare_parameter('stopgo.lateral_threshold', 0.04)
         self.declare_parameter('stopgo.yaw_threshold_deg', 3.0)
@@ -678,8 +683,32 @@ class DockingNode(Node):
             return
 
         yaw_tol = math.radians(self._p('tolerance.yaw_deg'))
-        seq = self._planner.plan_sequence(
-            tag_pose.dist, tag_pose.lat, tag_pose.normal, yaw_tol=yaw_tol)
+
+        # ── 两阶段停泊门控 ──────────────────────────────────────
+        # 阶段1(带角度修正)为默认。阶段2(纯直行, 不修 yaw/横向)在 dist ≤ start_distance
+        # 且航向已方阵对准(方阵误差 ≤ 专用门槛)时激活。到 start_distance 若航向仍超差,
+        # 阶段1继续转向修正直到对准, 然后才直行——「先对准再入库」, 不会在歪着时硬直行。
+        # start_distance ≤ target_distance 视为误配置, 静默回退单阶段。
+        straight_enabled = self._p('final_straight.enable')
+        straight_start = self._p('final_straight.start_distance')
+        straight_yaw_tol = math.radians(self._p('final_straight.yaw_threshold_deg'))
+
+        straight_active = False
+        if straight_enabled and straight_start > target_distance:
+            bearing = math.atan2(tag_pose.lat, tag_pose.dist)
+            square_err = abs(normalize_angle((tag_pose.normal + math.pi) - bearing))
+            if tag_pose.dist <= straight_start and square_err <= straight_yaw_tol:
+                straight_active = True
+
+        if straight_active:
+            seq = self._planner.plan_straight(tag_pose.dist)
+            self.get_logger().info(
+                f'走停 直线阶段 iter={self._maneuver_iters}: '
+                f'距离={tag_pose.dist:.3f}m → 目标={target_distance:.3f}m',
+                throttle_duration_sec=2.0)
+        else:
+            seq = self._planner.plan_sequence(
+                tag_pose.dist, tag_pose.lat, tag_pose.normal, yaw_tol=yaw_tol)
 
         # 移动前打印：二维码相对位姿 + 完整规划路径，仅凭日志即可诊断丢标问题。
         # bearing = 指向二维码的方向；normal = 二维码朝外法线方向；
