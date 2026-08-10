@@ -148,6 +148,9 @@ class DockingNode(Node):
         self._maneuver_queue: list = []
         self._maneuver_active = False
         self._maneuver_iters = 0
+        # 直行失败标志：进入直行距离时方位误差超门槛只判一次（首次进入），
+        # 防止直行中方位自然漂动误触发失败。_reset_maneuver 时清零。
+        self._straight_failed = False
         # 检测冻结标志：机动（盲转/盲走）期间为 True，此时 _on_detections 直接
         # 丢弃所有帧（运动模糊、视野边缘的坏帧绝不能污染规划用的位姿）。停稳
         # settle 结束后解冻，并清空滤波/缓冲，强制下一次规划只用停稳后的新鲜帧。
@@ -160,11 +163,13 @@ class DockingNode(Node):
         self._max_maneuver_iters = 40
 
         # Recovery-search state: remember which side the tag was last seen on
-        # (sign of lat) so a bidirectional sweep starts toward it, and track the
-        # rotate-phase boundary to alternate + widen each sweep.
+        # (sign of lat) so the angle-stepped sweep starts toward it. The node
+        # rotates a fixed angle (odometry-closed), stops, detects, repeats —
+        # sweeping a full 360° in one direction until the tag is found.
         self._last_seen_lat = 0.0
-        self._search_sweep_idx = 0
-        self._search_last_phase_start = 0
+        self._search_step = 0
+        self._search_detect_start = 0
+        self._search_direction = 1.0
 
         # Adaptive detection-rate tracking. The pose-buffer staleness window is
         # derived from the measured inter-detection interval, so the controller
@@ -255,7 +260,8 @@ class DockingNode(Node):
 
         # Search
         self.declare_parameter('search.angular_speed', 0.3)
-        self.declare_parameter('search.rotate_time_sec', 0.8)
+        self.declare_parameter('search.step_angle_deg', 30.0)
+        self.declare_parameter('search.rotate_time_sec', 0.8)  # deprecated, unused
         self.declare_parameter('search.pause_time_sec', 1.5)
         self.declare_parameter('search.hold_time_sec', 0.5)
         self.declare_parameter('search.search_direction', 1)
@@ -566,13 +572,14 @@ class DockingNode(Node):
             self._executor.cancel()
             self._planner.reset()
             self._reset_maneuver()
-        # Entering SEARCH_TAG (fresh start or re-lock): restart the widening
-        # bidirectional sweep from scratch so each search begins narrow and
-        # grows, rather than resuming a wide sweep left over from a prior attempt.
+        # 出 SEARCH_TAG：终止可能正在转的搜索步 + 解冻
+        if (self._prev_state == DockingState.SEARCH_TAG
+                and state != DockingState.SEARCH_TAG):
+            self._reset_search()
+        # 入 SEARCH_TAG (全新开始或丢标重锁)：从头开始角度步进扫描
         if (state == DockingState.SEARCH_TAG
                 and self._prev_state != DockingState.SEARCH_TAG):
-            self._search_sweep_idx = 0
-            self._search_last_phase_start = 0
+            self._reset_search()
         self._prev_state = state
 
         # ── Per-state behaviour ───────────────────────────────────
@@ -580,18 +587,7 @@ class DockingNode(Node):
             self._adapter.publish_stop()
 
         elif state == DockingState.SEARCH_TAG:
-            vx, vy, wz = self._compute_search_velocity(now_ns)
-            if abs(wz) > 0:
-                # Rotate IN PLACE to find the tag. No forward creep here: search
-                # is a large continuous rotation (momentum already beats static
-                # friction), and creeping forward over a 60 s search would walk
-                # the robot across the room. Arc-creep is only for the small,
-                # stall-prone APPROACH turns.
-                self._adapter.publish_turn(wz)
-            elif abs(vx) > 0:
-                self._adapter.publish_jog(vx)
-            else:
-                self._adapter.publish_stop()
+            self._run_search(tag_visible, tag_pose, base_type, now_ns)
 
         elif state in (DockingState.ALIGN, DockingState.APPROACH,
                        DockingState.FINAL_SERVO):
@@ -685,19 +681,38 @@ class DockingNode(Node):
         yaw_tol = math.radians(self._p('tolerance.yaw_deg'))
 
         # ── 两阶段停泊门控 ──────────────────────────────────────
-        # 阶段1(带角度修正)为默认。阶段2(纯直行, 不修 yaw/横向)在 dist ≤ start_distance
-        # 且航向已方阵对准(方阵误差 ≤ 专用门槛)时激活。到 start_distance 若航向仍超差,
-        # 阶段1继续转向修正直到对准, 然后才直行——「先对准再入库」, 不会在歪着时硬直行。
+        # 阶段1(带角度修正)为默认：用 plan_sequence 转向对准+前进, 尽量对准。
+        # 阶段2(纯直行, 不修 yaw/横向)：dist ≤ start_distance 即无条件激活——
+        # 进入直行距离后像停车入库, 不再打方向(再往前已无空间调位姿)。
+        # 进入时做一次性失败检查：方位误差超 yaw_threshold_deg(默认10°)说明
+        # 对准过差、入库会撞偏 → 报 MOTION_FAILED。_straight_failed 保证只判一次,
+        # 防止直行中方位自然漂动(tag 抖动+车体微偏)误触发失败。
         # start_distance ≤ target_distance 视为误配置, 静默回退单阶段。
         straight_enabled = self._p('final_straight.enable')
         straight_start = self._p('final_straight.start_distance')
         straight_yaw_tol = math.radians(self._p('final_straight.yaw_threshold_deg'))
 
+        # 方位误差用车体朝向(bearing=atan2(lat,dist))，不用方阵误差(square_err)。
+        # square_err 依赖 tag 法线(normal)，而 normal 是 AprilTag 最不可靠的自由度
+        # ——近场时在 ±180° 附近抖动，经 ±π 归一化后误差被放大到 4~5°，即使车已
+        # 正对标签(方位角<1°)也会误判超差。bearing 只取决于标签在画面中的位置，稳定可靠。
+        bearing = math.atan2(tag_pose.lat, tag_pose.dist)
+        bearing_err = abs(normalize_angle(bearing))
+
         straight_active = False
         if straight_enabled and straight_start > target_distance:
-            bearing = math.atan2(tag_pose.lat, tag_pose.dist)
-            square_err = abs(normalize_angle((tag_pose.normal + math.pi) - bearing))
-            if tag_pose.dist <= straight_start and square_err <= straight_yaw_tol:
+            if tag_pose.dist <= straight_start:
+                # 进入直行距离 → 无条件直行（不再调角）。
+                # 仅首次进入时做一次失败检查：方位误差超门槛 → 报导航失败。
+                if not self._straight_failed and bearing_err > straight_yaw_tol:
+                    self._straight_failed = True
+                    self.get_logger().error(
+                        f'直行失败：进入直行距离({tag_pose.dist:.2f}m)时方位误差 '
+                        f'{math.degrees(bearing_err):.1f}° > 门槛 '
+                        f'{math.degrees(straight_yaw_tol):.1f}°，对准过差无法入库')
+                    self._sm.fail()
+                    self._adapter.publish_stop()
+                    return
                 straight_active = True
 
         if straight_active:
@@ -728,6 +743,8 @@ class DockingNode(Node):
             f'方位={bearing_deg:+.1f}° 法线={math.degrees(tag_pose.normal):+.1f}° '
             f'| 原始 距离={self._raw_dist:.3f} 横向={self._raw_lat:+.3f} '
             f'法线={math.degrees(self._raw_normal):+.1f}° '
+            f'| 直行={straight_active} 方位误差={math.degrees(bearing_err):.1f}°'
+            f'(失败门槛{math.degrees(straight_yaw_tol):.1f}°) '
             f'| 路径 [{", ".join(steps)}]')
 
         if len(seq) == 1 and seq[0].kind == 'done':
@@ -742,6 +759,94 @@ class DockingNode(Node):
         self._frozen = True          # 开始盲动：冻结检测，运动期丢弃所有帧
         self._maneuver_iters += 1
         self._start_next_maneuver_step(base_type)
+
+    # ── Angle-stepped search loop ─────────────────────────────────
+
+    def _run_search(self, tag_visible: bool, tag_pose, base_type: str,
+                    now_ns: int):
+        """角度步进搜索的一个 tick：转固定角度(里程计闭环)→停稳→检测→再转。
+
+        转满 360° 直到找到二维码或状态机超时。结构镜像 _run_stop_and_go 的
+        Case 级联（执行中→等待稳定→解冻清旧数据→空闲检测），区别是检测期
+        不规划靠近动作，而是累计 pause_time_sec 不可见就再转一个 step_angle。
+        冻结机制保证转动期 tag_visible 恒为 False，状态机的 tag-lock 不会误触发。
+        """
+        # ── Case 1: 搜索步正在执行（里程计闭环盲转）──────────────
+        if self._executor.is_active:
+            done = self._executor.update(
+                self._odom_x, self._odom_y, self._odom_yaw,
+                tag_visible, self._raw_dist,
+                self._bearing_fn, self._theta_bounds_fn,
+                self._p('dock_target.distance'),
+                self._p('stopgo.drift_tol'), now_ns,
+            )
+            if done:
+                self._maneuver_active = False
+                self._executor.mark_stop_time(now_ns)
+            self._publish_action_cmd(base_type)
+            return
+
+        # ── Case 2: 转完后等待图像稳定 ────────────────────────────
+        if self._executor.wait_visual_settle(tag_visible, now_ns):
+            self._adapter.publish_stop()
+            return
+
+        # ── Case 2.5: 稳定窗口刚结束 → 解冻，强制下一帧只用停稳后的新鲜帧
+        if self._frozen:
+            self._frozen = False
+            self._filter_init = False
+            self._last_detection_ns = 0
+            self._pose_buffer.clear()
+            self._search_detect_start = 0
+            self._adapter.publish_stop()
+            return
+
+        # ── Case 3: 空闲且已稳定 — 检测期 ─────────────────────────
+        if not self._has_odom:
+            self._adapter.publish_stop()
+            self.get_logger().warn('搜索：等待里程计...', throttle_duration_sec=1.0)
+            return
+
+        # 二维码可见 → 原地停住，状态机累积 hold 转 APPROACH。
+        # 重置检测停留计数，让闪烁的二维码每次消失都重获完整停留窗口。
+        if tag_visible and tag_pose is not None:
+            self._search_detect_start = 0
+            self._adapter.publish_stop()
+            return
+
+        # 检测停留：累计 pause_time_sec 的持续不可见，然后转下一步
+        pause_time = self._p('search.pause_time_sec')
+        if self._search_detect_start == 0:
+            self._search_detect_start = now_ns
+            self._adapter.publish_stop()
+            self.get_logger().info(
+                f'搜索：检测停留 (步数={self._search_step})',
+                throttle_duration_sec=1.0)
+            return
+
+        if (now_ns - self._search_detect_start) * 1e-9 < pause_time:
+            self._adapter.publish_stop()
+            return
+
+        # 停留期满仍未见到 → 转下一步
+        self._search_detect_start = 0
+        self._search_step += 1
+        step_angle = math.radians(self._p('search.step_angle_deg'))
+        angle = step_angle * self._search_direction
+        rate = self._p('search.angular_speed')
+        if self._executor.start_turn(angle, rate, full=True):
+            self._executor.set_odom_ref(
+                self._odom_x, self._odom_y, self._odom_yaw)
+            self._maneuver_active = True
+            self._frozen = True
+            self.get_logger().info(
+                f'搜索：第{self._search_step}步 原地转 '
+                f'{math.degrees(angle):+.1f}° '
+                f'(方向={"CCW" if angle > 0 else "CW"})')
+        else:
+            self._frozen = False
+            self._maneuver_active = False
+        self._publish_action_cmd(base_type)
 
     def _start_next_maneuver_step(self, base_type: str):
         """Pop and start the next queued sub-step, re-referencing odometry.
@@ -843,6 +948,26 @@ class DockingNode(Node):
         self._maneuver_active = False
         self._maneuver_iters = 0
         self._frozen = False
+        self._straight_failed = False
+
+    def _reset_search(self):
+        """重置角度步进搜索：计数器、方向、执行器、冻结态。
+
+        进入 SEARCH_TAG 时按最后见到二维码的一侧选初始方向（+lat=左=CCW→+1），
+        从未见过则退回 search.search_direction；之后始终同向，12 步转满 360°。
+        出 SEARCH_TAG 时也调用，终止可能正在转的搜索步并解冻。
+        """
+        self._search_step = 0
+        self._search_detect_start = 0
+        if self._last_seen_lat > 0.0:
+            self._search_direction = 1.0
+        elif self._last_seen_lat < 0.0:
+            self._search_direction = -1.0
+        else:
+            self._search_direction = 1.0 if self._p('search.search_direction') >= 0 else -1.0
+        self._executor.cancel()
+        self._frozen = False
+        self._maneuver_active = False
 
     # ── Helpers for the action executor ────────────────────────────
 
@@ -873,47 +998,6 @@ class DockingNode(Node):
     def _is_omni(base_type: str) -> bool:
         return base_type in ('omni', 'quadruped')
 
-    # ── Search velocity ────────────────────────────────────────────
-
-    def _compute_search_velocity(self, now_ns: int) -> tuple[float, float, float]:
-        """Velocity for SEARCH_TAG — bidirectional widening sweep.
-
-        The old single-direction scan could never recover a tag lost off the
-        opposite FOV edge. This alternates direction each rotate phase and
-        widens the sweep, so both sides are covered:
-
-            sweep 0: toward last-seen side, 1× base width
-            sweep 1: opposite side,         2× width
-            sweep 2: back,                  3× width
-            ...
-
-        Starting toward the side where the tag was last seen (sign of
-        _last_seen_lat, +lat = left = CCW = +wz) finds it fastest in the common
-        case where a turn just nudged it past the edge.
-        """
-        base_speed = self._p('search.angular_speed')
-        rotate_time = self._p('search.rotate_time_sec')
-
-        # Detect entry into a new rotate phase → advance the sweep index.
-        if self._sm._search_phase == 'rotate':
-            if self._sm._search_phase_start_ns != self._search_last_phase_start:
-                self._search_last_phase_start = self._sm._search_phase_start_ns
-                self._search_sweep_idx += 1
-        else:
-            return 0.0, 0.0, 0.0
-
-        # First sweep direction: toward last-seen side (+lat → CCW → +).
-        first_dir = 1.0 if self._last_seen_lat >= 0.0 else -1.0
-        # Alternate each sweep.
-        direction = first_dir * (1.0 if (self._search_sweep_idx % 2 == 1) else -1.0)
-        # Widen: sweep 1→1×, 2→2×, 3→3×, capped at 4×.
-        width = min(self._search_sweep_idx, 4)
-
-        phase_ns = now_ns - self._sm._search_phase_start_ns
-        if phase_ns * 1e-9 < rotate_time * width:
-            return 0.0, 0.0, base_speed * direction
-        return 0.0, 0.0, 0.0
-
     # ── Params dict ────────────────────────────────────────────────
 
     def _build_params_dict(self) -> dict:
@@ -925,6 +1009,7 @@ class DockingNode(Node):
             },
             'search': {
                 'angular_speed': self._p('search.angular_speed'),
+                'step_angle_deg': self._p('search.step_angle_deg'),
                 'rotate_time_sec': self._p('search.rotate_time_sec'),
                 'pause_time_sec': self._p('search.pause_time_sec'),
                 'hold_time_sec': self._p('search.hold_time_sec'),

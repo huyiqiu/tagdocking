@@ -79,8 +79,6 @@ class DockingStateMachine:
         self._docking_start_ns = 0
 
         # Per-state sub-phase tracking
-        self._search_phase = 'rotate'     # 'rotate' | 'pause'
-        self._search_phase_start_ns = 0
         self._search_tag_hold_start_ns = 0
         self._align_hold_count = 0
         self._tag_lost_count = 0
@@ -146,13 +144,21 @@ class DockingStateMachine:
         """User cancel — transition to CANCELLED."""
         self._transition_to(DockingState.CANCELLED)
 
+    def fail(self, reason: str = ''):
+        """节点主动报失败 — 转 MOTION_FAILED（如直行阶段对准过差无法入库）。
+
+        与 cancel()（用户主动取消）区分：fail() 是系统判定无法继续停靠。
+        两者都是终态，is_success=False。
+        """
+        if reason:
+            self._node.get_logger().error(f'导航失败：{reason}')
+        self._transition_to(DockingState.MOTION_FAILED)
+
     def reset(self):
         """Full reset to IDLE."""
         self._state = DockingState.IDLE
         self._state_start_ns = 0
         self._docking_start_ns = 0
-        self._search_phase = 'rotate'
-        self._search_phase_start_ns = 0
         self._search_tag_hold_start_ns = 0
         self._align_hold_count = 0
         self._tag_lost_count = 0
@@ -276,13 +282,14 @@ class DockingStateMachine:
     # ── Per-state evaluators ───────────────────────────────────────
 
     def _eval_search(self, tag_visible, tag_pose, now_ns, params):
-        """SEARCH_TAG: rotate-pause scan pattern."""
+        """SEARCH_TAG: 角度步进扫描；节点负责转/检循环，这里只判超时和锁定。
+
+        节点的 _run_search 负责转固定角度(里程计闭环)→停稳→检测的循环。
+        转动期节点冻结检测(_frozen=True)，_on_detections 直接返回，故
+        tag_visible 在转动期恒为 False，这里的 tag-lock 不会在转动中误触发。
+        """
         search_cfg = params.get('search', {})
-        rotate_time = search_cfg.get('rotate_time_sec', 0.8)
-        pause_time = search_cfg.get('pause_time_sec', 1.5)
         hold_time = search_cfg.get('hold_time_sec', 0.5)
-        angular_speed = search_cfg.get('angular_speed', 0.3)
-        search_dir = search_cfg.get('search_direction', 1)
         search_timeout = search_cfg.get('timeout_sec', 60.0)
 
         # Per-state timeout
@@ -291,26 +298,8 @@ class DockingStateMachine:
             self._transition_to(DockingState.TIMEOUT)
             return
 
-        # Phase switching
-        elapsed_phase = (now_ns - self._search_phase_start_ns) * 1e-9
-
-        if self._search_phase == 'rotate':
-            if elapsed_phase > rotate_time:
-                self._search_phase = 'pause'
-                self._search_phase_start_ns = now_ns
-                self._node.get_logger().debug('Search: pause for detection',
-                                              throttle_duration_sec=1.0)
-                return
-        elif self._search_phase == 'pause':
-            if elapsed_phase > pause_time:
-                self._search_phase = 'rotate'
-                self._search_phase_start_ns = now_ns
-                self._node.get_logger().debug('Search: rotate',
-                                              throttle_duration_sec=1.0)
-                return
-
-        # Tag lock during pause
-        if tag_visible and self._search_phase == 'pause':
+        # Tag lock: 检测期持续可见 hold_time → APPROACH
+        if tag_visible and tag_pose is not None:
             if self._search_tag_hold_start_ns == 0:
                 self._search_tag_hold_start_ns = now_ns
             else:
@@ -445,8 +434,6 @@ class DockingStateMachine:
         self._state_start_ns = self._node.get_clock().now().nanoseconds
 
         # Reset per-state tracking
-        self._search_phase = 'rotate'
-        self._search_phase_start_ns = self._state_start_ns
         self._search_tag_hold_start_ns = 0
         self._align_hold_count = 0
         self._tag_lost_count = 0

@@ -27,6 +27,7 @@ install(PROGRAMS
   scripts/test_turn_angle
   scripts/test_jog_distance
   scripts/test_apriltag
+  scripts/calibrate_camera
   DESTINATION lib/${PROJECT_NAME}
 )
 

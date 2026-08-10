@@ -69,13 +69,13 @@ docking_node:
     final_servo.distance: 0.20                # m — enter FINAL_SERVO within this distance
 
     # ── Final Straight (两阶段停泊) ──
-    # 阶段1(APPROACH): 正常带角度修正的接近。
-    # 阶段2(直行): 纯直行前进, 不修正 yaw/横向, 如同停车入库。
-    # 当 dist ≤ start_distance 且航向方阵误差 ≤ yaw_threshold_deg 时激活阶段2。
-    # 到 start_distance 若航向仍超差, 阶段1继续转向修正直到对准, 然后才直行。
+    # 阶段1(APPROACH): 正常带角度修正的接近, 尽量对准。
+    # 阶段2(直行): 进入 start_distance 后无条件纯直行, 不再调角(像停车入库)。
+    #   进入时做一次性失败检查: 方位误差 > yaw_threshold_deg 则对准过差、
+    #   入库会撞偏 → 报 MOTION_FAILED 导航失败。容许 ±10° 内入库。
     final_straight.enable: true                       # 两阶段停泊开关; false 恢复单阶段
     final_straight.start_distance: 0.85               # m — 直行阶段起点 (须 > dock_target.distance)
-    final_straight.yaw_threshold_deg: 3.0             # deg — 进入直行阶段的航向门槛 (方阵误差, 3°@55cm≈1.6cm 横向)
+    final_straight.yaw_threshold_deg: 10.0            # deg — 直行失败门槛: 进入直行距离时方位误差超此值则报导航失败
 
     # ── Docking Tolerance ──
     tolerance.position_m: 0.05                # m — 前后 ±5cm 视为到位
@@ -87,12 +87,15 @@ docking_node:
     timeout_sec: 120.0                        # overall docking timeout
 
     # ── Search Behavior ──
-    search.angular_speed: 0.3                 # rad/s — rotation speed
-    search.rotate_time_sec: 0.8               # s — rotate for this long
-    search.pause_time_sec: 1.5                # s — pause for detection
-    search.hold_time_sec: 0.5                 # s — tag must be visible this long to lock
-    search.search_direction: 1                # +1 = CCW, -1 = CW
-    search.timeout_sec: 60.0                  # overall search timeout
+    # 角度步进搜索: 转固定角度(里程计闭环) → 停稳 → 检测 → 再转, 转满 360°。
+    # 转动期冻结检测避免误锁; 单向旋转不交替, 12 步(30°)转满一圈在 60s 超时内。
+    search.angular_speed: 0.3                 # rad/s — 每步旋转速度
+    search.step_angle_deg: 30.0               # deg — 每步旋转角度, 建议≥10°(太小会半速拖慢)
+    search.rotate_time_sec: 0.8               # (已弃用) 角度步进化后不再读取, 保留兼容旧配置
+    search.pause_time_sec: 1.5                # s — 每步之间的检测停留时长
+    search.hold_time_sec: 0.5                 # s — 二维码持续可见此时长才锁定
+    search.search_direction: 1                # +1=CCW, -1=CW (从未见过二维码时的起始方向)
+    search.timeout_sec: 60.0                  # 整体搜索超时
 
     # ── Per-State Timeouts ──
     align_timeout_sec: 15.0
