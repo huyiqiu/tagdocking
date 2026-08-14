@@ -162,7 +162,7 @@ def generate_launch_description():
                              description='最终停泊距离 (m), 底盘距 tag'),
         DeclareLaunchArgument('final_straight_distance', default_value='0.85',
                              description='直行阶段起点距离 (m), 到此距离后纯直行不再调角 (须 > dock_distance)'),
-        DeclareLaunchArgument('final_straight_yaw_deg', default_value='3.0',
+        DeclareLaunchArgument('final_straight_yaw_deg', default_value='5.0',
                              description='进入直行阶段的航向门槛 (deg, 方阵误差)'),
         OpaqueFunction(function=launch_setup),
     ])

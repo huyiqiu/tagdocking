@@ -30,6 +30,7 @@ class DockingState(enum.IntEnum):
     APPROACH = 4
     FINAL_SERVO = 5
     DOCKED = 6
+    RETRYING = 8          # 失败后倒车重试(活动态, 节点驱动盲退后转 SEARCH_TAG)
     # Error states
     TAG_LOST = 10
     TIMEOUT = 11
@@ -44,6 +45,7 @@ _ACTIVE_STATES = {
     DockingState.ALIGN,
     DockingState.APPROACH,
     DockingState.FINAL_SERVO,
+    DockingState.RETRYING,
 }
 
 # Terminal success state
@@ -87,6 +89,10 @@ class DockingStateMachine:
         self._stable_since_ns = 0
         self._last_velocity = (0.0, 0.0, 0.0)
 
+        # 失败重试: 倒车后重新停靠。max_retries 由节点从参数写入。
+        self._retry_count = 0
+        self._max_retries = 2
+
     # ── Properties ──────────────────────────────────────────────────
 
     @property
@@ -113,6 +119,10 @@ class DockingStateMachine:
     def is_error(self) -> bool:
         return self._state in _ERROR_STATES
 
+    @property
+    def retry_count(self) -> int:
+        return self._retry_count
+
     def elapsed_ns(self, now_ns: int) -> int:
         """Nanoseconds since docking started."""
         if self._docking_start_ns == 0:
@@ -134,6 +144,7 @@ class DockingStateMachine:
             self._node.get_logger().warn(f'无法启动：当前状态={self._state.name}')
             return False
 
+        self._retry_count = 0   # 用户主动启动: 重试计数清零
         self._transition_to(
             DockingState.NAVIGATING if enable_navigation else DockingState.SEARCH_TAG)
         if self._docking_start_ns == 0:
@@ -145,14 +156,35 @@ class DockingStateMachine:
         self._transition_to(DockingState.CANCELLED)
 
     def fail(self, reason: str = ''):
-        """节点主动报失败 — 转 MOTION_FAILED（如直行阶段对准过差无法入库）。
+        """节点主动报失败 — 可重试的失败(如直行阶段对准过差)。
 
-        与 cancel()（用户主动取消）区分：fail() 是系统判定无法继续停靠。
-        两者都是终态，is_success=False。
+        若还有重试次数, 转 RETRYING: 节点盲退一段距离后由 retry_search() 转
+        SEARCH_TAG 重新锁定靠近。退满 max_retries 次仍失败才落 MOTION_FAILED 终态。
+        AprilTag 近场位姿(尤其降采样后的小码)单帧噪声大, 直行入口一次方位超限
+        往往是抖动而非真没对准 —— 后退重锁给一次重新靠近的机会。
+        与 cancel()(用户主动取消)区分: cancel() 不重试, 直接终态。
         """
         if reason:
             self._node.get_logger().error(f'导航失败：{reason}')
-        self._transition_to(DockingState.MOTION_FAILED)
+        if self._retry_count < self._max_retries:
+            self._retry_count += 1
+            self._node.get_logger().warn(
+                f'停靠失败，自动重试({self._retry_count}/{self._max_retries}) '
+                f'→ 倒车后重新锁定')
+            self._transition_to(DockingState.RETRYING)
+        else:
+            self._node.get_logger().error(
+                f'停靠失败且已达最大重试次数({self._max_retries})')
+            self._transition_to(DockingState.MOTION_FAILED)
+
+    def retry_search(self):
+        """RETRYING 倒车到位后调用: 转 SEARCH_TAG 重新锁定。
+
+        保留 _docking_start_ns(整体超时累计), 只重置搜索子相位。
+        """
+        self._search_tag_hold_start_ns = 0
+        self._tag_lost_count = 0
+        self._transition_to(DockingState.SEARCH_TAG)
 
     def reset(self):
         """Full reset to IDLE."""
@@ -163,6 +195,7 @@ class DockingStateMachine:
         self._align_hold_count = 0
         self._tag_lost_count = 0
         self._stable_since_ns = 0
+        self._retry_count = 0
 
     # ── State machine evaluation ────────────────────────────────────
 
@@ -273,6 +306,14 @@ class DockingStateMachine:
         elif state == DockingState.FINAL_SERVO:
             self._eval_final_servo(tag_visible, tag_pose, now_ns,
                                    cmd_vx, cmd_vy, cmd_wz, params)
+
+        elif state == DockingState.RETRYING:
+            # 倒车超时保护: 里程计不走(底盘卡死/失联)会卡在 RETRYING,
+            # 直接落 MOTION_FAILED 终态(不再重试, 防止无限倒车)。
+            retry_timeout = params.get('retry', {}).get('timeout_sec', 15.0)
+            if self.state_elapsed_ns(now_ns) * 1e-9 > retry_timeout:
+                self._node.get_logger().error('重试倒车超时 — MOTION_FAILED')
+                self._transition_to(DockingState.MOTION_FAILED)
 
         elif state in _ERROR_STATES or state == _SUCCESS_STATE:
             pass  # terminal states

@@ -102,6 +102,7 @@ class DockingNode(Node):
 
         # ── State machine ─────────────────────────────────────────
         self._sm = DockingStateMachine(self)
+        self._sm._max_retries = int(self._p('retry.max_retries'))
 
         # ── Base adapter ──────────────────────────────────────────
         self._adapter = self._create_adapter()
@@ -192,6 +193,15 @@ class DockingNode(Node):
         # Control period
         self._dt = 0.05  # 20 Hz
 
+        # Quiescent cmd_vel policy: brake briefly on entering an idle/terminal
+        # state, then release /cmd_vel so teleop/Nav2 can drive the robot.
+        # Continuously publishing zero at 20 Hz otherwise monopolises the topic
+        # and locks out manual control after docking (and fights Nav2 during
+        # NAVIGATING). The chassis watchdog stops the robot if nobody publishes.
+        self._quiescent = False
+        self._brake_until_ns = 0
+        self._BRAKE_WINDOW_NS = int(0.3 * 1e9)   # ~0.3 s firm brake on entry
+
         # ── ROS interfaces ─────────────────────────────────────────
         self._init_ros_interfaces()
 
@@ -258,6 +268,12 @@ class DockingNode(Node):
         self.declare_parameter('safety.minimum_distance_m', 0.15)
         self.declare_parameter('timeout_sec', 120.0)
 
+        # Retry (失败后倒车一段距离再重新 dock)
+        self.declare_parameter('retry.max_retries', 2)
+        self.declare_parameter('retry.backup_distance', 0.5)
+        self.declare_parameter('retry.linear_rate', 0.08)
+        self.declare_parameter('retry.timeout_sec', 15.0)
+
         # Search
         self.declare_parameter('search.angular_speed', 0.3)
         self.declare_parameter('search.step_angle_deg', 30.0)
@@ -304,7 +320,7 @@ class DockingNode(Node):
 
         # Detection topic
         self.declare_parameter('detection_topic', '/detections')
-        self.declare_parameter('odom_topic', '/odom')
+        self.declare_parameter('odom_topic', '/odom_combined')
 
     def _p(self, name: str):
         return self.get_parameter(name).value
@@ -583,22 +599,49 @@ class DockingNode(Node):
         self._prev_state = state
 
         # ── Per-state behaviour ───────────────────────────────────
-        if state == DockingState.NAVIGATING:
-            self._adapter.publish_stop()
-
-        elif state == DockingState.SEARCH_TAG:
+        # Active motion states own /cmd_vel and command motion each tick.
+        # Quiescent states (IDLE/NAVIGATING/DOCKED/errors) must NOT keep
+        # publishing zero — that monopolises /cmd_vel and locks out teleop
+        # (and fights Nav2 during NAVIGATING). Brake briefly on entry, then
+        # release the topic so other publishers can drive the robot.
+        if state == DockingState.SEARCH_TAG:
+            self._quiescent = False
             self._run_search(tag_visible, tag_pose, base_type, now_ns)
 
         elif state in (DockingState.ALIGN, DockingState.APPROACH,
                        DockingState.FINAL_SERVO):
+            self._quiescent = False
             self._run_stop_and_go(tag_visible, tag_pose, base_type, now_ns)
 
-        else:  # IDLE, DOCKED, error states
-            self._adapter.publish_stop()
+        elif state == DockingState.RETRYING:
+            self._quiescent = False
+            self._run_retry(base_type, now_ns)
+
+        else:  # IDLE, NAVIGATING, DOCKED, error states
+            self._brake_and_release(now_ns)
 
         # Publish state and error
         self._publish_state(state)
         self._publish_error(error_x, error_y, error_yaw)
+
+    # ── Quiescent cmd_vel policy ────────────────────────────────────
+
+    def _brake_and_release(self, now_ns: int):
+        """Quiescent-state /cmd_vel policy: brake briefly on entry, then release.
+
+        Continuously publishing Twist() at 20 Hz while idle/docked monopolises
+        /cmd_vel — every teleop command is overwritten by zero within 50 ms, so
+        the robot appears "locked" until the docking launch is killed. Instead
+        publish a short burst of stops on the entry edge (firm brake in case the
+        robot still has residual velocity), then publish nothing and let teleop /
+        Nav2 own the topic. The chassis watchdog stops the robot if nobody
+        publishes.
+        """
+        if not self._quiescent:
+            self._quiescent = True
+            self._brake_until_ns = now_ns + self._BRAKE_WINDOW_NS
+        if now_ns < self._brake_until_ns:
+            self._adapter.publish_stop()
 
     # ── Stop-and-go loop ───────────────────────────────────────────
 
@@ -759,6 +802,45 @@ class DockingNode(Node):
         self._frozen = True          # 开始盲动：冻结检测，运动期丢弃所有帧
         self._maneuver_iters += 1
         self._start_next_maneuver_step(base_type)
+
+    def _run_retry(self, base_type: str, now_ns: int):
+        """重试倒车的一个 tick: 盲退 retry.backup_distance, 到位后 → SEARCH_TAG。
+
+        镜像 _run_search 的 Case 1/2 结构。倒车纯里程计闭环(blind), 不看 tag;
+        退够距离后调状态机 retry_search() 转 SEARCH_TAG 重新锁定靠近。
+        进入 RETRYING 时控制循环的 cleanup(离开 stopgo 态)已 cancel 旧 executor
+        + _reset_maneuver, 故首 tick executor 空闲 → Case 2 启动盲退。
+        """
+        # Case 1: 倒车执行中
+        if self._executor.is_active:
+            done = self._executor.update(
+                self._odom_x, self._odom_y, self._odom_yaw,
+                False, None,   # blind: 不看 tag
+                self._bearing_fn, self._theta_bounds_fn,
+                self._p('dock_target.distance'),
+                self._p('stopgo.drift_tol'), now_ns,
+            )
+            if done:
+                self._maneuver_active = False
+                self._executor.mark_stop_time(now_ns)
+                self._sm.retry_search()
+            self._publish_action_cmd(base_type)
+            return
+
+        # Case 2: 倒车未开始 → 启动盲退(负距离 = 后退)
+        dist = abs(float(self._p('retry.backup_distance')))
+        rate = float(self._p('retry.linear_rate'))
+        if dist < 1e-3:
+            self._sm.retry_search()
+            self._adapter.publish_stop()
+            return
+        self._executor.start_jog(-dist, rate, blind=True)
+        self._executor.set_odom_ref(self._odom_x, self._odom_y, self._odom_yaw)
+        self._maneuver_active = True
+        self._frozen = True
+        self.get_logger().info(
+            f'重试：盲退 {-dist:+.3f}m (速率 {rate:.2f}m/s) 后重新锁定')
+        self._publish_action_cmd(base_type)
 
     # ── Angle-stepped search loop ─────────────────────────────────
 
@@ -1029,6 +1111,9 @@ class DockingNode(Node):
             'safety': {
                 'minimum_distance_m': self._p('safety.minimum_distance_m'),
             },
+            'retry': {
+                'timeout_sec': self._p('retry.timeout_sec'),
+            },
             'align_timeout_sec': self._p('align_timeout_sec'),
             'approach_timeout_sec': self._p('approach_timeout_sec'),
             'final_servo_timeout_sec': self._p('final_servo_timeout_sec'),
@@ -1199,6 +1284,13 @@ def main(args=None):
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
+    except Exception:
+        # 信号处理器(_handle_signal)会调用 rclpy.shutdown() 以便打断 spin,
+        # 但这会让正在转的 spin 下一轮 wait_set 初始化抛 RCLError
+        # ("context is not valid")。上下文已被有意关闭时属正常退出路径,
+        # 吞掉以免 launch 报 process died; 仅真异常(rclpy 仍 ok)才重新抛出。
+        if rclpy.ok():
+            raise
     finally:
         try:
             node.destroy_node()

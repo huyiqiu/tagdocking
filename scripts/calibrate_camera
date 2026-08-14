@@ -17,6 +17,8 @@
 #   ./scripts/calibrate_camera                              # 默认 9x6 内角点, 25mm 方格
 #   ./scripts/calibrate_camera --size 7x5 --square 0.02     # 自定义棋盘格
 #   ./scripts/calibrate_camera --camera-name rgb_camera     # 相机名(默认就是 rgb_camera, 改了驱动不认)
+#   注: 脚本内部已用下划线 --camera_name 传给 cameracalibrator (它只认这种形式)
+#   ./scripts/calibrate_camera --skip-topic-check           # 跳过话题检查(脚本内查不到但交互式能查到时用)
 #
 # 棋盘格 --size 是【内角点数】NxM, 不是方格数:
 #   标准 8x8 棋盘(64 格) = 7x7 内角点
@@ -41,6 +43,7 @@ SQUARE="0.025"
 CAMERA_NAME="rgb_camera"
 IMAGE_TOPIC="/camera/color/image_raw"
 INFO_TOPIC="/camera/color/camera_info"
+SKIP_TOPIC_CHECK=0
 
 # ── 解析命令行 ──────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -50,6 +53,7 @@ while [[ $# -gt 0 ]]; do
     --camera-name)  CAMERA_NAME="$2"; shift 2 ;;
     --image-topic)  IMAGE_TOPIC="$2"; shift 2 ;;
     --info-topic)   INFO_TOPIC="$2"; shift 2 ;;
+    --skip-topic-check) SKIP_TOPIC_CHECK=1; shift ;;
     -h|--help)
       sed -n '2,/^$/p' "$0" | sed 's/^# \?//'
       exit 0 ;;
@@ -74,9 +78,11 @@ fi
 echo "✓ DISPLAY=$DISPLAY (X11 转发可用)"
 
 # 2. ROS 环境
+# ⚠ colcon/ros 的 setup.bash 会引用未定义变量(如 COLCON_TRACE), 与本脚本的
+# set -u 冲突会直接终止脚本 —— sourcing 期间临时关掉 -u。
 if [[ -z "${ROS_DISTRO:-}" ]] || ! command -v ros2 &>/dev/null; then
   if [[ -f /opt/ros/humble/setup.bash ]]; then
-    source /opt/ros/humble/setup.bash
+    set +u; source /opt/ros/humble/setup.bash; set -u
   else
     echo "✗ 错误: 找不到 ROS2 (ROS_DISTRO 未设, /opt/ros/humble 不存在)" >&2
     exit 1
@@ -84,7 +90,7 @@ if [[ -z "${ROS_DISTRO:-}" ]] || ! command -v ros2 &>/dev/null; then
 fi
 # 工作空间 overlay (让 ros2 run 能找到 camera_calibration)
 if [[ -f ~/wheeltec_ros2/install/setup.bash ]]; then
-  source ~/wheeltec_ros2/install/setup.bash
+  set +u; source ~/wheeltec_ros2/install/setup.bash; set -u
 fi
 
 # 3. camera_calibration 包
@@ -107,19 +113,49 @@ fi
 echo "✓ camera_calibration 包可用"
 
 # 4. 相机话题在发布
-echo "→ 检查相机话题..."
-if ! ros2 topic info "$IMAGE_TOPIC" 2>/dev/null | grep -q "Publisher count: [1-9]"; then
-  echo "✗ 错误: 图像话题 $IMAGE_TOPIC 没有发布者。" >&2
-  echo "  请先启动相机(起导航或单独起相机驱动):" >&2
-  echo "    ros2 launch wheeltec_fastlio navigation.launch.py" >&2
-  echo "  或指定别的话题: $0 --image-topic <话题>" >&2
-  exit 1
+# 重试几次给 daemon 预热; 仍失败就打印诊断信息让用户判断(而非闷头退出)。
+# 这是非致命检查 —— 标定窗口本身收得到图像才是真正的判据, 所以查不到也不退出,
+# 用 --skip-topic-check 可彻底跳过。
+_wait_for_publisher() {
+  local topic="$1" tries=0
+  while [[ $tries -lt 5 ]]; do
+    if ros2 topic info "$topic" 2>/dev/null | grep -q "Publisher count: [1-9]"; then
+      return 0
+    fi
+    tries=$((tries + 1))
+    sleep 1
+  done
+  return 1
+}
+
+if [[ $SKIP_TOPIC_CHECK -eq 0 ]]; then
+  echo "→ 检查相机话题..."
+  TOPIC_OK=true
+  if ! _wait_for_publisher "$IMAGE_TOPIC"; then
+    echo "⚠ 脚本进程内查不到 $IMAGE_TOPIC 的发布者。诊断:" >&2
+    echo "  ── ros2 topic info 原始输出 ──" >&2
+    ros2 topic info "$IMAGE_TOPIC" 2>&1 | sed 's/^/    /' >&2
+    echo "  ── ros2 topic list (含 color 的行) ──" >&2
+    ros2 topic list 2>&1 | grep -i color | sed 's/^/    /' >&2 || echo "    (无 color 话题)" >&2
+    echo "  ── 本脚本 ROS_DOMAIN_ID / RMW ──" >&2
+    echo "    ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-<空>}" >&2
+    echo "    RMW_IMPLEMENTATION=${RMW_IMPLEMENTATION:-<默认>}" >&2
+    echo "  若你交互式跑 'ros2 topic info $IMAGE_TOPIC' 能看到发布者," >&2
+    echo "  多半是本脚本与登录 shell 的 ROS 环境/域不一致(DOMAIN_ID、RMW、overlay)。" >&2
+    echo "  可用 --skip-topic-check 跳过此检查直接启动标定窗口(收得到图像与否一目了然)。" >&2
+    TOPIC_OK=false
+  fi
+  if $TOPIC_OK && ! _wait_for_publisher "$INFO_TOPIC"; then
+    echo "⚠ $INFO_TOPIC 没有发布者(可能相机驱动还没起 camera_info)。" >&2
+    TOPIC_OK=false
+  fi
+  $TOPIC_OK && echo "✓ 相机话题正常 ($IMAGE_TOPIC)"
+  if ! $TOPIC_OK; then
+    echo "  话题检查未通过但仍继续 —— 标定窗口若收不到图像请先解决环境问题。" >&2
+  fi
+else
+  echo "→ 跳过话题检查 (--skip-topic-check)"
 fi
-if ! ros2 topic info "$INFO_TOPIC" 2>/dev/null | grep -q "Publisher count: [1-9]"; then
-  echo "✗ 错误: camera_info 话题 $INFO_TOPIC 没有发布者。" >&2
-  exit 1
-fi
-echo "✓ 相机话题正常 ($IMAGE_TOPIC)"
 
 # 5. 标定输出目录
 mkdir -p "$CALIB_DIR"
@@ -150,12 +186,14 @@ echo ""
 # cameracalibrator 标定完点 COMMIT 后, do_upload() 会 print(self.c.ost())
 # 即 ost 格式 YAML 打到 stdout。用 tee 同时存日志和显示, 事后从日志提取。
 # --no-service-check: astra 没 set_camera_info 服务, 跳过启动检查避免退出。
+# --camera_name (下划线!): 这版 cameracalibrator 用 optparse, 只认下划线形式,
+#   写入 ost 的 [name] 段, 必须是 "rgb_camera"(匹配 astra 驱动硬编码名)。
 # 话题重映射: cameracalibrator 默认订阅 image/camera_info, remap 到实际话题。
 set +e
 /opt/ros/humble/lib/camera_calibration/cameracalibrator \
   --size "$SIZE" \
   --square "$SQUARE" \
-  --camera-name "$CAMERA_NAME" \
+  --camera_name "$CAMERA_NAME" \
   --no-service-check \
   --ros-args \
     -r "image:=$IMAGE_TOPIC" \

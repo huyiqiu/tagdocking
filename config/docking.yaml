@@ -107,4 +107,4 @@ docking_node:
 
     # ── Topics ──
     detection_topic: "/detections"
-    odom_topic: "/odom"
+    odom_topic: "/odom_combined"
