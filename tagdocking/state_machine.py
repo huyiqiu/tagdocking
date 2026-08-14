@@ -144,9 +144,13 @@ class DockingStateMachine:
 
         Navigation (Nav2 pre-dock) has been removed — an external service is
         expected to bring the robot into tag range before calling start.
+
+        Allowed from any non-active state: IDLE, a success terminal (DOCKED /
+        UNDOCKED), or an error terminal. In particular re-docking after an
+        undock (UNDOCKED) must be allowed — otherwise a dock→undock→dock cycle
+        gets stuck at "无法启动：当前状态=UNDOCKED".
         """
-        if self._state not in (DockingState.IDLE, DockingState.DOCKED,
-                               *[s for s in _ERROR_STATES]):
+        if self._state not in (DockingState.IDLE, *_SUCCESS_STATES, *_ERROR_STATES):
             self._node.get_logger().warn(f'无法启动：当前状态={self._state.name}')
             return False
 
@@ -171,6 +175,10 @@ class DockingStateMachine:
                 f'无法泊出：停泊进行中({self._state.name})')
             return False
         self._transition_to(DockingState.UNDOCKING)
+        # 泊出是一次独立操作: 重置整体超时起点, 否则 UNDOCKING 也受全局超时
+        # (_ACTIVE_STATES) 管辖, 而 _docking_start_ns 还停留在上次停泊的 t0,
+        # 隔一阵再触发泊出会立刻 elapsed>timeout_sec 落 TIMEOUT。
+        self._docking_start_ns = self._state_start_ns
         return True
 
     def finish_undock(self):

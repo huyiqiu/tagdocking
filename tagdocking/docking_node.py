@@ -732,7 +732,7 @@ class DockingNode(Node):
         bearing = math.atan2(tag_pose.lat, tag_pose.dist)
         bearing_err = abs(normalize_angle(bearing))
 
-        straight_active = False
+        go_straight = False
         if straight_enabled and straight_start > target_distance:
             if tag_pose.dist <= straight_start:
                 # 进入直行距离 → 无条件直行（不再调角）。
@@ -746,9 +746,17 @@ class DockingNode(Node):
                     self._sm.fail()
                     self._adapter.publish_stop()
                     return
-                straight_active = True
+                go_straight = True
+            elif (bearing_err <= straight_yaw_tol
+                  and abs(tag_pose.lat) <= self._p('stopgo.lateral_threshold')):
+                # 阶段1 已基本对准(方位+横向都在容差内) → 直接直行, 不再做
+                # turn-drive-turn。plan_sequence 的 turn1/turn2 依赖 tag 法线
+                # normal, 而 normal 是 AprilTag 最不可靠的自由度(近场 ±180° 抖动,
+                # 实测已对正标签仍被算成 ~8° 偏角), 会平白多一次 [转+10° 前进 转-10°]
+                # 的摆头。方位(bearing)只依赖标签在画面中的位置, 稳定可靠。
+                go_straight = True
 
-        if straight_active:
+        if go_straight:
             seq = self._planner.plan_straight(tag_pose.dist)
             self.get_logger().info(
                 f'走停 直线阶段 iter={self._maneuver_iters}: '
@@ -776,7 +784,7 @@ class DockingNode(Node):
             f'方位={bearing_deg:+.1f}° 法线={math.degrees(tag_pose.normal):+.1f}° '
             f'| 原始 距离={self._raw_dist:.3f} 横向={self._raw_lat:+.3f} '
             f'法线={math.degrees(self._raw_normal):+.1f}° '
-            f'| 直行={straight_active} 方位误差={math.degrees(bearing_err):.1f}°'
+            f'| 直行={go_straight} 方位误差={math.degrees(bearing_err):.1f}°'
             f'(失败门槛{math.degrees(straight_yaw_tol):.1f}°) '
             f'| 路径 [{", ".join(steps)}]')
 
