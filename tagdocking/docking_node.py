@@ -14,6 +14,7 @@ Architecture:
   Services:
     ~/start_docking  → std_srvs/Trigger — start docking
     ~/cancel_docking → std_srvs/Trigger — cancel docking
+    ~/start_undock   → std_srvs/Trigger — pull out (reverse + 180° turn)
 
   Action:
     ~/dock           → Dock.action — full docking with feedback
@@ -155,6 +156,11 @@ class DockingNode(Node):
         # own timeout bounds wall-clock independently.
         self._max_maneuver_iters = 40
 
+        # ── Undock (泊出) sub-phase ──────────────────────────────────
+        # 0 = 盲退 undock.backup_distance, 1 = 原地转 180°, 2 = 完成。
+        # 由 _run_undock 在 UNDOCKING 态驱动, 纯里程计闭环, 不看 tag。
+        self._undock_phase = 0
+
         # Recovery-search state: remember which side the tag was last seen on
         # (sign of lat) so the angle-stepped sweep starts toward it. The node
         # rotates a fixed angle (odometry-closed), stops, detects, repeats —
@@ -253,6 +259,13 @@ class DockingNode(Node):
         self.declare_parameter('retry.linear_rate', 0.08)
         self.declare_parameter('retry.timeout_sec', 15.0)
 
+        # Undock (泊出: 盲退一段距离 → 原地转 180° → 完成)
+        self.declare_parameter('undock.backup_distance', 0.5)
+        self.declare_parameter('undock.linear_rate', 0.08)
+        self.declare_parameter('undock.turn_angle_deg', 180.0)   # 正=CCW, 负=CW
+        self.declare_parameter('undock.angular_rate', 0.3)
+        self.declare_parameter('undock.timeout_sec', 30.0)
+
         # Search
         self.declare_parameter('search.angular_speed', 0.3)
         self.declare_parameter('search.step_angle_deg', 30.0)
@@ -323,6 +336,8 @@ class DockingNode(Node):
             Trigger, '~/start_docking', self._on_start_docking)
         self._srv_cancel = self.create_service(
             Trigger, '~/cancel_docking', self._on_cancel_docking)
+        self._srv_undock = self.create_service(
+            Trigger, '~/start_undock', self._on_start_undock)
 
         try:
             from tagdocking.action import Dock
@@ -555,6 +570,12 @@ class DockingNode(Node):
             self._executor.cancel()
             self._planner.reset()
             self._reset_maneuver()
+        # 出 UNDOCKING: 终止可能还在跑的盲退/盲转, 清掉 _frozen, 否则下一次
+        # 停泊会带着冻结态启动、丢弃所有检测帧。
+        if (self._prev_state == DockingState.UNDOCKING
+                and state != DockingState.UNDOCKING):
+            self._executor.cancel()
+            self._reset_maneuver()
         # 出 SEARCH_TAG：终止可能正在转的搜索步 + 解冻
         if (self._prev_state == DockingState.SEARCH_TAG
                 and state != DockingState.SEARCH_TAG):
@@ -583,7 +604,11 @@ class DockingNode(Node):
             self._quiescent = False
             self._run_retry(base_type, now_ns)
 
-        else:  # IDLE, DOCKED, error states
+        elif state == DockingState.UNDOCKING:
+            self._quiescent = False
+            self._run_undock(base_type, now_ns)
+
+        else:  # IDLE, DOCKED, UNDOCKED, error states
             self._brake_and_release(now_ns)
 
         # Publish state and error
@@ -806,6 +831,84 @@ class DockingNode(Node):
         self.get_logger().info(
             f'重试：盲退 {-dist:+.3f}m (速率 {rate:.2f}m/s) 后重新锁定')
         self._publish_action_cmd(base_type)
+
+    def _run_undock(self, base_type: str, now_ns: int):
+        """泊出的一个 tick: 盲退 → 原地转 180° → UNDOCKED。
+
+        两段纯里程计闭环盲动顺序执行 (镜像 _run_retry 的 Case 结构)：
+          phase 0: 盲退 undock.backup_distance (负 jog, 同重试倒车)
+          phase 1: 原地转 undock.turn_angle_deg (默认 180°)
+        两段都到位后调状态机 finish_undock() → UNDOCKED。
+        不看 tag；运动期冻结检测 (与停泊盲动一致)。
+        """
+        # Case 1: 子动作执行中
+        if self._executor.is_active:
+            done = self._executor.update(
+                self._odom_x, self._odom_y, self._odom_yaw,
+                False, None,   # blind: 不看 tag
+                self._bearing_fn, self._theta_bounds_fn,
+                self._p('dock_target.distance'),
+                self._p('stopgo.drift_tol'), now_ns,
+            )
+            if done:
+                self._maneuver_active = False
+                self._executor.mark_stop_time(now_ns)
+                self._undock_phase += 1
+                if not self._start_undock_step(base_type):
+                    # 两段盲动均完成 → 泊出成功
+                    self._adapter.publish_stop()
+                    self._sm.finish_undock()
+                    return
+            self._publish_action_cmd(base_type)
+            return
+
+        # Case 2: 首次进入 → 启动第一段(盲退)
+        if not self._has_odom:
+            self._adapter.publish_stop()
+            self.get_logger().warn('泊出：等待里程计...', throttle_duration_sec=1.0)
+            return
+        self._undock_phase = 0
+        if not self._start_undock_step(base_type):
+            self._adapter.publish_stop()
+            self._sm.finish_undock()
+            return
+        self._publish_action_cmd(base_type)
+
+    def _start_undock_step(self, base_type: str) -> bool:
+        """启动 _undock_phase 指示的泊出子动作。
+
+        phase 0 = 盲退, phase 1 = 原地转 180°。
+        返回 True = 已启动一个动作; False = 该相位空跳或已全部完成(调用方据此收尾)。
+        空跳(距离/角度过小)时自动推进到下一相位再试, 与 _start_next_maneuver_step
+        的"跳过过小子步"行为一致。
+        """
+        if self._undock_phase == 0:
+            dist = abs(float(self._p('undock.backup_distance')))
+            rate = float(self._p('undock.linear_rate'))
+            if dist < 1e-3:
+                self._undock_phase += 1   # 距离为 0, 跳过盲退直接转
+            else:
+                self._executor.start_jog(-dist, rate, blind=True)
+                self._executor.set_odom_ref(
+                    self._odom_x, self._odom_y, self._odom_yaw)
+                self._maneuver_active = True
+                self._frozen = True
+                self.get_logger().info(
+                    f'泊出：盲退 {-dist:+.3f}m (速率 {rate:.2f}m/s)')
+                return True
+        if self._undock_phase == 1:
+            angle = math.radians(float(self._p('undock.turn_angle_deg')))
+            rate = float(self._p('undock.angular_rate'))
+            if self._executor.start_turn(angle, rate, full=True):
+                self._executor.set_odom_ref(
+                    self._odom_x, self._odom_y, self._odom_yaw)
+                self._maneuver_active = True
+                self._frozen = True
+                self.get_logger().info(
+                    f'泊出：原地转 {math.degrees(angle):+.1f}°')
+                return True
+            self._undock_phase += 1   # 角度过小未启动 → 视为完成
+        return False
 
     # ── Angle-stepped search loop ─────────────────────────────────
 
@@ -1075,6 +1178,9 @@ class DockingNode(Node):
             'retry': {
                 'timeout_sec': self._p('retry.timeout_sec'),
             },
+            'undock': {
+                'timeout_sec': self._p('undock.timeout_sec'),
+            },
             'align_timeout_sec': self._p('align_timeout_sec'),
             'approach_timeout_sec': self._p('approach_timeout_sec'),
             'final_servo_timeout_sec': self._p('final_servo_timeout_sec'),
@@ -1113,6 +1219,17 @@ class DockingNode(Node):
         self._adapter.publish_stop()
         response.success = True
         response.message = 'cancelled'
+        return response
+
+    def _on_start_undock(self, request, response):
+        ok = self._sm.start_undock()
+        response.success = ok
+        response.message = f'state={self._sm.state_name}' if ok else 'docking active'
+        if ok:
+            self._planner.reset()
+            self._executor.cancel()
+            self._reset_maneuver()
+            self._undock_phase = 0
         return response
 
     # ── Action callbacks ───────────────────────────────────────────

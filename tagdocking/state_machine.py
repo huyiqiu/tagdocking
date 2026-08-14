@@ -7,6 +7,8 @@ States:
     APPROACH     — stop-and-go: lateral→yaw→forward via geometry planner
     FINAL_SERVO  — stability confirmation (tag pose stable + velocity zero)
     DOCKED       — success: position + yaw within tolerance, robot stable
+    UNDOCKING    — pulling out: blind reverse a distance + 180° turn
+    UNDOCKED     — success: undock maneuver complete
 
 Error terminal states:
     TAG_LOST     — tag not visible for > timeout
@@ -29,11 +31,13 @@ class DockingState(enum.IntEnum):
     FINAL_SERVO = 5
     DOCKED = 6
     RETRYING = 8          # 失败后倒车重试(活动态, 节点驱动盲退后转 SEARCH_TAG)
+    UNDOCKING = 9         # 泊出(活动态): 盲退一段距离 + 原地转180°
     # Error states
     TAG_LOST = 10
     TIMEOUT = 11
     MOTION_FAILED = 12
     CANCELLED = 13
+    UNDOCKED = 14         # 泊出成功(终态)
 
 
 # States that are considered "active" (not terminal)
@@ -43,10 +47,11 @@ _ACTIVE_STATES = {
     DockingState.APPROACH,
     DockingState.FINAL_SERVO,
     DockingState.RETRYING,
+    DockingState.UNDOCKING,
 }
 
-# Terminal success state
-_SUCCESS_STATE = DockingState.DOCKED
+# Terminal success states
+_SUCCESS_STATES = {DockingState.DOCKED, DockingState.UNDOCKED}
 
 # Terminal error states
 _ERROR_STATES = {
@@ -106,11 +111,11 @@ class DockingStateMachine:
 
     @property
     def is_terminal(self) -> bool:
-        return self._state in _ERROR_STATES or self._state == _SUCCESS_STATE
+        return self._state in _ERROR_STATES or self._state in _SUCCESS_STATES
 
     @property
     def is_success(self) -> bool:
-        return self._state == _SUCCESS_STATE
+        return self._state in _SUCCESS_STATES
 
     @property
     def is_error(self) -> bool:
@@ -152,6 +157,25 @@ class DockingStateMachine:
         #  多次倒车重试仍累计在同一超时窗口内。)
         self._docking_start_ns = self._state_start_ns
         return True
+
+    def start_undock(self):
+        """Initiate undocking (pull out): blind reverse + 180° turn.
+
+        Allowed from any non-active state (IDLE / DOCKED / error terminals) —
+        typically called after DOCKED. Rejected if a docking sequence is in
+        progress. The node drives the blind two-step maneuver; on completion
+        it calls finish_undock() → UNDOCKED.
+        """
+        if self._state in _ACTIVE_STATES:
+            self._node.get_logger().warn(
+                f'无法泊出：停泊进行中({self._state.name})')
+            return False
+        self._transition_to(DockingState.UNDOCKING)
+        return True
+
+    def finish_undock(self):
+        """Node calls this when the undock maneuver completed → UNDOCKED."""
+        self._transition_to(DockingState.UNDOCKED)
 
     def cancel(self):
         """User cancel — transition to CANCELLED."""
@@ -299,7 +323,15 @@ class DockingStateMachine:
                 self._node.get_logger().error('重试倒车超时 — MOTION_FAILED')
                 self._transition_to(DockingState.MOTION_FAILED)
 
-        elif state in _ERROR_STATES or state == _SUCCESS_STATE:
+        elif state == DockingState.UNDOCKING:
+            # 泊出超时保护: 里程计不走(底盘卡死/失联)会卡在 UNDOCKING,
+            # 直接落 MOTION_FAILED 终态。
+            undock_timeout = params.get('undock', {}).get('timeout_sec', 30.0)
+            if self.state_elapsed_ns(now_ns) * 1e-9 > undock_timeout:
+                self._node.get_logger().error('泊出超时 — MOTION_FAILED')
+                self._transition_to(DockingState.MOTION_FAILED)
+
+        elif state in _ERROR_STATES or state in _SUCCESS_STATES:
             pass  # terminal states
 
         return self._state

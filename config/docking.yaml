@@ -77,6 +77,16 @@ docking_node:
     safety.minimum_distance_m: 0.15           # m — stop if closer than this
     timeout_sec: 120.0                        # overall docking timeout
 
+    # ── Undock (泊出) ──
+    # 泊出 = 盲退一段距离 → 原地转 180°, 纯里程计闭环不看 tag。
+    # 由 /docking_node/start_undock 触发, 典型场景: 停泊(DOCKED)后把车退出充电桩/工位。
+    # blind 与重试倒车同一路径(negative jog), 转向用 full 全量盲转(里程计校准)。
+    undock.backup_distance: 0.5                # m — 盲退距离(后退, 正值)
+    undock.linear_rate: 0.08                   # m/s — 后退速率
+    undock.turn_angle_deg: 180.0               # deg — 转向角度(正=CCW, 负=CW)
+    undock.angular_rate: 0.3                   # rad/s — 转向速率
+    undock.timeout_sec: 30.0                   # 泊出整体超时(里程计不走时兜底落 MOTION_FAILED)
+
     # ── Search Behavior ──
     # 角度步进搜索: 转固定角度(里程计闭环) → 停稳 → 检测 → 再转, 转满 360°。
     # 转动期冻结检测避免误锁; 单向旋转不交替, 12 步(30°)转满一圈在 60s 超时内。

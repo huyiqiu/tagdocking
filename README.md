@@ -210,13 +210,39 @@ class MyDockingClient(Node):
     def __init__(self):
         super().__init__('my_docking_client')
         self._start_cli = self.create_client(Trigger, '/docking_node/start_docking')
+        self._undock_cli = self.create_client(Trigger, '/docking_node/start_undock')
 
     def start_docking(self):
         req = Trigger.Request()
         future = self._start_cli.call_async(req)
         rclpy.spin_until_future_complete(self, future)
         print(future.result().message)
+
+    def undock(self):
+        req = Trigger.Request()
+        future = self._undock_cli.call_async(req)
+        rclpy.spin_until_future_complete(self, future)
+        print(future.result().message)
 ```
+
+### 泊出 (Undock)
+
+停泊完成后 (`DOCKED`)，调用 `~/start_undock` 把车退出停靠位：
+
+```bash
+ros2 service call /docking_node/start_undock std_srvs/srv/Trigger
+```
+
+泊出是一个固定的两段式盲动序列，纯里程计闭环、不看二维码：
+
+1. **盲退** `undock.backup_distance` (默认 0.5 m，同重试倒车的 negative jog)
+2. **原地转 180°** (`undock.turn_angle_deg`，正=CCW / 负=CW)
+
+两段到位后进入 `UNDOCKED` 终态。`~/state` 依次发布 `undocking` → `undocked`，
+webapp 据此弹"泊出完成"提示。泊出可从任意非停泊态触发 (IDLE / DOCKED / 错误终态)，
+停泊进行中 (`SEARCH_TAG` / `APPROACH` …) 调用会被拒绝。
+
+> 泊出是盲动 (后退 + 转向)，**调用方需确保车后方无障碍**。
 
 ---
 
@@ -232,6 +258,8 @@ class MyDockingClient(Node):
 | `APPROACH` | 4 | PID 视觉伺服逼近 Tag | 60s |
 | `FINAL_SERVO` | 5 | 减速精确逼近 + 稳定确认 | 30s |
 | `DOCKED` | 6 | 停靠成功 | — |
+| `UNDOCKING` | 9 | 泊出: 盲退 + 原地转 180° | 30s (`undock.timeout_sec`) |
+| `UNDOCKED` | 14 | 泊出成功 | — |
 
 ### 4.2 异常状态
 
