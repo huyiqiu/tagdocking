@@ -5,7 +5,6 @@ Architecture:
     /detections      → AprilTag detection array
     /tf              → (via tf2_ros.Buffer) tag pose lookup
     /odom            → odometry feedback
-    /amcl_pose       → robot pose in map (for Nav2 pre-dock computation)
 
   Publishers:
     /cmd_vel         → (via BaseAdapter) velocity commands
@@ -50,7 +49,6 @@ from .utils import TagPose, yaw_from_quat, normalize_angle, tag_normal_angle
 from .pose_buffer import PoseBuffer
 from .geometry_planner import GeometryPlanner, ActionPlan
 from .action_executor import ActionExecutor
-from .navigation_manager import NavigationManager
 from .state_machine import DockingStateMachine, DockingState
 
 
@@ -93,12 +91,6 @@ class DockingNode(Node):
             final_approach_distance=self._p('final_servo.distance'),
             yaw_threshold=math.radians(self._p('stopgo.yaw_threshold_deg')),
         )
-
-        # ── Navigation ────────────────────────────────────────────
-        self._nav = NavigationManager(
-            self,
-            action_name=self._p('navigation.nav2_action_name'),
-            timeout_sec=self._p('navigation.nav2_timeout_sec'))
 
         # ── State machine ─────────────────────────────────────────
         self._sm = DockingStateMachine(self)
@@ -187,17 +179,14 @@ class DockingNode(Node):
         self._odom_yaw = 0.0
         self._has_odom = False
 
-        # AMCL pose (for Nav2 pre-dock)
-        self._amcl_pose = None
-
         # Control period
         self._dt = 0.05  # 20 Hz
 
         # Quiescent cmd_vel policy: brake briefly on entering an idle/terminal
-        # state, then release /cmd_vel so teleop/Nav2 can drive the robot.
+        # state, then release /cmd_vel so teleop can drive the robot.
         # Continuously publishing zero at 20 Hz otherwise monopolises the topic
-        # and locks out manual control after docking (and fights Nav2 during
-        # NAVIGATING). The chassis watchdog stops the robot if nobody publishes.
+        # and locks out manual control after docking. The chassis watchdog stops
+        # the robot if nobody publishes.
         self._quiescent = False
         self._brake_until_ns = 0
         self._BRAKE_WINDOW_NS = int(0.3 * 1e9)   # ~0.3 s firm brake on entry
@@ -213,22 +202,12 @@ class DockingNode(Node):
         self._install_signal_handlers()
 
         self.get_logger().info(
-            f'停靠节点就绪 | 底盘={self._p("base.type")} | '
-            f'导航={self._p("navigation.enable")} | 走停模式')
+            f'停靠节点就绪 | 底盘={self._p("base.type")} | 走停模式')
 
     # ── Parameter helpers ──────────────────────────────────────────
 
     def _declare_params(self):
         """Declare all ROS2 parameters with defaults."""
-        # Navigation
-        self.declare_parameter('navigation.enable', True)
-        self.declare_parameter('navigation.pre_dock_distance', 1.0)
-        self.declare_parameter('navigation.position_tolerance', 0.1)
-        self.declare_parameter('navigation.yaw_tolerance_deg', 5.0)
-        self.declare_parameter('navigation.nav2_action_name', 'navigate_to_pose')
-        self.declare_parameter('navigation.nav2_timeout_sec', 60.0)
-        self.declare_parameter('navigation.pre_dock_frame', 'map')
-
         # Camera / timing
         self.declare_parameter('camera.max_latency_ms', 200)
         self.declare_parameter('camera.expected_fps', 30)
@@ -337,9 +316,6 @@ class DockingNode(Node):
         self._odom_sub = self.create_subscription(
             Odometry, odom_topic, self._on_odom, 10)
 
-        self._amcl_sub = self.create_subscription(
-            Odometry, '/amcl_pose', self._on_amcl_pose, 10)
-
         self._state_pub = self.create_publisher(String, '~/state', 10)
         self._error_pub = self.create_publisher(Vector3, '~/error', 10)
 
@@ -408,9 +384,6 @@ class DockingNode(Node):
         self._odom_y = msg.pose.pose.position.y
         self._odom_yaw = yaw_from_quat(msg.pose.pose.orientation)
         self._has_odom = True
-
-    def _on_amcl_pose(self, msg: Odometry):
-        self._amcl_pose = msg
 
     # ── TF tag pose lookup ─────────────────────────────────────────
 
@@ -556,10 +529,6 @@ class DockingNode(Node):
             error_yaw = normalize_angle(
                 tag_pose.yaw - math.radians(self._p('dock_target.yaw_offset_deg')))
 
-        # Navigation status
-        nav_done = self._nav.is_done()
-        nav_success = self._nav.success()
-
         # State machine evaluation
         params = self._build_params_dict()
         self._sm.evaluate(
@@ -570,8 +539,6 @@ class DockingNode(Node):
             odom_yaw=self._odom_yaw,
             cmd_vx=0.0, cmd_vy=0.0, cmd_wz=0.0,  # not used in stop-and-go
             motion_stalled=False,  # handled by action_executor
-            nav_done=nav_done,
-            nav_success=nav_success,
             now_ns=now_ns,
             params=params,
             maneuver_active=self.maneuver_active,
@@ -600,10 +567,9 @@ class DockingNode(Node):
 
         # ── Per-state behaviour ───────────────────────────────────
         # Active motion states own /cmd_vel and command motion each tick.
-        # Quiescent states (IDLE/NAVIGATING/DOCKED/errors) must NOT keep
-        # publishing zero — that monopolises /cmd_vel and locks out teleop
-        # (and fights Nav2 during NAVIGATING). Brake briefly on entry, then
-        # release the topic so other publishers can drive the robot.
+        # Quiescent states (IDLE/DOCKED/errors) must NOT keep publishing zero —
+        # that monopolises /cmd_vel and locks out teleop. Brake briefly on
+        # entry, then release the topic so other publishers can drive the robot.
         if state == DockingState.SEARCH_TAG:
             self._quiescent = False
             self._run_search(tag_visible, tag_pose, base_type, now_ns)
@@ -617,7 +583,7 @@ class DockingNode(Node):
             self._quiescent = False
             self._run_retry(base_type, now_ns)
 
-        else:  # IDLE, NAVIGATING, DOCKED, error states
+        else:  # IDLE, DOCKED, error states
             self._brake_and_release(now_ns)
 
         # Publish state and error
@@ -633,9 +599,8 @@ class DockingNode(Node):
         /cmd_vel — every teleop command is overwritten by zero within 50 ms, so
         the robot appears "locked" until the docking launch is killed. Instead
         publish a short burst of stops on the entry edge (firm brake in case the
-        robot still has residual velocity), then publish nothing and let teleop /
-        Nav2 own the topic. The chassis watchdog stops the robot if nobody
-        publishes.
+        robot still has residual velocity), then publish nothing and let teleop
+        own the topic. The chassis watchdog stops the robot if nobody publishes.
         """
         if not self._quiescent:
             self._quiescent = True
@@ -1085,10 +1050,6 @@ class DockingNode(Node):
     def _build_params_dict(self) -> dict:
         return {
             'timeout_sec': self._p('timeout_sec'),
-            'navigation': {
-                'nav2_timeout_sec': self._p('navigation.nav2_timeout_sec'),
-                'pre_dock_distance': self._p('navigation.pre_dock_distance'),
-            },
             'search': {
                 'angular_speed': self._p('search.angular_speed'),
                 'step_angle_deg': self._p('search.step_angle_deg'),
@@ -1136,12 +1097,9 @@ class DockingNode(Node):
     # ── Service callbacks ──────────────────────────────────────────
 
     def _on_start_docking(self, request, response):
-        nav_enable = self._p('navigation.enable')
-        ok = self._sm.start(enable_navigation=nav_enable)
+        ok = self._sm.start()
         response.success = ok
         response.message = f'state={self._sm.state_name}' if ok else 'already active'
-        if ok and nav_enable:
-            self._start_navigation()
         self._planner.reset()
         self._executor.cancel()
         self._reset_maneuver()
@@ -1149,7 +1107,6 @@ class DockingNode(Node):
 
     def _on_cancel_docking(self, request, response):
         self._sm.cancel()
-        self._nav.cancel()
         self._planner.reset()
         self._executor.cancel()
         self._reset_maneuver()
@@ -1164,13 +1121,10 @@ class DockingNode(Node):
         """Action execute callback — blocks until docking completes."""
         from tagdocking.action import Dock
 
-        nav_enable = self._p('navigation.enable')
-        ok = self._sm.start(enable_navigation=nav_enable)
+        ok = self._sm.start()
         if not ok:
             goal_handle.abort()
             return Dock.Result(success=False, message='already active')
-        if nav_enable:
-            self._start_navigation()
 
         self._planner.reset()
         self._executor.cancel()
@@ -1182,7 +1136,6 @@ class DockingNode(Node):
             if goal_handle.is_cancel_requested:
                 goal_handle.canceled()
                 self._sm.cancel()
-                self._nav.cancel()
                 self._planner.reset()
                 self._executor.cancel()
                 self._reset_maneuver()
@@ -1208,40 +1161,11 @@ class DockingNode(Node):
 
     def _dock_cancel_cb(self, cancel_request):
         self._sm.cancel()
-        self._nav.cancel()
         self._planner.reset()
         self._executor.cancel()
         self._reset_maneuver()
         self._adapter.publish_stop()
         return CancelResponse.ACCEPT
-
-    # ── Navigation ─────────────────────────────────────────────────
-
-    def _start_navigation(self):
-        """Compute and send Nav2 pre-dock goal."""
-        from geometry_msgs.msg import PoseStamped, Quaternion
-
-        pre_dock_x = 0.0
-        pre_dock_y = 0.0
-        pre_dock_yaw = 0.0
-        pre_dock_frame = self._p('navigation.pre_dock_frame')
-
-        if self._amcl_pose is not None:
-            pre_dock_x = self._amcl_pose.pose.pose.position.x
-            pre_dock_y = self._amcl_pose.pose.pose.position.y
-            pre_dock_yaw = yaw_from_quat(self._amcl_pose.pose.pose.orientation)
-
-        pose = PoseStamped()
-        pose.header.frame_id = pre_dock_frame
-        pose.header.stamp = self.get_clock().now().to_msg()
-        pose.pose.position.x = pre_dock_x
-        pose.pose.position.y = pre_dock_y
-        pose.pose.position.z = 0.0
-        pose.pose.orientation = Quaternion()
-        pose.pose.orientation.z = math.sin(pre_dock_yaw / 2.0)
-        pose.pose.orientation.w = math.cos(pre_dock_yaw / 2.0)
-
-        self._nav.send_goal(pose)
 
     # ── Emergency stop ─────────────────────────────────────────────
 

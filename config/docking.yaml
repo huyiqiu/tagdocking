@@ -1,14 +1,5 @@
 docking_node:
   ros__parameters:
-    # ── Navigation (Nav2 pre-docking) ──
-    navigation.enable: true
-    navigation.pre_dock_distance: 1.0        # m — distance in front of tag
-    navigation.position_tolerance: 0.1        # m
-    navigation.yaw_tolerance_deg: 5.0         # degrees
-    navigation.nav2_action_name: "navigate_to_pose"
-    navigation.nav2_timeout_sec: 60.0
-    navigation.pre_dock_frame: "map"
-
     # ── Camera / Timing ──
     # 自适应位姿时效窗口: 实际取 max(max_latency_ms, 实测检测间隔 × latency_interval_margin)。
     # 程序自动适应相机真实帧率 (6Hz→窗口~500ms, 30Hz→窗口~100ms 但受下限保护),

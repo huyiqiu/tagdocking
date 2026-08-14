@@ -2,7 +2,6 @@
 
 States:
     IDLE         — waiting for start command
-    NAVIGATING   — Nav2 pre-dock navigation (optional, skipped if nav disabled)
     SEARCH_TAG   — rotating/pausing to find the AprilTag
     ALIGN        — (legacy, skipped — absorbed into APPROACH stop-and-go)
     APPROACH     — stop-and-go: lateral→yaw→forward via geometry planner
@@ -24,7 +23,6 @@ from .utils import normalize_angle
 
 class DockingState(enum.IntEnum):
     IDLE = 0
-    NAVIGATING = 1
     SEARCH_TAG = 2
     ALIGN = 3
     APPROACH = 4
@@ -40,7 +38,6 @@ class DockingState(enum.IntEnum):
 
 # States that are considered "active" (not terminal)
 _ACTIVE_STATES = {
-    DockingState.NAVIGATING,
     DockingState.SEARCH_TAG,
     DockingState.ALIGN,
     DockingState.APPROACH,
@@ -68,7 +65,7 @@ class DockingStateMachine:
 
     Usage:
         sm = DockingStateMachine(params)
-        sm.start(enable_navigation=False)
+        sm.start()
         # In control loop:
         sm.evaluate(tag_pose, tag_visible, odom_data, now_ns)
         state = sm.state
@@ -137,18 +134,23 @@ class DockingStateMachine:
 
     # ── Actions ─────────────────────────────────────────────────────
 
-    def start(self, enable_navigation: bool):
-        """Initiate docking. Transitions to NAVIGATING or SEARCH_TAG."""
+    def start(self):
+        """Initiate docking. Transitions straight to SEARCH_TAG.
+
+        Navigation (Nav2 pre-dock) has been removed — an external service is
+        expected to bring the robot into tag range before calling start.
+        """
         if self._state not in (DockingState.IDLE, DockingState.DOCKED,
                                *[s for s in _ERROR_STATES]):
             self._node.get_logger().warn(f'无法启动：当前状态={self._state.name}')
             return False
 
         self._retry_count = 0   # 用户主动启动: 重试计数清零
-        self._transition_to(
-            DockingState.NAVIGATING if enable_navigation else DockingState.SEARCH_TAG)
-        if self._docking_start_ns == 0:
-            self._docking_start_ns = self._state_start_ns
+        self._transition_to(DockingState.SEARCH_TAG)
+        # 每次用户触发都是一次全新的停泊: 重置整体超时起点。
+        # (重试走 retry_search(), 不动 _docking_start_ns, 故同一次停泊内的
+        #  多次倒车重试仍累计在同一超时窗口内。)
+        self._docking_start_ns = self._state_start_ns
         return True
 
     def cancel(self):
@@ -209,8 +211,6 @@ class DockingStateMachine:
                  cmd_vy: float,
                  cmd_wz: float,
                  motion_stalled: bool,
-                 nav_done: bool,
-                 nav_success: bool,
                  now_ns: int,
                  params: dict,
                  maneuver_active: bool = False):
@@ -222,8 +222,6 @@ class DockingStateMachine:
             odom_*: Current odometry.
             cmd_*: Current velocity command being sent.
             motion_stalled: True if motion stalled (handled by action_executor now).
-            nav_done: True if Nav2 navigation completed.
-            nav_success: True if Nav2 succeeded.
             now_ns: Current ROS time in nanoseconds.
             params: Dict of all relevant parameters (see _get_params_keys).
             maneuver_active: True while a blind turn-drive-turn maneuver is
@@ -279,20 +277,6 @@ class DockingStateMachine:
         # ── Per-state evaluation ─────────────────────────────────
         if state == DockingState.IDLE:
             pass  # wait for start command
-
-        elif state == DockingState.NAVIGATING:
-            nav_timeout = params.get('navigation', {}).get('nav2_timeout_sec', 60.0)
-            elapsed = self.state_elapsed_ns(now_ns) * 1e-9
-            if nav_done:
-                if nav_success:
-                    self._node.get_logger().info('Nav2 完成 → SEARCH_TAG')
-                    self._transition_to(DockingState.SEARCH_TAG)
-                else:
-                    self._node.get_logger().error('Nav2 失败')
-                    self._transition_to(DockingState.TIMEOUT)
-            elif elapsed > nav_timeout:
-                self._node.get_logger().error(f'Nav2 超时（{nav_timeout:.0f}s）')
-                self._transition_to(DockingState.TIMEOUT)
 
         elif state == DockingState.SEARCH_TAG:
             self._eval_search(tag_visible, tag_pose, now_ns, params)

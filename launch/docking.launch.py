@@ -11,9 +11,6 @@ Usage:
   # With custom tag
   ros2 launch tagdocking docking.launch.py dock_tag_id:=5 tag_size:=0.21
 
-  # Skip Navigation (direct docking mode)
-  ros2 launch tagdocking docking.launch.py navigation_enable:=false
-
   # Omni wheel mode
   ros2 launch tagdocking docking.launch.py base_type:=omni
 """
@@ -49,7 +46,6 @@ def launch_setup(context):
     camera_frame = LaunchConfiguration('camera_frame').perform(context)
     cmd_vel_topic = LaunchConfiguration('cmd_vel_topic').perform(context)
     base_type = LaunchConfiguration('base_type').perform(context)
-    navigation_enable = LaunchConfiguration('navigation_enable').perform(context).lower() == 'true'
     dock_distance = float(LaunchConfiguration('dock_distance').perform(context))
     final_straight_distance = float(LaunchConfiguration('final_straight_distance').perform(context))
     final_straight_yaw_deg = float(LaunchConfiguration('final_straight_yaw_deg').perform(context))
@@ -124,7 +120,6 @@ def launch_setup(context):
                 'camera_frame': camera_frame,
                 'base.cmd_vel_topic': cmd_vel_topic,
                 'base.type': base_type,
-                'navigation.enable': navigation_enable,
                 # 两阶段停泊参数 (覆盖 yaml)
                 'dock_target.distance': dock_distance,
                 'final_straight.start_distance': final_straight_distance,
@@ -156,8 +151,6 @@ def generate_launch_description():
                              description='Velocity command topic'),
         DeclareLaunchArgument('base_type', default_value='diff_drive',
                              description='Chassis type: diff_drive, omni, quadruped'),
-        DeclareLaunchArgument('navigation_enable', default_value='true',
-                             description='Enable Nav2 pre-docking'),
         DeclareLaunchArgument('dock_distance', default_value='0.55',
                              description='最终停泊距离 (m), 底盘距 tag'),
         DeclareLaunchArgument('final_straight_distance', default_value='0.85',
