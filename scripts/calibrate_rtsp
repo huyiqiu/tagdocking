@@ -1,0 +1,252 @@
+#!/usr/bin/env python3
+"""RTSP 相机棋盘格标定 — 直接拉流标定, 无 ROS 依赖, 生成 rtsp_camera 内参 YAML。
+
+为什么需要它
+------------
+机器狗相机只有 RTSP 流, 没有 ROS 相机驱动, 无从挂接 ROS 官方
+camera_calibration; 本脚本用 OpenCV 直接拉流做棋盘格标定, 输出的 YAML
+直接喂给 rtsp_camera 节点的 camera_info_file 参数。
+
+用法
+----
+    python3 scripts/calibrate_rtsp --url rtsp://192.168.1.100:8554/live \\
+        [--size 9x6] [--square 0.025] [--frames 20] \\
+        [--out config/rtsp_camera_info.yaml] [--show]
+
+标定操作
+--------
+手持棋盘格在相机前 0.2~1m 移动: 远近变化、上下左右平移、绕各轴倾斜,
+覆盖画面中心与四角。脚本自动采帧(棋盘在画面里显著移动后才采下一帧,
+保证姿态多样性), 采满 --frames 帧后解算并写文件。提前 Ctrl+C 且已采
+≥12 帧也会解算。
+
+参数说明
+--------
+    --size    棋盘格【内角点数】NxM (不是方格数)。标准 8x8 棋盘=7x7 内角点;
+              打印一张 10x7 方格的图 = 9x6 内角点。默认 9x6。
+    --square  单个方格边长(米), 用尺量打印出来的实际尺寸。默认 0.025。
+    --frames  采集帧数, 默认 20 (≥15 才稳定)。
+    --out     输出 YAML 路径, 默认 config/rtsp_camera_info.yaml。
+    --show    有 DISPLAY 时实时显示棋盘检测画面 (ssh -X / 本机有桌面时用;
+              无头模式不用它, 进度看终端打印)。
+"""
+
+import argparse
+import datetime
+import os
+import sys
+import time
+
+os.environ.setdefault('OPENCV_FFMPEG_CAPTURE_OPTIONS', 'rtsp_transport;tcp')
+
+try:
+    import cv2
+    import numpy as np
+except ImportError:
+    sys.exit('需要 OpenCV 与 NumPy: sudo apt install python3-opencv python3-numpy')
+
+try:
+    import yaml
+except ImportError:
+    sys.exit('需要 PyYAML: sudo apt install python3-yaml')
+
+MIN_FRAMES_EARLY_EXIT = 12   # Ctrl+C 时至少采到的帧数才允许提前解算
+MIN_MOVE_PX = 40.0           # 棋盘平均角点位移低于此值(像素)不采帧
+MIN_INTERVAL_SEC = 1.0       # 两次采帧最小间隔
+
+
+def parse_args():
+    p = argparse.ArgumentParser(
+        description='RTSP 相机棋盘格标定 (生成 rtsp_camera 内参 YAML)',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__.split('标定操作')[0])
+    p.add_argument('--url', required=True, help='RTSP 地址')
+    p.add_argument('--size', default='9x6',
+                   help='棋盘内角点数 NxM (默认 9x6, 注意是内角点不是方格数)')
+    p.add_argument('--square', type=float, default=0.025,
+                   help='方格边长, 米 (默认 0.025, 用尺量实际打印尺寸)')
+    p.add_argument('--frames', type=int, default=20,
+                   help='采集帧数 (默认 20)')
+    p.add_argument('--timeout', type=float, default=180.0,
+                   help='整体超时秒数 (默认 180)')
+    p.add_argument('--out', default=None,
+                   help='输出 YAML (默认 <包>/config/rtsp_camera_info.yaml)')
+    p.add_argument('--show', action='store_true',
+                   help='实时显示检测画面 (需 DISPLAY)')
+    args = p.parse_args()
+
+    try:
+        w, h = args.size.lower().split('x')
+        args.pattern = (int(w), int(h))
+        if args.pattern[0] < 2 or args.pattern[1] < 2:
+            raise ValueError
+    except ValueError:
+        sys.exit(f'--size 格式应为 NxM (如 9x6), 实际: {args.size}')
+    if args.square <= 0:
+        sys.exit('--square 必须为正 (单位米)')
+    if args.out is None:
+        pkg = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        args.out = os.path.join(pkg, 'config', 'rtsp_camera_info.yaml')
+    return args
+
+
+def find_corners(gray, pattern):
+    """检测棋盘角点。优先 SB(更稳), 回退经典 + 亚像素。
+
+    返回 (N,1,2) float32 (cv2 惯例形状) 或 None (未检出)。
+    """
+    try:
+        ok, corners = cv2.findChessboardCornersSB(gray, pattern, 0)
+        if ok:
+            return corners.reshape(-1, 1, 2).astype(np.float32)
+    except (AttributeError, TypeError, cv2.error):
+        pass   # 旧版 OpenCV 无 SB / 绑定签名不同 → 回退经典检测
+    flags = cv2.CALIB_CB_ADAPTIVE_THRESH | cv2.CALIB_CB_NORMALIZE_IMAGE
+    ok, corners = cv2.findChessboardCorners(gray, pattern, flags)
+    if not ok:
+        return None
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 1e-3)
+    corners = cv2.cornerSubPix(gray, corners, (5, 5), (-1, -1), criteria)
+    return corners.reshape(-1, 1, 2).astype(np.float32)
+
+
+def collect(url, pattern, square, n_frames, timeout, show):
+    """拉流采帧, 返回 (obj_points, img_points, size)。"""
+    cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
+    if not cap.isOpened():
+        sys.exit(f'RTSP 连接失败: {url} (检查地址/网络/相机供电)')
+    print(f'已连接 {url}, 等待画面...')
+
+    # 物方角点 (棋盘坐标系, z=0)
+    pw, ph = pattern
+    objp = np.zeros((pw * ph, 3), np.float32)
+    objp[:, :2] = np.mgrid[0:pw, 0:ph].T.reshape(-1, 2) * square
+
+    obj_points, img_points = [], []
+    last_mean = None
+    last_t = 0.0
+    size = None
+    t0 = time.monotonic()
+    found_any = False
+
+    try:
+        while len(obj_points) < n_frames:
+            if time.monotonic() - t0 > timeout:
+                break
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                print('  流中断, 1s 后重试...')
+                time.sleep(1.0)
+                continue
+            size = (frame.shape[1], frame.shape[0])
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            corners = find_corners(gray, pattern)
+            if corners is None:
+                if show:
+                    cv2.imshow('calibrate', frame)
+                    cv2.waitKey(1)
+                continue
+            found_any = True
+
+            mean = corners.reshape(-1, 2).mean(axis=0)
+            now = time.monotonic()
+            moved = (last_mean is None
+                     or float(np.linalg.norm(mean - last_mean)) >= MIN_MOVE_PX)
+            if moved and (now - last_t) >= MIN_INTERVAL_SEC:
+                obj_points.append(objp.copy())
+                img_points.append(corners)
+                last_mean, last_t = mean, now
+                print(f'  采帧 {len(obj_points)}/{n_frames} '
+                      f'(画面位置 x={mean[0]:.0f}, y={mean[1]:.0f}; '
+                      '移动棋盘: 远近/平移/倾斜, 覆盖四角)')
+            if show:
+                vis = frame.copy()
+                cv2.drawChessboardCorners(vis, pattern, corners, True)
+                cv2.imshow('calibrate', vis)
+                cv2.waitKey(1)
+    except KeyboardInterrupt:
+        print('\n提前结束采集...')
+
+    cap.release()
+    if show:
+        cv2.destroyAllWindows()
+
+    if not found_any and not obj_points:
+        sys.exit(
+            f'始终检测不到 {pattern[0]}x{pattern[1]} 内角点棋盘。检查:\n'
+            '  1. 棋盘是否完整入画、光照均匀、无反光;\n'
+            f'  2. --size 是否与实物一致 (10x7 方格打印图 = 9x6 内角点);\n'
+            '  3. RTSP 画面是否清晰 (分辨率/网络)。')
+    if not obj_points:
+        sys.exit('未采到任何帧。')
+    return obj_points, img_points, size
+
+
+def calibrate(obj_points, img_points, size):
+    rms, K, D, _, _ = cv2.calibrateCamera(
+        obj_points, img_points, size, None, None)
+    return rms, K, D
+
+
+def save_yaml(path, size, K, D, rms, url):
+    os.makedirs(os.path.dirname(os.path.abspath(path)) or '.', exist_ok=True)
+    data = {
+        'width': size[0],
+        'height': size[1],
+        'camera_matrix': [[float(K[0][0]), 0.0, float(K[0][2])],
+                          [0.0, float(K[1][1]), float(K[1][2])],
+                          [0.0, 0.0, 1.0]],
+        'distortion': [round(float(v), 8) for v in D.flatten()],
+        'distortion_model': 'plumb_bob',
+    }
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write('# rtsp_camera 相机内参 — 棋盘格标定生成, 勿手改\n')
+        f.write(f'# source: {url}\n')
+        f.write(f'# date:   {datetime.datetime.now().isoformat(timespec="seconds")}\n')
+        f.write(f'# rms:    {rms:.4f} px (< 0.5 优, < 1.0 可用)\n')
+        f.write('# 用法: ros2 launch tagdocking docking.launch.py '
+                'rtsp_url:=... camera_info_file:=' + os.path.abspath(path) + '\n')
+        yaml.safe_dump(data, f, allow_unicode=True, sort_keys=False)
+    return data
+
+
+def main():
+    args = parse_args()
+    print(f'标定 {args.url}: 棋盘 {args.pattern[0]}x{args.pattern[1]} 内角点, '
+          f'方格 {args.square * 1000:.0f}mm, 目标 {args.frames} 帧')
+    print('手持棋盘在相机前移动 (0.2~1m, 远近/平移/倾斜, 覆盖画面四角)...')
+
+    obj_points, img_points, size = collect(
+        args.url, args.pattern, args.square, args.frames,
+        args.timeout, args.show)
+
+    n = len(obj_points)
+    if n < MIN_FRAMES_EARLY_EXIT:
+        sys.exit(f'只采到 {n} 帧 (< {MIN_FRAMES_EARLY_EXIT}), 不足以稳定解算; '
+                 '重新运行并多移动棋盘。')
+    if n < args.frames:
+        print(f'注意: 仅采到 {n} 帧 (目标 {args.frames}), 结果可能略糙')
+
+    print(f'\n解算 {n} 帧...')
+    rms, K, D = calibrate(obj_points, img_points, size)
+
+    fx, cx = K[0][0], K[0][2]
+    fy, cy = K[1][1], K[1][2]
+    print(f'  分辨率: {size[0]}x{size[1]}')
+    print(f'  fx={fx:.2f}  fy={fy:.2f}  cx={cx:.2f}  cy={cy:.2f}')
+    print(f'  畸变:   {[round(float(v), 6) for v in D.flatten()]}')
+    print(f'  RMS:    {rms:.4f} px '
+          f'({"优" if rms < 0.5 else "可用" if rms < 1.0 else "偏大, 建议重标"})')
+
+    out = os.path.abspath(args.out)
+    save_yaml(out, size, K, D, rms, args.url)
+    print(f'\n已保存: {out}')
+    print('\n下一步 (机器狗停泊):')
+    print(f'  ros2 launch tagdocking docking.launch.py base_type:=omni \\')
+    print(f'      rtsp_url:={args.url} \\')
+    print(f'      camera_info_file:={out} \\')
+    print(f'      odom_topic:=<狗的里程计话题> camera_mount_z:=<相机高度 m>')
+
+
+if __name__ == '__main__':
+    main()

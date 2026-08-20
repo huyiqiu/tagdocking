@@ -17,3 +17,6 @@ __pycache__/
 .claude/
 .vscode/
 .idea/
+
+# 本地参考资料 (SDK 文档/二进制, 不进仓库)
+reference/

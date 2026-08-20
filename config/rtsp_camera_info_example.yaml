@@ -1,0 +1,23 @@
+# rtsp_camera 相机内参【示例】— 数值是占位的, 不要直接使用!
+#
+# 复制为 rtsp_camera_info.yaml 并用真实标定值替换:
+#   python3 scripts/calibrate_rtsp --url rtsp://192.168.x.x:8554/live \
+#       --out config/rtsp_camera_info.yaml
+#
+# 内参错误会导致 AprilTag 测距完全不准 (差 10% 的焦距 = 差 10% 的距离)。
+#
+# 格式说明:
+#   width/height      标定时的流分辨率, 应与 rtsp 实际拉流分辨率一致
+#                     (不一致时 rtsp_camera 会按比例缩放并告警)
+#   camera_matrix     内参 3x3, 也接受 9 元素扁平列表或 {fx, fy, cx, cy} 字典
+#   distortion        畸变系数 [k1, k2, p1, p2, k3] (与分辨率无关, 不缩放)
+#   distortion_model  plumb_bob (opencv 惯例)
+
+width: 1920
+height: 1080
+camera_matrix:
+  - [1234.5, 0.0, 960.0]
+  - [0.0, 1236.7, 540.0]
+  - [0.0, 0.0, 1.0]
+distortion: [-0.28, 0.12, 0.001, -0.002, 0.0]
+distortion_model: plumb_bob

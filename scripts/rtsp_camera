@@ -1,0 +1,19 @@
+#!/usr/bin/env python3
+"""Entry-point script for the RTSP → ROS2 camera bridge.
+
+Usage:
+    # 先标定: python3 scripts/calibrate_rtsp --url rtsp://...
+    ros2 run tagdocking rtsp_camera --ros-args \\
+        -p rtsp_url:="rtsp://192.168.1.100:8554/live" \\
+        -p camera_info_file:=/path/to/rtsp_camera_info.yaml
+
+    # or via launch (rtsp 模式自动拉起):
+    ros2 launch tagdocking docking.launch.py rtsp_url:=rtsp://... \\
+        camera_info_file:=...
+"""
+
+from tagdocking.rtsp_camera import main
+
+
+if __name__ == '__main__':
+    main()

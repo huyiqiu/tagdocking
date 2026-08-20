@@ -24,6 +24,8 @@ install(
 install(PROGRAMS
   scripts/docking_node
   scripts/camera_info_bridge
+  scripts/rtsp_camera
+  scripts/calibrate_rtsp
   scripts/test_turn_angle
   scripts/test_jog_distance
   scripts/test_apriltag
