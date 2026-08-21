@@ -64,6 +64,7 @@ def launch_setup(context):
     rtsp_url = LaunchConfiguration('rtsp_url').perform(context).strip()
     camera_info_file = LaunchConfiguration('camera_info_file').perform(context).strip()
     camera_downscale = int(LaunchConfiguration('camera_downscale').perform(context) or 0)
+    camera_backend = LaunchConfiguration('camera_backend').perform(context)
     odom_topic = LaunchConfiguration('odom_topic').perform(context)
     base_frame = LaunchConfiguration('base_frame').perform(context)
     mount_x = float(LaunchConfiguration('camera_mount_x').perform(context) or 0.0)
@@ -109,6 +110,7 @@ def launch_setup(context):
                 'camera_info_out_topic': sync_info_topic,
                 'frame_id': camera_frame,
                 'downscale': camera_downscale,
+                'capture_backend': camera_backend,
                 'base_frame': base_frame,
                 'mount.x': mount_x,
                 'mount.y': mount_y,
@@ -226,6 +228,9 @@ def generate_launch_description():
                                          'scripts/calibrate_rtsp 生成)'),
         DeclareLaunchArgument('camera_downscale', default_value='0',
                              description='RTSP 输出降采样倍数 (0=自动到 ~640 宽)'),
+        DeclareLaunchArgument('camera_backend', default_value='ffmpeg',
+                             description='RTSP 拉流后端: ffmpeg | gstreamer '
+                                         '(Jetson 硬解, FFmpeg 解码冻结时用)'),
         DeclareLaunchArgument('odom_topic', default_value='/odom_combined',
                              description='里程计话题 (机器狗按其实际话题设置)'),
         DeclareLaunchArgument('base_frame', default_value='base_link',

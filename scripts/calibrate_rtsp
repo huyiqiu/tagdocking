@@ -11,7 +11,15 @@ camera_calibration; 本脚本用 OpenCV 直接拉流做棋盘格标定, 输出�
 ----
     python3 scripts/calibrate_rtsp --url rtsp://192.168.1.100:8554/live \\
         [--size 9x6] [--square 0.025] [--frames 20] \\
-        [--out config/rtsp_camera_info.yaml] [--show]
+        [--backend gstreamer] [--out config/rtsp_camera_info.yaml] [--show]
+
+拉流后端
+--------
+    --backend ffmpeg (默认) 用 OpenCV 的 FFmpeg 后端。Jetson 上若出现
+        cap.read() 冻结帧 (--show 画面卡住不动、检测永远失败), 换
+        --backend gstreamer: 走 rtspsrc + decodebin (nvv4l2decoder 硬解)
+        管线, 是 Jetson 拉 RTSP 的最稳方式。要求 OpenCV 编译了
+        GStreamer 支持 (JetPack 自带 OpenCV 默认开启)。
 
 标定操作
 --------
@@ -29,6 +37,8 @@ camera_calibration; 本脚本用 OpenCV 直接拉流做棋盘格标定, 输出�
     --out     输出 YAML 路径, 默认 config/rtsp_camera_info.yaml。
     --show    有 DISPLAY 时实时显示棋盘检测画面 (ssh -X / 本机有桌面时用;
               无头模式不用它, 进度看终端打印)。
+    --backend 拉流后端 ffmpeg|gstreamer (默认 ffmpeg; Jetson 冻结时换 gstreamer)。
+    --gst-latency  GStreamer rtspsrc 抖动缓冲 ms (默认 200)。
 """
 
 import argparse
@@ -55,6 +65,42 @@ MIN_MOVE_PX = 40.0           # 棋盘平均角点位移低于此值(像素)不�
 MIN_INTERVAL_SEC = 1.0       # 两次采帧最小间隔
 
 
+def _gst_pipelines(url, latency_ms):
+    """候选 GStreamer 管线, 按优先级排列。
+
+    Jetson: decodebin 自动选 nvv4l2decoder 硬解, nvvidconv 把 NVMM 帧转系统
+    内存 BGRx; 非 Jetson 无 nvvidconv 插件, 回退纯 videoconvert 管线
+    (decodebin 走 avdec 软解)。protocols=tcp 与 FFmpeg 后端一致, 防 UDP
+    丢包花屏; appsink drop+max-buffers=1 始终取最新帧, 不积压涨延迟。
+    """
+    tail = 'appsink drop=true max-buffers=1 sync=false'
+    src = f'rtspsrc location={url} latency={latency_ms} protocols=tcp'
+    return [
+        f'{src} ! decodebin ! nvvidconv ! video/x-raw,format=BGRx ! '
+        f'videoconvert ! video/x-raw,format=BGR ! {tail}',
+        f'{src} ! decodebin ! videoconvert ! video/x-raw,format=BGR ! {tail}',
+    ]
+
+
+def open_capture(url, backend, gst_latency):
+    """按后端打开流, 成功返回 VideoCapture, 失败返回 None。"""
+    if backend == 'gstreamer':
+        if 'GStreamer: YES' not in cv2.getBuildInformation():
+            sys.exit('当前 OpenCV 未编译 GStreamer 支持, --backend gstreamer 不可用。\n'
+                     'Jetson 请用 JetPack 自带 OpenCV, 或检查 cv2.getBuildInformation()。')
+        for pipe in _gst_pipelines(url, gst_latency):
+            cap = cv2.VideoCapture(pipe, cv2.CAP_GSTREAMER)
+            if cap.isOpened():
+                print(f'GStreamer 管线: {pipe}')
+                return cap
+            cap.release()
+        return None
+    cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
+    if not cap.isOpened():
+        return None
+    return cap
+
+
 def parse_args():
     p = argparse.ArgumentParser(
         description='RTSP 相机棋盘格标定 (生成 rtsp_camera 内参 YAML)',
@@ -73,6 +119,10 @@ def parse_args():
                    help='输出 YAML (默认 <包>/config/rtsp_camera_info.yaml)')
     p.add_argument('--show', action='store_true',
                    help='实时显示检测画面 (需 DISPLAY)')
+    p.add_argument('--backend', default='ffmpeg', choices=['ffmpeg', 'gstreamer'],
+                   help='拉流后端 (默认 ffmpeg; Jetson 上 FFmpeg 冻结时用 gstreamer 硬解)')
+    p.add_argument('--gst-latency', type=int, default=200,
+                   help='GStreamer rtspsrc 抖动缓冲 ms (默认 200)')
     args = p.parse_args()
 
     try:
@@ -110,12 +160,12 @@ def find_corners(gray, pattern):
     return corners.reshape(-1, 1, 2).astype(np.float32)
 
 
-def collect(url, pattern, square, n_frames, timeout, show):
+def collect(url, pattern, square, n_frames, timeout, show, backend, gst_latency):
     """拉流采帧, 返回 (obj_points, img_points, size)。"""
-    cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
-    if not cap.isOpened():
-        sys.exit(f'RTSP 连接失败: {url} (检查地址/网络/相机供电)')
-    print(f'已连接 {url}, 等待画面...')
+    cap = open_capture(url, backend, gst_latency)
+    if cap is None:
+        sys.exit(f'RTSP 连接失败: {url} (backend={backend}; 检查地址/网络/相机供电)')
+    print(f'已连接 {url} (backend={backend}), 等待画面...')
 
     # 物方角点 (棋盘坐标系, z=0)
     pw, ph = pattern
@@ -218,7 +268,7 @@ def main():
 
     obj_points, img_points, size = collect(
         args.url, args.pattern, args.square, args.frames,
-        args.timeout, args.show)
+        args.timeout, args.show, args.backend, args.gst_latency)
 
     n = len(obj_points)
     if n < MIN_FRAMES_EARLY_EXIT:

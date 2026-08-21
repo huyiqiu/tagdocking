@@ -242,6 +242,7 @@ python3 scripts/calibrate_rtsp --url rtsp://192.168.1.100:8554/live \
     --size 9x6 --square 0.025
 # 手持棋盘在相机前 0.2~1m 移动 (远近/平移/倾斜, 覆盖四角), 自动采帧解算
 # → 生成 config/rtsp_camera_info.yaml (内参)
+# Jetson 上若 --show 画面冻结/始终检测不到(FFmpeg 解码问题), 加 --backend gstreamer 硬解
 ```
 
 **第 2 步 — 验证检测**（强烈建议先做，排除内参/TF 问题）：
@@ -283,6 +284,7 @@ ros2 launch tagdocking docking.launch.py \
 | `camera_mount_x/y/z` | 相机在 base_link 下的安装位置（米） |
 | `camera_mount_yaw/pitch/roll_deg` | 相机安装姿态（0=正前水平；低头用正 pitch，抬头用负 pitch） |
 | `camera_downscale` | 输出降采样（0=自动到 ~640 宽，防大帧打爆 DDS） |
+| `camera_backend` | RTSP 拉流后端 `ffmpeg`（默认）/ `gstreamer`（Jetson 硬解，FFmpeg 冻结时用） |
 | `base_frame` | 狗的基座坐标系名（默认 `base_link`） |
 
 **RTSP 延迟注意**：帧打的是到达时间戳，画面内容比时间戳旧 0.1~0.5s。

@@ -8,7 +8,8 @@
   3. 没有 base_link→相机坐标系 的 TF(docking_node 按 base_link 系测量)。
 
 本节点一次补齐:
-  - 后台线程用 OpenCV(FFmpeg 后端) 拉 RTSP 流, 每帧以**到达时刻**打戳,
+  - 后台线程用 OpenCV 拉 RTSP 流(FFmpeg 或 GStreamer 后端, 见
+    capture_backend 参数), 每帧以**到达时刻**打戳,
     发布 Image 到 image_out_topic (默认 /camera_sync/image_raw);
   - 内参来自 YAML 文件(camera_info_file, 由 scripts/calibrate_rtsp 生成)
     或内联参数, 合成 CameraInfo(与 Image 同一时间戳, 逐帧配对)发布到
@@ -166,6 +167,11 @@ class RtspCameraNode(Node):
         self.declare_parameter('image_out_topic', '/camera_sync/image_raw')
         self.declare_parameter('camera_info_out_topic', '/camera_sync/camera_info')
         self.declare_parameter('frame_id', 'camera_color_optical_frame')
+        # 拉流后端: ffmpeg (默认) | gstreamer。
+        # Jetson 上 FFmpeg 后端对某些流(H.265/高码率)会解出冻结残帧
+        # (画面卡住、检测永远失败), 换 gstreamer 走 nvv4l2decoder 硬解。
+        self.declare_parameter('capture_backend', 'ffmpeg')
+        self.declare_parameter('gst_latency', 200)  # rtspsrc 抖动缓冲 ms
 
         # 内参来源 1: YAML 文件 (推荐, scripts/calibrate_rtsp 生成)
         self.declare_parameter('camera_info_file', '')
@@ -381,6 +387,8 @@ class RtspCameraNode(Node):
 
     def _open_capture(self):
         """打开 RTSP 流, 失败返回 None。"""
+        if str(self._p('capture_backend')) == 'gstreamer':
+            return self._open_gstreamer()
         cap = cv2.VideoCapture(self._url, cv2.CAP_FFMPEG)
         # 对 FFMPEG 后端此设置多数版本被忽略, 但无害; 读线程逐帧消费,
         # 不积压即不涨延迟。
@@ -392,6 +400,35 @@ class RtspCameraNode(Node):
             cap.release()
             return None
         return cap
+
+    def _open_gstreamer(self):
+        """GStreamer 管线打开流: Jetson 硬解管线优先, 失败回退通用管线。
+
+        Jetson: decodebin 自动选 nvv4l2decoder 硬解, nvvidconv 把 NVMM 帧转
+        系统内存 BGRx; 非 Jetson 无 nvvidconv 插件, 回退纯 videoconvert
+        (decodebin 走 avdec 软解)。protocols=tcp 与 FFmpeg 后端一致防 UDP
+        花屏; appsink drop+max-buffers=1 始终取最新帧, 不积压涨延迟。
+        """
+        if 'GStreamer: YES' not in cv2.getBuildInformation():
+            self.get_logger().error(
+                '当前 OpenCV 未编译 GStreamer 支持, capture_backend:=gstreamer '
+                '不可用 (Jetson 请用 JetPack 自带 OpenCV)')
+            return None
+        latency = int(self._p('gst_latency'))
+        tail = 'appsink drop=true max-buffers=1 sync=false'
+        src = f'rtspsrc location={self._url} latency={latency} protocols=tcp'
+        pipes = [
+            f'{src} ! decodebin ! nvvidconv ! video/x-raw,format=BGRx ! '
+            f'videoconvert ! video/x-raw,format=BGR ! {tail}',
+            f'{src} ! decodebin ! videoconvert ! video/x-raw,format=BGR ! {tail}',
+        ]
+        for pipe in pipes:
+            cap = cv2.VideoCapture(pipe, cv2.CAP_GSTREAMER)
+            if cap.isOpened():
+                self.get_logger().info(f'GStreamer 管线: {pipe}')
+                return cap
+            cap.release()
+        return None
 
     def _capture_loop(self):
         """采集线程: 连接 → 循环读帧发布 → 断流重连。"""
