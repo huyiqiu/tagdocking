@@ -406,9 +406,12 @@ class RtspCameraNode(Node):
         """GStreamer 管线打开流: Jetson 硬解管线优先, 失败回退通用管线。
 
         Jetson: decodebin 自动选 nvv4l2decoder 硬解, nvvidconv 把 NVMM 帧转
-        系统内存 BGRx; 非 Jetson 无 nvvidconv 插件, 回退纯 videoconvert
-        (decodebin 走 avdec 软解)。protocols=tcp 与 FFmpeg 后端一致防 UDP
-        花屏; appsink drop+max-buffers=1 始终取最新帧, 不积压涨延迟。
+        系统内存后由 videoconvert 出 BGR。⚠ 不要给 nvvidconv 加显式
+        video/x-raw,format=BGRx 中间 caps: 部分 JetPack 上该路径经 appsink
+        出全黑帧 (gst-launch 无 caps 同路径正常) — 已实测踩坑。
+        非 Jetson 无 nvvidconv 插件, 回退纯 videoconvert (decodebin 走
+        avdec 软解)。protocols=tcp 防 UDP 花屏; appsink drop+max-buffers=1
+        始终取最新帧, 不积压涨延迟。
         """
         # build info 是列对齐格式, "GStreamer:" 与 YES 间是多个空格, 不能用单空格子串匹配
         if not re.search(r'GStreamer:\s+YES', cv2.getBuildInformation()):
@@ -420,7 +423,9 @@ class RtspCameraNode(Node):
         tail = 'appsink drop=true max-buffers=1 sync=false'
         src = f'rtspsrc location={self._url} latency={latency} protocols=tcp'
         pipes = [
-            f'{src} ! decodebin ! nvvidconv ! video/x-raw,format=BGRx ! '
+            f'{src} ! decodebin ! nvvidconv ! videoconvert ! '
+            f'video/x-raw,format=BGR ! {tail}',
+            f'{src} ! decodebin ! nvvidconv ! video/x-raw,format=I420 ! '
             f'videoconvert ! video/x-raw,format=BGR ! {tail}',
             f'{src} ! decodebin ! videoconvert ! video/x-raw,format=BGR ! {tail}',
         ]

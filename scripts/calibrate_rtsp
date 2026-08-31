@@ -70,14 +70,19 @@ def _gst_pipelines(url, latency_ms):
     """候选 GStreamer 管线, 按优先级排列。
 
     Jetson: decodebin 自动选 nvv4l2decoder 硬解, nvvidconv 把 NVMM 帧转系统
-    内存 BGRx; 非 Jetson 无 nvvidconv 插件, 回退纯 videoconvert 管线
-    (decodebin 走 avdec 软解)。protocols=tcp 与 FFmpeg 后端一致, 防 UDP
-    丢包花屏; appsink drop+max-buffers=1 始终取最新帧, 不积压涨延迟。
+    内存后由 videoconvert 出 BGR。⚠ 不要给 nvvidconv 加显式
+    video/x-raw,format=BGRx 中间 caps: 部分 JetPack 上该路径经 appsink 出
+    全黑帧 (gst-launch 无 caps 同路径正常) — 已实测踩坑。
+    非 Jetson 无 nvvidconv 插件, 回退纯 videoconvert 管线 (decodebin 走
+    avdec 软解)。protocols=tcp 防 UDP 丢包花屏; appsink drop+max-buffers=1
+    始终取最新帧, 不积压涨延迟。
     """
     tail = 'appsink drop=true max-buffers=1 sync=false'
     src = f'rtspsrc location={url} latency={latency_ms} protocols=tcp'
     return [
-        f'{src} ! decodebin ! nvvidconv ! video/x-raw,format=BGRx ! '
+        f'{src} ! decodebin ! nvvidconv ! videoconvert ! '
+        f'video/x-raw,format=BGR ! {tail}',
+        f'{src} ! decodebin ! nvvidconv ! video/x-raw,format=I420 ! '
         f'videoconvert ! video/x-raw,format=BGR ! {tail}',
         f'{src} ! decodebin ! videoconvert ! video/x-raw,format=BGR ! {tail}',
     ]
