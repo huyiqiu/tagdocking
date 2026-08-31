@@ -44,6 +44,7 @@ camera_calibration; 本脚本用 OpenCV 直接拉流做棋盘格标定, 输出�
 import argparse
 import datetime
 import os
+import re
 import sys
 import time
 
@@ -85,7 +86,8 @@ def _gst_pipelines(url, latency_ms):
 def open_capture(url, backend, gst_latency):
     """按后端打开流, 成功返回 VideoCapture, 失败返回 None。"""
     if backend == 'gstreamer':
-        if 'GStreamer: YES' not in cv2.getBuildInformation():
+        # build info 是列对齐格式, "GStreamer:" 与 YES 间是多个空格, 不能用单空格子串匹配
+        if not re.search(r'GStreamer:\s+YES', cv2.getBuildInformation()):
             sys.exit('当前 OpenCV 未编译 GStreamer 支持, --backend gstreamer 不可用。\n'
                      'Jetson 请用 JetPack 自带 OpenCV, 或检查 cv2.getBuildInformation()。')
         for pipe in _gst_pipelines(url, gst_latency):

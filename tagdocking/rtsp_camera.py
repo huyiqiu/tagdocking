@@ -47,6 +47,7 @@ camera_info 时间戳天然逐帧一致, 且内含降采样, 少一跳大帧 DDS
 
 import math
 import os
+import re
 import threading
 import time
 
@@ -409,7 +410,8 @@ class RtspCameraNode(Node):
         (decodebin 走 avdec 软解)。protocols=tcp 与 FFmpeg 后端一致防 UDP
         花屏; appsink drop+max-buffers=1 始终取最新帧, 不积压涨延迟。
         """
-        if 'GStreamer: YES' not in cv2.getBuildInformation():
+        # build info 是列对齐格式, "GStreamer:" 与 YES 间是多个空格, 不能用单空格子串匹配
+        if not re.search(r'GStreamer:\s+YES', cv2.getBuildInformation()):
             self.get_logger().error(
                 '当前 OpenCV 未编译 GStreamer 支持, capture_backend:=gstreamer '
                 '不可用 (Jetson 请用 JetPack 自带 OpenCV)')
