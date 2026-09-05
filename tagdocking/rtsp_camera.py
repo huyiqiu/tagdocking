@@ -45,6 +45,7 @@ camera_info 时间戳天然逐帧一致, 且内含降采样, 少一跳大帧 DDS
         odom_topic:=/odom camera_mount_z:=0.35
 """
 
+import array
 import math
 import os
 import re
@@ -143,6 +144,7 @@ class RtspCameraNode(Node):
         self._last_frame_mono = 0.0
         self._reconnects = 0
         self._stream_wh = None
+        self._src_wh = None   # 流源分辨率 (供硬件缩放定宽高; 与发布帧尺寸区分)
         self._last_stats_mono = time.monotonic()
         self._last_stats_count = 0
         self._stats_timer = self.create_timer(5.0, self._log_stats)
@@ -193,7 +195,9 @@ class RtspCameraNode(Node):
         self.declare_parameter('downscale', 0)
         self.declare_parameter('target_width', 640)
 
-        self.declare_parameter('max_fps', 0.0)          # 0 = 不限流
+        self.declare_parameter('max_fps', 10.0)         # 0 = 不限流。
+        # 默认 10fps: 走停式停靠在 settle 窗口 (0.8s) 静止后才采帧, 10fps 足够;
+        # 消费端仍全速读流防积压, 超额帧在 _pump 丢弃, 只降 DDS/apriltag 负载。
         self.declare_parameter('reconnect_sec', 2.0)    # 断流重连间隔
         self.declare_parameter('frame_timeout_sec', 5.0)  # 无帧告警阈值
 
@@ -412,6 +416,13 @@ class RtspCameraNode(Node):
         非 Jetson 无 nvvidconv 插件, 回退纯 videoconvert (decodebin 走
         avdec 软解)。protocols=tcp 防 UDP 花屏; appsink drop+max-buffers=1
         始终取最新帧, 不积压涨延迟。
+
+        ⚠ 延迟积压教训: 若让 1080p 全分辨率帧走 videoconvert 软件转换,
+        Jetson CPU 只能消化 ~5-8fps, 而流是 30fps — decodebin 内部 multiqueue
+        无限积压, 延迟随运行时间线性增长 (每秒涨 ~1s, 几分钟即几十秒)。
+        因此首选管线让 nvvidconv **在硬件里先缩放**到输出宽度再出系统内存
+        (需先探测流分辨率定宽高, 见 _hw_scale_caps), 软件转换量降 ~10 倍;
+        并加 drop-on-latency 与漏队列兜底, 保证消费 ≥ 产出, 不积压。
         """
         # build info 是列对齐格式, "GStreamer:" 与 YES 间是多个空格, 不能用单空格子串匹配
         if not re.search(r'GStreamer:\s+YES', cv2.getBuildInformation()):
@@ -420,9 +431,17 @@ class RtspCameraNode(Node):
                 '不可用 (Jetson 请用 JetPack 自带 OpenCV)')
             return None
         latency = int(self._p('gst_latency'))
-        tail = 'appsink drop=true max-buffers=1 sync=false'
-        src = f'rtspsrc location={self._url} latency={latency} protocols=tcp'
-        pipes = [
+        tail = ('queue leaky=downstream max-size-buffers=2 ! '
+                'appsink drop=true max-buffers=1 sync=false')
+        src = (f'rtspsrc location={self._url} latency={latency} '
+               f'protocols=tcp drop-on-latency=true')
+        scale_caps = self._hw_scale_caps()
+        pipes = []
+        if scale_caps:
+            pipes.append(
+                f'{src} ! decodebin ! nvvidconv ! {scale_caps} ! '
+                f'videoconvert ! video/x-raw,format=BGR ! {tail}')
+        pipes += [
             f'{src} ! decodebin ! nvvidconv ! videoconvert ! '
             f'video/x-raw,format=BGR ! {tail}',
             f'{src} ! decodebin ! nvvidconv ! video/x-raw,format=I420 ! '
@@ -436,6 +455,49 @@ class RtspCameraNode(Node):
                 return cap
             cap.release()
         return None
+
+    def _hw_scale_caps(self):
+        """硬件缩放 caps 字符串; 无法确定流分辨率或无需缩放时返回 None。
+
+        实测 1080p 流若不给 width/height 只给 width, caps fixation 会把高度
+        fixate 成输入高度 (640x1080 画面被压扁), 故必须按流原始宽高比显式
+        给出 width 和 height。
+        """
+        sw, sh = self._src_wh or (None, None)
+        if not sw:
+            sw, sh = self._probe_stream_res()
+        if not sw:
+            return None
+        if self._downscale > 0:
+            f = self._downscale
+            w, h = sw // f, sh // f
+        else:
+            w = min(self._target_width, sw)
+            h = round(sh * w / sw / 2) * 2
+            w = round(w / 2) * 2
+        if w <= 0 or h <= 0 or (w >= sw and h >= sh):
+            return None   # 流本身就不大, 无需硬件缩放
+        self.get_logger().info(
+            f'硬件缩放: {sw}x{sh} → {w}x{h} (nvvidconv, 避免全分辨率软件转换积压)')
+        return f'video/x-raw,format=I420,width={w},height={h}'
+
+    def _probe_stream_res(self):
+        """ffmpeg 快速探测流分辨率 (只读一帧即断开), 供硬件缩放定宽高。
+
+        只取尺寸不用于解码, ffmpeg 后端的冻结帧问题在此无关紧要。
+        失败返回 (0, 0), 调用方回退到不缩放管线。
+        """
+        try:
+            cap = cv2.VideoCapture(self._url, cv2.CAP_FFMPEG)
+            ok, frame = cap.read()
+            cap.release()
+            if ok and frame is not None:
+                sh, sw = frame.shape[:2]
+                self._src_wh = (sw, sh)
+                return sw, sh
+        except Exception as exc:   # 探测失败不致命, 回退不缩放管线
+            self.get_logger().warn(f'探测流分辨率失败: {exc}')
+        return 0, 0
 
     def _capture_loop(self):
         """采集线程: 连接 → 循环读帧发布 → 断流重连。"""
@@ -455,6 +517,7 @@ class RtspCameraNode(Node):
             cap.release()
             if rclpy.ok() and not self._stop.is_set():
                 self._reconnects += 1
+                self._src_wh = None   # 断流后重探测, 防相机分辨率变化后缩放错位
                 self.get_logger().warn(
                     f'RTSP 流中断, {self._reconnect_sec:.1f}s 后重连 '
                     f'(累计 {self._reconnects} 次)',
@@ -503,7 +566,9 @@ class RtspCameraNode(Node):
             img.encoding = 'bgr8'
             img.step = img.width * frame.shape[2]
         img.is_bigendian = 0
-        img.data = frame.tobytes()
+        # array.array('B') 走 Image.data 快路径(直接引用); 传 bytes 会触发 setter
+        # 的逐元素校验(全帧两遍 Python 迭代, 640x360 一帧 >100ms), 8fps 即打满一核
+        img.data = array.array('B', frame.tobytes())
 
         info = CameraInfo()
         info.header.stamp = stamp

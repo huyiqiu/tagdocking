@@ -30,6 +30,8 @@ camera_info_out_topic  桥输出的 camera_info 话题 (默认 /camera_sync/came
     ros2 run tagdocking camera_info_bridge
 """
 
+import array
+
 import numpy as np
 import rclpy
 from rclpy.node import Node
@@ -133,7 +135,9 @@ class CameraInfoBridge(Node):
         try:
             arr = np.frombuffer(msg.data, dtype=np.uint8).reshape(h, w, bpp)
             small = arr[::f, ::f, :]
-            msg.data = small.tobytes()
+            # array.array('B') 走 Image.data 快路径; bytes 会触发 setter 逐元素
+            # 校验(全帧两遍 Python 迭代), 大帧下烧满 CPU (同 rtsp_camera 的教训)
+            msg.data = array.array('B', small.tobytes())
             msg.height = small.shape[0]
             msg.width = small.shape[1]
             msg.step = small.shape[1] * bpp

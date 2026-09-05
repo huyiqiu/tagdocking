@@ -98,6 +98,12 @@ class TestApriltag(Node):
         self._count = 0
         self._tf_fails = 0
         self._last_msg_ns = 0
+        self._last_det_ns = 0      # 最近一次目标 Tag 检出时刻: /detections 正常发布
+                                   # ≠ Tag 在画面里, 移开 Tag 后 apriltag_node 仍发空数组
+        self._stale_warned = False # 丢失警告详细版只打一次, 恢复检出后复位
+
+        # 丢失判定阈值: 发布 ~10fps, 1s ≈ 连续 10 帧无检出才算真丢了
+        self._stale_sec = 1.0
 
         self._summary_timer = self.create_timer(2.0, self._print_realtime)
         self._warn_timer = self.create_timer(4.0, self._warn_if_stale)
@@ -124,8 +130,16 @@ class TestApriltag(Node):
         for det in msg.detections:
             if det.id == self._tag_id:
                 self._count += 1
+                self._last_det_ns = self._last_msg_ns
+                self._stale_warned = False
                 self._lookup_and_log()
                 return
+
+    def _det_age(self) -> float:
+        """距最近一次目标 Tag 检出的秒数; 从未检出返回 inf。"""
+        if self._last_det_ns == 0:
+            return float('inf')
+        return (self.get_clock().now().nanoseconds - self._last_det_ns) / 1e9
 
     def _warn_if_stale(self):
         if self._last_msg_ns == 0 and self._count == 0:
@@ -134,6 +148,33 @@ class TestApriltag(Node):
             print('    2. Tag 是否在相机视野内?')
             print(f'    3. 相机坐标系是否为 "{self._camera_frame}"?')
             print('       (用 --camera-frame 指定实际帧名)')
+            print()
+        elif self._last_msg_ns != 0 and self._count == 0:
+            # /detections 在发但一直没有匹配 ID 的 tag — 之前这种情况会完全静默
+            print('  ⚠ 收到 /detections 但未见目标 Tag — 请确认:')
+            print(f'    1. 画面里的 Tag 是否为 {self._tag_frame}?')
+            print('    2. Tag 是否太远/太小/反光? 靠近到 1m 内再试')
+            print()
+        elif self._count > 0 and not self._buf_dist:
+            # 检到了 tag 但 TF 全部查询失败 — 同样会完全静默
+            print(f'  ⚠ 已检测到 Tag {self._count} 次, 但 TF 查询失败 '
+                  f'{self._tf_fails} 次 — 请确认:')
+            print('    1. 相机→Tag 的 TF 是否发布? (apriltag publish_tf)')
+            print('    2. 帧名是否匹配? (ros2 run tf2_tools view_frames)')
+            print()
+        elif self._count > 0 and self._buf_dist and self._det_age() > self._stale_sec:
+            # 曾检出过、链路正常, 但目标已连续 1s 无检出 — 移开/遮挡 Tag 就是这种
+            # 状态; 不提示的话汇总行会一直打丢失前的旧均值, 看起来像读数稳定
+            if not self._stale_warned:
+                print(f'  ⚠ Tag 已丢失 {self._det_age():.1f}s — apriltag_node 仍在发布, '
+                      f'但目标 Tag 不再出现 (移开/遮挡/太远?)')
+                print()
+                self._stale_warned = True
+        elif (self._last_msg_ns != 0 and self._count > 0 and not self._buf_dist
+              and (self.get_clock().now().nanoseconds - self._last_msg_ns) / 1e9 > 2.0):
+            # 检出过但 /detections 本身停更 >2s — 检测节点崩了或图像流断了
+            print('  ⚠ /detections 已停止发布 — 检查 apriltag_node 是否存活、'
+                  '图像话题是否还在发布')
             print()
 
     def _lookup_and_log(self):
@@ -203,6 +244,12 @@ class TestApriltag(Node):
 
     def _print_realtime(self):
         if len(self._buf_dist) < 3:
+            return
+        # deque 是丢失前的旧样本, 均值已冻结 — 继续打数值会让人误以为 Tag 还在
+        age = self._det_age()
+        if age > self._stale_sec:
+            print(f'\033[91m  ⚠ Tag 已丢失 {age:.0f}s — 上方汇总为丢失前缓存, '
+                  f'勿作决策依据\033[0m')
             return
         d_mean = statistics.mean(self._buf_dist)
         d_std  = statistics.stdev(self._buf_dist)
@@ -277,6 +324,11 @@ def _launch_apriltag_node(tag_family: str, tag_size: float, tag_id: int,
         '-p', f'tag_frames:=[{tag_frame}]',
         '-p', 'publish_tf:=true',
         '-p', 'z_up:=false',
+        # decimate=2 (apriltag_ros 默认) 检测前先把图降采样一半: rtsp_camera 桥
+        # 输出 ~640 宽, 1m 外 16cm tag 只剩 ~25px, 低于 36h11 可检下限 → 全空
+        # (实测 0/123 帧; 同数据 decimate=1 检出 107/107)。640x360 全分辨率
+        # 检测 CPU 开销可忽略, 故关闭降采样。
+        '-p', 'detector.decimate:=1.0',
         '-r', f'image_rect:={image_topic}',
     ]
     print(f'  启动 apriltag_node (Tag ID={tag_id}, {tag_size}m) ... ', end='', flush=True)
