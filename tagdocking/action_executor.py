@@ -104,7 +104,7 @@ class ActionExecutor:
     # ── Start actions ───────────────────────────────────────────────
 
     def start_jog(self, distance: float, linear_rate: float,
-                  blind: bool = False):
+                  blind: bool = False, odom_scale: float = 1.0):
         """Start a straight-line jog of `distance` metres.
 
         Positive = forward, negative = reverse.
@@ -114,6 +114,12 @@ class ActionExecutor:
         blind turn-drive-turn maneuver, where the pre-move tag pose is stale and
         the whole leg must be driven to completion regardless of what the
         (frozen) camera reading says.
+
+        odom_scale: some legged chassis (ZSL-1) under-report translation in
+        their odometry (measured ~2x low in reverse, ~4x low laterally; only
+        the IMU yaw is trustworthy). `distance` is expressed in REAL metres;
+        the stop target is divided by odom_scale so the run stops when the
+        TRUE displacement — not the under-reported odometry — reaches it.
         """
         if self._action != 'idle':
             return
@@ -121,7 +127,7 @@ class ActionExecutor:
         self._action = 'jogging'
         self._action_linear = linear_rate if distance >= 0 else -abs(linear_rate)
         self._action_angular = 0.0
-        self._action_target = abs(distance)
+        self._action_target = abs(distance) / max(odom_scale, 0.05)
         self._jog_blind = blind
 
     def start_turn(self, angle: float, angular_rate: float,
@@ -172,12 +178,19 @@ class ActionExecutor:
         self._action_target = abs(damped)
         return True
 
-    def start_jog_lateral(self, distance: float, lateral_rate: float):
+    def start_jog_lateral(self, distance: float, lateral_rate: float,
+                          odom_scale: float = 1.0):
         """Start a pure lateral move (omni/mecanum only).
 
         Positive distance = move left, negative = move right.
         Completion is tracked by projecting odometry displacement onto
         the lateral axis at the start of the action.
+
+        odom_scale: some legged chassis (ZSL-1) under-report lateral
+        displacement in their odometry (measured ~4x low). `distance`
+        is expressed in REAL metres; the odometry stop target is divided
+        by odom_scale so the run stops when the TRUE displacement — not
+        the under-reported odometry — reaches `distance`.
         """
         if self._action != 'idle':
             return
@@ -186,7 +199,7 @@ class ActionExecutor:
         self._action_lateral = lateral_rate if distance >= 0 else -abs(lateral_rate)
         self._action_linear = 0.0
         self._action_angular = 0.0
-        self._action_target = abs(distance)
+        self._action_target = abs(distance) / max(odom_scale, 0.05)
 
     # ── Set odometry reference ──────────────────────────────────────
 

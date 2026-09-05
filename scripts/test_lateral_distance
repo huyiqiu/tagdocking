@@ -1,0 +1,306 @@
+#!/usr/bin/env python3
+"""Lateral-jog distance accuracy test script (omni / quadruped chassis).
+
+Commands a pure lateral jog (positive = left, negative = right) and reports
+the difference between the commanded distance and the lateral displacement
+measured by odometry, using the SAME stop criterion as the real docking
+node (ActionExecutor lateral projection).
+
+Usage:
+    # 左移 0.3m（默认速度 0.15 m/s，狗 odom 默认话题）
+    python3 test_lateral_distance --distance 0.3
+
+    # 右移 0.5m
+    python3 test_lateral_distance --distance -0.5
+
+    # 自定义速度（必须大于 l1w_control 死区 min_linear_y=0.10）
+    python3 test_lateral_distance --distance 0.3 --speed 0.2
+
+报告除横向位移外，还量化横移步态的两个伴生漂移：
+  - 前向漂移: 横移时沿"前进轴"溜出去多少（腿式横移常见）
+  - 朝向漂移: 横移时身体转了多少度（横移伴随转身漂移）
+
+测试完成后请目测狗的实际移动距离并与报告中的 odom 横向位移对比：
+若两者差距明显，说明狗自身里程计对横移通道低估 —— 停靠判停会
+因此提前停车，真实位移超出预期。
+"""
+
+import argparse
+import math
+import sys
+import rclpy
+from rclpy.node import Node
+from rclpy.executors import ExternalShutdownException
+from geometry_msgs.msg import Twist
+from nav_msgs.msg import Odometry
+
+from tagdocking.action_executor import ActionExecutor
+from tagdocking.utils import yaw_from_quat
+
+_SETTLE = 1.0            # s  — 停车后等待里程计稳定
+_TIMEOUT_FACTOR = 10.0   # x  — 超时 = 预期时间 × 此系数（腿式横移远慢于指令速度）
+_MIN_SPEED = 0.10        # l1w_control clampAxis 的 min_linear_y 死区
+_PROGRESS_EVERY = 5.0    # s  — 横移过程中的进度打印间隔
+
+
+class TestLateralDistance(Node):
+    """Test lateral-jog distance accuracy (omni/mecanum chassis)."""
+
+    def __init__(self, distance=0.3, speed=0.15,
+                 cmd_vel_topic='cmd_vel', odom_topic='/dog/odom'):
+        super().__init__('test_lateral_distance')
+
+        self.declare_parameter('cmd_vel_topic', cmd_vel_topic)
+        self.declare_parameter('odom_topic', odom_topic)
+        self.declare_parameter('distance', distance)
+        self.declare_parameter('speed', speed)
+
+        self._distance = self._p('distance')
+        self._speed = abs(self._p('speed'))
+        if self._speed <= _MIN_SPEED:
+            self.get_logger().warn(
+                f'速度 {self._speed:.2f} 未超过 l1w_control 横移死区 '
+                f'{_MIN_SPEED}，指令将被截零、狗不会移动！')
+        # 腿式横移执行速度可能只有指令速度的 1/10，超时放宽
+        self._timeout = abs(self._distance) / self._speed * _TIMEOUT_FACTOR + 15.0
+
+        # ── Odometry ───────────────────────────────────────────────
+        self._odom_x = 0.0
+        self._odom_y = 0.0
+        self._odom_yaw = 0.0
+        self._has_odom = False
+        self._start_x = None
+        self._start_y = None
+        self._start_yaw = None
+        self._final_x = None
+        self._final_y = None
+        self._final_yaw = None
+        self._timed_out = False
+        self._last_progress_ns = 0
+
+        self._odom_sub = self.create_subscription(
+            Odometry, self._p('odom_topic'), self._on_odom, 10)
+
+        # ── Publisher ──────────────────────────────────────────────
+        self._pub = self.create_publisher(
+            Twist, self._p('cmd_vel_topic'), 10)
+
+        # ── ActionExecutor（与停靠节点相同的横移判停）─────────────
+        self._exec = ActionExecutor(
+            turn_settle_sec=0.0,
+            turn_undershoot=0.75,
+            max_turn_step=0.5)
+
+        self._phase = 'wait_odom'
+        self._phase_start_ns = 0
+
+        # ── Timer ──────────────────────────────────────────────────
+        self._timer = self.create_timer(0.05, self._loop)
+
+        dir_str = '左移' if self._distance >= 0 else '右移'
+        self.get_logger().info(
+            f'Lateral test ready | {abs(self._distance):.3f}m {dir_str} '
+            f'| speed={self._speed:.2f} m/s | 超时={self._timeout:.0f}s')
+
+    def _p(self, name):
+        return self.get_parameter(name).value
+
+    def _on_odom(self, msg: Odometry):
+        self._odom_x = msg.pose.pose.position.x
+        self._odom_y = msg.pose.pose.position.y
+        self._odom_yaw = yaw_from_quat(msg.pose.pose.orientation)
+        if not self._has_odom:
+            self._has_odom = True
+            self.get_logger().info(
+                f'里程计已连接 | 当前朝向: {math.degrees(self._odom_yaw):.1f}°')
+
+    def _lateral_progress(self) -> float:
+        """Projected displacement on the lateral axis at action start."""
+        dx = self._odom_x - self._start_x
+        dy = self._odom_y - self._start_y
+        cos_yaw = math.cos(self._start_yaw)
+        sin_yaw = math.sin(self._start_yaw)
+        return -sin_yaw * dx + cos_yaw * dy
+
+    def _loop(self):
+        now_ns = self.get_clock().now().nanoseconds
+
+        if self._phase == 'wait_odom':
+            if self._has_odom:
+                self._start_x = self._odom_x
+                self._start_y = self._odom_y
+                self._start_yaw = self._odom_yaw
+                self._exec.start_jog_lateral(self._distance, self._speed)
+                self._exec.set_odom_ref(
+                    self._odom_x, self._odom_y, self._odom_yaw)
+                self._phase = 'jog'
+                self._phase_start_ns = now_ns
+                self._last_progress_ns = now_ns
+                dir_str = '左移' if self._distance >= 0 else '右移'
+                self.get_logger().info(
+                    f'开始横移 | {abs(self._distance):.3f}m {dir_str} | '
+                    f'起点=({self._start_x:.3f}, {self._start_y:.3f}) '
+                    f'朝向={math.degrees(self._start_yaw):.1f}°')
+
+        elif self._phase == 'jog':
+            if self._exec.is_active:
+                elapsed = (now_ns - self._phase_start_ns) * 1e-9
+                if elapsed >= self._timeout:
+                    self._timed_out = True
+                    self._pub_lateral(0.0)
+                    self._exec.cancel()
+                    self._exec.mark_stop_time(now_ns)
+                    self._elapsed_s = elapsed
+                    self._phase = 'settle'
+                    self._phase_start_ns = now_ns
+                    self.get_logger().warn(
+                        f'超时 {self._timeout:.0f}s 未达到判停值，强制停车！'
+                        f'当前横移={self._lateral_progress():.3f}m')
+                    return
+                done = self._exec.update(
+                    self._odom_x, self._odom_y, self._odom_yaw,
+                    False, None,
+                    lambda: 0.0, lambda: 0.1,
+                    0.0, 0.3, now_ns)
+                if self._exec.is_active:
+                    self._pub_lateral(self._exec.lateral_cmd)
+                    if (now_ns - self._last_progress_ns) * 1e-9 >= _PROGRESS_EVERY:
+                        self._last_progress_ns = now_ns
+                        self.get_logger().info(
+                            f'  横移中… {self._lateral_progress():+.3f}m / '
+                            f'{self._distance:+.3f}m（判停用 odom 横向投影）')
+                else:
+                    self._pub_lateral(0.0)
+                    self._exec.mark_stop_time(now_ns)
+                    self._elapsed_s = elapsed
+                    self._phase = 'settle'
+                    self._phase_start_ns = now_ns
+                    self.get_logger().info('横移完成，等待里程计稳定…')
+
+        elif self._phase == 'settle':
+            self._pub_lateral(0.0)
+            if (now_ns - self._phase_start_ns) * 1e-9 >= _SETTLE:
+                self._final_x = self._odom_x
+                self._final_y = self._odom_y
+                self._final_yaw = self._odom_yaw
+                self._phase = 'report'
+                self._print_report()
+
+        elif self._phase == 'report':
+            self._pub_lateral(0.0)
+
+    def _pub_lateral(self, lateral: float):
+        msg = Twist()
+        msg.linear.y = float(lateral)   # REP-103: 正 = 左
+        self._pub.publish(msg)
+
+    def _print_report(self):
+        dx = self._final_x - self._start_x
+        dy = self._final_y - self._start_y
+        cos_yaw = math.cos(self._start_yaw)
+        sin_yaw = math.sin(self._start_yaw)
+        lateral = -sin_yaw * dx + cos_yaw * dy       # 横向（左正）
+        forward = cos_yaw * dx + sin_yaw * dy        # 前向
+        total = math.hypot(dx, dy)
+        error = lateral - self._distance
+        pct = error / max(abs(self._distance), 0.01) * 100
+        yaw_drift = math.degrees(_wrap(self._final_yaw - self._start_yaw))
+        elapsed = getattr(self, '_elapsed_s', None)
+
+        self.get_logger().info('')
+        self.get_logger().info('=' * 55)
+        self.get_logger().info('  横移距离精度报告')
+        self.get_logger().info('=' * 55)
+        if self._timed_out:
+            self.get_logger().info('  ⚠ 超时强制停车（未达到判停值）')
+        self.get_logger().info(f'  指令横移:     {self._distance:+8.3f} m '
+                               f'({"左" if self._distance >= 0 else "右"})')
+        self.get_logger().info(f'  起点:         ({self._start_x:.3f}, {self._start_y:.3f})')
+        self.get_logger().info(f'  终点:         ({self._final_x:.3f}, {self._final_y:.3f})')
+        self.get_logger().info(f'  Δx / Δy:      {dx:8.3f} / {dy:.3f} m')
+        self.get_logger().info(f'  横向位移:     {lateral:+8.3f} m   ← 判停依据')
+        self.get_logger().info(f'  前向漂移:     {forward:+8.3f} m   ← 横移伴随前后溜动')
+        self.get_logger().info(f'  总位移:       {total:8.3f} m')
+        self.get_logger().info(f'  朝向漂移:     {yaw_drift:8.2f}°   ← 横移伴随转身')
+        if elapsed is not None:
+            avg = abs(lateral) / elapsed if elapsed > 0.1 else 0.0
+            self.get_logger().info(f'  耗时:         {elapsed:8.1f} s   '
+                                   f'平均横移速度: {avg:.3f} m/s')
+        if not self._timed_out:
+            self.get_logger().info(f'  误差:         {error:+8.3f} m  ({pct:+.1f}%)')
+            passed = abs(pct) < 10
+            if passed:
+                self.get_logger().info(f'  结果:         ✓ PASS (误差<10%)')
+            else:
+                self.get_logger().info(f'  结果:         ✗ 误差偏大 (>{10}%)')
+        self.get_logger().info(f'  标定系数:     K = 实际位移 / {lateral:+.3f} '
+                               f'（卷尺量实际位移后填入 yaml 的 '
+                               f'stopgo.lateral_odom_scale）')
+        self.get_logger().info('-' * 55)
+        self.get_logger().info(
+            '  请目测狗本次实际移动了几厘米、朝哪边，与上方「横向位移」')
+        self.get_logger().info(
+            '  对比：若目测 ≫ odom（狗 odom 低估横移），停靠判停会提前停车。')
+        self.get_logger().info('=' * 55)
+        self.get_logger().info('')
+        self.get_logger().info('测试完成，按 Ctrl+C 退出。')
+        self._phase = 'done'
+
+
+def _wrap(a: float) -> float:
+    return math.atan2(math.sin(a), math.cos(a))
+
+
+def main(args=None):
+    argv = sys.argv[1:] if args is None else args
+    try:
+        ros_idx = argv.index('--ros-args')
+        argv = argv[:ros_idx]
+    except ValueError:
+        pass
+
+    parser = argparse.ArgumentParser(
+        description='横移距离精度测试（全向底盘 / 机器狗）',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+示例:
+  python3 test_lateral_distance --distance 0.3            # 左移 0.3m
+  python3 test_lateral_distance --distance -0.5           # 右移 0.5m
+  python3 test_lateral_distance --distance 0.3 --speed 0.2
+
+speed 默认 0.15 m/s。l1w_control 死区 min_linear_y=0.10：
+  速度低于 0.10 会被截零、狗不动、判停卡死。
+注意: 腿式横移步态很慢（实测可能只有指令速度的 1/10），
+  0.3m 可能需要 20s 以上，属正常现象，脚本带超时保护。""")
+
+    parser.add_argument('--distance', type=float, required=True,
+                        help='横移距离（米），正=左移，负=右移')
+    parser.add_argument('--speed', type=float, default=0.15,
+                        help='横移速度 (m/s)，默认 0.15，必须 > 0.10（死区）')
+    parser.add_argument('--cmd-vel-topic', default='cmd_vel', help=argparse.SUPPRESS)
+    parser.add_argument('--odom-topic', default='/dog/odom', help=argparse.SUPPRESS)
+    cli = parser.parse_args(argv)
+
+    rclpy.init(args=sys.argv if args is None else args)
+    node = TestLateralDistance(
+        distance=cli.distance, speed=cli.speed,
+        cmd_vel_topic=cli.cmd_vel_topic, odom_topic=cli.odom_topic)
+
+    def _finish():
+        # 先发零速停车; Ctrl+C 时 context 可能已被 rclpy 关掉, 失败就算了
+        try:
+            node._pub_lateral(0.0)
+        except Exception:
+            pass
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+
+    try:
+        rclpy.spin(node)
+    except (KeyboardInterrupt, ExternalShutdownException):
+        _finish()
+
+
+if __name__ == '__main__':
+    main()

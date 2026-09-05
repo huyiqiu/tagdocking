@@ -55,7 +55,7 @@ def launch_setup(context):
     dock_tag_id = int(LaunchConfiguration('dock_tag_id').perform(context))
     camera_frame = LaunchConfiguration('camera_frame').perform(context)
     cmd_vel_topic = LaunchConfiguration('cmd_vel_topic').perform(context)
-    base_type = LaunchConfiguration('base_type').perform(context)
+    base_type = LaunchConfiguration('base_type').perform(context).strip()
     dock_distance = float(LaunchConfiguration('dock_distance').perform(context))
     final_straight_distance = float(LaunchConfiguration('final_straight_distance').perform(context))
     final_straight_yaw_deg = float(LaunchConfiguration('final_straight_yaw_deg').perform(context))
@@ -65,7 +65,7 @@ def launch_setup(context):
     camera_info_file = LaunchConfiguration('camera_info_file').perform(context).strip()
     camera_downscale = int(LaunchConfiguration('camera_downscale').perform(context) or 0)
     camera_backend = LaunchConfiguration('camera_backend').perform(context)
-    odom_topic = LaunchConfiguration('odom_topic').perform(context)
+    odom_topic = LaunchConfiguration('odom_topic').perform(context).strip()
     base_frame = LaunchConfiguration('base_frame').perform(context)
     mount_x = float(LaunchConfiguration('camera_mount_x').perform(context) or 0.0)
     mount_y = float(LaunchConfiguration('camera_mount_y').perform(context) or 0.0)
@@ -156,6 +156,9 @@ def launch_setup(context):
             'tag_frames': [tag_frame],
             'publish_tf': True,
             'z_up': False,
+            # 默认 decimate=2 会把桥输出的 ~640 宽图再降一半, 远距离小 tag
+            # (1m 外 16cm ≈ 25px) 低于 36h11 检测下限 → 检测全空。关掉。
+            'detector.decimate': 1.0,
         }],
         remappings=[
             # 订阅桥的同步输出而非裸 image_raw; camera_info 自动派生到 sync_info_topic
@@ -179,14 +182,15 @@ def launch_setup(context):
                 'camera_frame': camera_frame,
                 'base_frame': base_frame,
                 'base.cmd_vel_topic': cmd_vel_topic,
-                'base.type': base_type,
-                'odom_topic': odom_topic,
                 # 两阶段停泊参数 (覆盖 yaml)
                 'dock_target.distance': dock_distance,
                 'final_straight.start_distance': final_straight_distance,
                 'final_straight.yaw_threshold_deg': final_straight_yaw_deg,
             },
-        ],
+            # base_type / odom_topic 为空时用 yaml 值 (yaml 权威): 只有显式传参
+            # 才覆盖, 避免无参启动时 launch 默认值悄悄顶掉 yaml 里的底盘配置。
+        ] + ([{'base.type': base_type}] if base_type else [])
+          + ([{'odom_topic': odom_topic}] if odom_topic else []),
         output='screen',
     ))
 
@@ -210,8 +214,9 @@ def generate_launch_description():
                              description='Camera optical frame name'),
         DeclareLaunchArgument('cmd_vel_topic', default_value='cmd_vel',
                              description='Velocity command topic'),
-        DeclareLaunchArgument('base_type', default_value='diff_drive',
-                             description='Chassis type: diff_drive, omni, quadruped'),
+        DeclareLaunchArgument('base_type', default_value='',
+                             description='Chassis type: diff_drive, omni, quadruped '
+                                         '(空 = 使用 config/docking.yaml 的 base.type)'),
         DeclareLaunchArgument('dock_distance', default_value='0.55',
                              description='最终停泊距离 (m), 底盘距 tag'),
         DeclareLaunchArgument('final_straight_distance', default_value='0.85',
@@ -231,8 +236,9 @@ def generate_launch_description():
         DeclareLaunchArgument('camera_backend', default_value='ffmpeg',
                              description='RTSP 拉流后端: ffmpeg | gstreamer '
                                          '(Jetson 硬解, FFmpeg 解码冻结时用)'),
-        DeclareLaunchArgument('odom_topic', default_value='/odom_combined',
-                             description='里程计话题 (机器狗按其实际话题设置)'),
+        DeclareLaunchArgument('odom_topic', default_value='',
+                             description='里程计话题 (空 = 使用 config/docking.yaml 的 '
+                                         'odom_topic; 机器狗为 /dog/odom)'),
         DeclareLaunchArgument('base_frame', default_value='base_link',
                              description='机器人基座坐标系 (静态 TF 父系 + docking 测量系)'),
         DeclareLaunchArgument('camera_mount_x', default_value='0.0',

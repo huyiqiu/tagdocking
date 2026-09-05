@@ -303,6 +303,13 @@ class DockingNode(Node):
         self.declare_parameter('stopgo.jog_angular_rate', 0.3)
         self.declare_parameter('stopgo.turn_creep_linear', 0.0)  # 已弃用，固定纯原地转
         self.declare_parameter('stopgo.lateral_rate', 0.08)
+        # 狗固件横移通道航位推算严重低估（实测 odom 0.507m / 实际约 2m，
+        # 低估 ~4 倍）：判停目标 = 距离/该系数，即真实位移达到目标时停。
+        self.declare_parameter('stopgo.lateral_odom_scale', 1.0)
+        # 前进/后退通道同样低估（后退实测 odom 0.493m / 实际 1m+，~2 倍；
+        # 前进待精标）。只有转向（IMU yaw）可信。
+        self.declare_parameter('stopgo.jog_odom_scale', 1.0)
+        self.declare_parameter('stopgo.jog_backward_odom_scale', 1.0)
         self.declare_parameter('stopgo.turn_settle_sec', 0.5)
         self.declare_parameter('stopgo.turn_undershoot', 0.75)
         self.declare_parameter('stopgo.max_turn_step', 0.3)
@@ -762,6 +769,23 @@ class DockingNode(Node):
                 f'走停 直线阶段 iter={self._maneuver_iters}: '
                 f'距离={tag_pose.dist:.3f}m → 目标={target_distance:.3f}m',
                 throttle_duration_sec=2.0)
+        elif self._is_omni(base_type):
+            # Omni：逐帧小步规划 —— 横移对中 → 原地微转 → 直线前进。
+            # 不用 plan_sequence 的法线盲机动：其 standoff 点 A = tag + d_target·n
+            # 在 dist ≈ d_target 时贴在机器人脚下, turn1=atan2(A) 对厘米级测量
+            # 噪声极敏感（实测 dock_distance=1.2 @ dist=1.28 规划出 ±44° 小挪
+            # 动）；且大角度盲转的腿式滑移让真实位移超出里程计判停值，下一轮
+            # 测量突变（dist 跌破 d_target → A 翻到身后 → 转 124° 往回走），
+            # 正反馈打转。omni 有横向自由度，直接横移消横偏，每步停稳重测，
+            # 转向只剩小角度对准。
+            step = self._planner.plan(tag_pose.dist, tag_pose.lat, bearing)
+            if step.kind == 'yaw':
+                # 大角度对准按 max_turn_step 分批：每步停稳重测，避免一次
+                # 大盲转的滑移污染下一轮测量。
+                step.turn_angle = math.copysign(
+                    min(abs(step.turn_angle), self._p('stopgo.max_turn_step')),
+                    step.turn_angle)
+            seq = [step]
         else:
             seq = self._planner.plan_sequence(
                 tag_pose.dist, tag_pose.lat, tag_pose.normal, yaw_tol=yaw_tol)
@@ -775,7 +799,10 @@ class DockingNode(Node):
             if p.kind == 'yaw':
                 steps.append(f'转 {math.degrees(p.turn_angle):+.1f}°')
             elif p.kind == 'forward':
-                steps.append(f'前进 {p.jog_distance:+.3f}m')
+                if abs(p.lateral_distance) > 1e-4:
+                    steps.append(f'横移 {p.lateral_distance:+.3f}m')
+                else:
+                    steps.append(f'前进 {p.jog_distance:+.3f}m')
             else:
                 steps.append(p.kind)
         self.get_logger().info(
@@ -832,7 +859,9 @@ class DockingNode(Node):
             self._sm.retry_search()
             self._adapter.publish_stop()
             return
-        self._executor.start_jog(-dist, rate, blind=True)
+        self._executor.start_jog(
+            -dist, rate, blind=True,
+            odom_scale=self._p('stopgo.jog_backward_odom_scale'))
         self._executor.set_odom_ref(self._odom_x, self._odom_y, self._odom_yaw)
         self._maneuver_active = True
         self._frozen = True
@@ -896,7 +925,9 @@ class DockingNode(Node):
             if dist < 1e-3:
                 self._undock_phase += 1   # 距离为 0, 跳过盲退直接转
             else:
-                self._executor.start_jog(-dist, rate, blind=True)
+                self._executor.start_jog(
+                    -dist, rate, blind=True,
+                    odom_scale=self._p('stopgo.jog_backward_odom_scale'))
                 self._executor.set_odom_ref(
                     self._odom_x, self._odom_y, self._odom_yaw)
                 self._maneuver_active = True
@@ -1044,7 +1075,8 @@ class DockingNode(Node):
         elif plan.kind == 'forward':
             if abs(plan.lateral_distance) > 1e-4 and self._is_omni(base_type):
                 self._executor.start_jog_lateral(
-                    plan.lateral_distance, self._p('stopgo.lateral_rate'))
+                    plan.lateral_distance, self._p('stopgo.lateral_rate'),
+                    odom_scale=self._p('stopgo.lateral_odom_scale'))
                 if not self._executor.is_active:
                     return False
                 self._executor.set_odom_ref(
@@ -1053,9 +1085,13 @@ class DockingNode(Node):
                     f'  子步：横移 {plan.lateral_distance:+.3f}m')
             else:
                 # Blind straight leg — odometry only, no visual early-stop.
+                # 平移里程计按通道低估，判停目标除以对应通道系数。
+                scale = (self._p('stopgo.jog_odom_scale')
+                         if plan.jog_distance >= 0
+                         else self._p('stopgo.jog_backward_odom_scale'))
                 self._executor.start_jog(
                     plan.jog_distance, self._p('stopgo.jog_linear_rate'),
-                    blind=True)
+                    blind=True, odom_scale=scale)
                 if not self._executor.is_active:
                     return False
                 self._executor.set_odom_ref(

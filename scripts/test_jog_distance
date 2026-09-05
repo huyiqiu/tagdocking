@@ -169,6 +169,10 @@ class TestJogDistance(Node):
         else:
             self.get_logger().info(f'  结果:         ✗ 误差偏大 (>{10}%)')
             self.get_logger().info(f'                建议: 检查轮径参数 / 降低 --speed 重试')
+        self.get_logger().info(f'  标定系数:     K = 实际位移 / {actual:.3f} '
+                               f'（卷尺量实际位移后填入 yaml：前进填 '
+                               f'stopgo.jog_odom_scale，后退填 '
+                               f'jog_backward_odom_scale）')
         self.get_logger().info('=' * 55)
         self.get_logger().info('')
         self.get_logger().info('测试完成，按 Ctrl+C 退出。')

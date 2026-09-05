@@ -34,7 +34,9 @@ docking_node:
     #   "diff_drive" — unicycle control (vx + wz only)
     #   "omni"       — full 3-DOF (vx, vy, wz) via cmd_vel
     #   "quadruped"  — SDK move(vx, vy, yaw_rate) callback
-    base.type: "diff_drive"
+    # 机器狗 (ZSL-1) 是全向底盘, 用 omni: 横向偏差直接横移修正,
+    # 经 l1w_control 的 /cmd_vel (vx/vy/wz) 下发。
+    base.type: "omni"
     base.cmd_vel_topic: "cmd_vel"
 
     # ── Stop-and-Go Parameters ──
@@ -46,7 +48,22 @@ docking_node:
     stopgo.jog_linear_rate: 0.08             # m/s — constant speed during forward jog
     stopgo.jog_angular_rate: 0.3             # rad/s — constant speed during turn
     stopgo.turn_creep_linear: 0.0            # m/s — 已弃用: "边走边转"叠加前进会驶出目标横向范围; 固定纯原地转, 角度靠里程计校准 (此参数不再被读取, 保留仅为兼容)
-    stopgo.lateral_rate: 0.08                # m/s — constant speed during lateral jog (omni)
+    # 必须 > l1w_control 的 min_linear_y 死区 (0.10): 低于死区的横移指令会被
+    # clampAxis 截成 0, 狗原地不动导致横移步判停卡死。取 0.12 留裕量。
+    stopgo.lateral_rate: 0.12                # m/s — constant speed during lateral jog (omni)
+    # 狗固件对横移通道的航位推算严重低估：实测 odom 记 0.507m、狗实际移约 2m
+    # （低估 ~4 倍，前进/转向通道正常）。判停目标 = 距离/该系数，即狗真实
+    # 位移达到目标时才判停。标定：跑 test_lateral_distance --distance 0.5，
+    # 卷尺量实际位移 L，系数 = L / 报告中的横向位移。
+    # 当前 1.0 = 未启用补偿（换设备测试中，待定标后回填）。
+    stopgo.lateral_odom_scale: 1.0
+    # 前进/后退通道同样低估（后退实测 odom 0.493m/实际 1m+，~2 倍；前进
+    # 用户报告误差也很大，倍数待精标）。标定：跑
+    # test_jog_distance --distance 0.3（前进）/ --distance -0.3（后退），
+    # 卷尺量实际位移 L，系数 = L / 报告中的实际位移。
+    # 当前 1.0 = 未启用补偿。
+    stopgo.jog_odom_scale: 1.0
+    stopgo.jog_backward_odom_scale: 1.0
     stopgo.turn_settle_sec: 0.8              # s — wait after turn for image to clear (加长: 避免模糊帧被 jump rejection 误拒)
     stopgo.turn_undershoot: 0.75             # fraction — turn only x% of commanded angle
     stopgo.max_turn_step: 0.17               # rad (~10°) — 单次转向硬上限, 小步转+每步重看, 低帧率下 tag 不易转出视野而丢失
@@ -108,4 +125,5 @@ docking_node:
 
     # ── Topics ──
     detection_topic: "/detections"
-    odom_topic: "/odom_combined"
+    # 机器狗本体里程计 (l1w_control publish_odom 发布, IMU+运动学航位推算)
+    odom_topic: "/dog/odom"
