@@ -1,0 +1,24 @@
+# rtsp_camera 相机内参 — 棋盘格标定生成, 勿手改
+# source: rtsp://127.0.0.1:8589/test
+# date:   2026-09-02T16:46:20
+# rms:    0.2780 px (< 0.5 优, < 1.0 可用)
+# 用法: ros2 launch tagdocking docking.launch.py rtsp_url:=... camera_info_file:=/home/nvidia/ros2_ws/src/tagdocking/config/rtsp_camera_info.yaml
+width: 1920
+height: 1080
+camera_matrix:
+- - 777.0410066920067
+  - 0.0
+  - 972.606149601412
+- - 0.0
+  - 790.3164665834713
+  - 557.9611637689775
+- - 0.0
+  - 0.0
+  - 1.0
+distortion:
+- -0.09822229
+- -0.03355651
+- -0.00015769
+- -0.00029648
+- 0.12956317
+distortion_model: plumb_bob

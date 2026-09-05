@@ -5,6 +5,22 @@ project(tagdocking)
 find_package(ament_cmake REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
 find_package(action_msgs REQUIRED)
+find_package(rclcpp REQUIRED)
+find_package(geometry_msgs REQUIRED)
+find_package(nav_msgs REQUIRED)
+find_package(std_srvs REQUIRED)
+
+# ── Zsibot SDK bridge (C++) ───────────────────────────────────────
+# 链接系统已装的 zsibot-sdk 静态库 (libzsibot.a) 及其运行库 libnetwork.so;
+# 头文件在 /usr/local/include/zsibot/include (dpkg: zsibot-sdk, simple-socket)。
+add_executable(zsibot_bridge src/zsibot_bridge_node.cpp)
+target_include_directories(zsibot_bridge PRIVATE /usr/local/include/zsibot/include)
+target_link_libraries(zsibot_bridge
+  /usr/local/lib/libzsibot.a
+  /usr/local/lib/libnetwork.so
+  pthread)
+ament_target_dependencies(zsibot_bridge rclcpp geometry_msgs nav_msgs std_srvs)
+install(TARGETS zsibot_bridge DESTINATION lib/${PROJECT_NAME})
 
 # ── Generate action interface ─────────────────────────────────────
 rosidl_generate_interfaces(${PROJECT_NAME}
