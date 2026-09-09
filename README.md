@@ -58,7 +58,8 @@
 **运动期间从不相信相机，静止时从不相信里程计。** 每一步机动是：
 
 ```
-停稳 → settle 等图像清晰 → 采一帧新鲜测量 → 规划器算出完整小段路径
+停稳 → 静止站立锁定 (posture.*，身体不喘) → settle 等图像清晰 + 稳定帧
+  → 采一帧新鲜测量 → 规划器算出完整小段路径 → stand_up 恢复运动
   → 冻结检测 → 里程计闭环盲动到目标 → 停稳 → …(循环)
 ```
 
@@ -71,6 +72,41 @@
 - settle 窗口（`stopgo.turn_settle_sec`，0.8s）结束后**清空全部旧位姿**并重新
   播种 EMA 滤波——规划永远只用停稳后的新鲜帧
 
+### 静止站立 × 呼吸抑制 (posture.*) — 停看循环升级
+
+狗的站立步态会"呼吸"（身体持续微幅起伏），tag 位姿因此始终带抖动。每个停看
+点的"停"由 `PostureMode`（`tagdocking/posture_mode.py`）升级为完整闭环：
+
+```
+停 → /l1w_control/static_stand (CMD_LOCK_MODE, 身体锁定不喘)
+   → 等 posture_state==static_stand 且距停稳 ≥ posture.static_settle_sec
+   → 解冻清空旧位姿 → 等待 ≥ posture.min_stable_frames 帧连续 accepted
+   → 量测 + 重规划 (锁定下进行, 位姿最稳)
+   → /l1w_control/stand_up 恢复运动模式 → 等 motion_enabled==True → 起步
+```
+
+- **所有停看点统一**：APPROACH 每步、丢 tag 搜索步、失败重试、泊出入口；
+  盲链子步之间（turn-drive-turn 内部）不停不锁
+- **解锁确认以 `/l1w_control/motion_enabled` 为准**——它就是桥的 cmd_vel
+  门控本身（`authority && motion_enabled_ && !static_stand`），固件退出 LOCK
+  有滞后，只有 Bool 变 True 才真的能走
+- **DOCKED 保持静止站立**（不呼吸、姿态最稳）；泊出自动先 stand_up；取消/
+  超时/失败等错误终态自动恢复运动模式把狗还给遥控
+- **机动中被外部切入静止站立**（如网页台"静止站立"按钮）→ 立即
+  MOTION_FAILED（cmd_vel 已死，不静默耗完超时）；判定要求 motion_enabled
+  为 False，避免解锁瞬间 posture_state 滞后残留误判
+- **降级语义**：`/l1w_control` 服务不存在（备用桥 zsibot_bridge / 纯台架）→
+  `service_wait_sec` 宽限后自动停用并告警一次，行为退回纯感知侧 settle；
+  static_stand 确认超时 → 本次停降级为未锁定继续；stand_up 失败不可降级
+  （狗还锁着）→ 重试 `unlock_retries` 次后 MOTION_FAILED
+- **每停多花 ~1.5-2.5s**（锁定 + settle + 稳定帧 + 解锁），`timeout_sec` 已
+  相应上调（120→180、approach 60→90、search 60→120）
+- **节点退出/急停不自动 stand_up**——锁定站立是最安全的姿态；恢复用
+  `ros2 service call /l1w_control/stand_up std_srvs/srv/Trigger '{}'`
+  或网页台"站起"按钮
+- 台架无狗调试：`scripts/mock_l1w_control` 模拟模式接口 + cmd_vel 门控 +
+  里程计积分，可跑通完整走停闭环（见 §8）
+
 ### 模块结构
 
 ```
@@ -78,7 +114,7 @@ tagdocking/
 ├── action/Dock.action           # ROS2 Action 定义
 ├── config/docking.yaml          # 全部参数
 ├── config/rtsp_camera_info_example.yaml  # RTSP 相机内参示例
-├── launch/docking.launch.py     # 启动文件 (相机源: ROS话题桥 / RTSP桥 二选一)
+├── launch/docking.launch.py     # 启动文件 (相机源: ROS话题桥 / RTSP桥 / Odin1 三选一)
 ├── scripts/
 │   ├── docking_node             # 停泊主节点入口
 │   ├── camera_info_bridge       # ROS 相机时间戳同步桥入口
@@ -87,13 +123,15 @@ tagdocking/
 │   ├── calibrate_rtsp           # 棋盘格标定 (RTSP, 纯 ssh 无 GUI)
 │   ├── test_apriltag            # 相机直测 tag 距离/横向 (验证内参+TF)
 │   ├── test_turn_angle          # 转角精度测试 (cmd vs 里程计)
-│   └── test_jog_distance        # 直行精度测试 (cmd vs 里程计)
+│   ├── test_jog_distance        # 直行精度测试 (cmd vs 里程计)
+│   └── mock_l1w_control         # 台架替身: 模拟狗模式接口+门控+里程计
 ├── tagdocking/
 │   ├── docking_node.py          # 主节点 — 20Hz 控制循环, 集成所有子系统
 │   ├── state_machine.py         # 状态机 + 超时/重试/泊出管理
+│   ├── posture_mode.py          # 静止站立(锁定)管理器 — 停看循环 停→锁→稳→规划→解锁→走
 │   ├── geometry_planner.py      # 几何规划器 — 法线机动(turn-drive-turn)/两阶段直行
 │   ├── action_executor.py       # 动作执行器 — 里程计航位推算闭环
-│   ├── camera_info_bridge.py    # 相机话题时间戳同步桥 (ROS 相机模式)
+│   ├── camera_info_bridge.py    # 相机话题时间戳同步桥 (ROS 相机模式 + Odin1 内参合成模式)
 │   ├── rtsp_camera.py           # RTSP→ROS 相机桥 (机器狗模式: 拉流+内参+静态TF)
 │   ├── pose_buffer.py           # 时间戳位姿缓冲 (自适应时效窗口)
 │   ├── pid_controller.py        # PID (含 anti-windup) — 遗留, 主流程未使用
@@ -133,12 +171,13 @@ tagdocking/
           /cmd_vel /cmd_vel  SDK move(vx,vy,wz)
 ```
 
-相机侧（二选一，由 launch 的 `rtsp_url` 参数决定）：
+相机侧（三选一，由 launch 的 `rtsp_url` / `use_odin` 参数决定）：
 
 ```
 ROS 相机模式:  相机驱动(/image_raw+/camera_info) ─► camera_info_bridge ─► /camera_sync/*
 RTSP 模式:     rtsp_camera (拉流+内参合成+静态TF) ─────────────────────► /camera_sync/*
-                              └► /camera_sync/image_raw + /camera_sync/camera_info
+Odin1 模式:    /odin1/image/undistorted ─► camera_info_bridge(合成模式: 内参合成
+                              +frame_id重打+静态TF) ─► /camera_sync/image_raw + /camera_sync/camera_info
                                         └► apriltag_node ─► /detections + TF
 ```
 
@@ -150,9 +189,11 @@ RTSP 模式:     rtsp_camera (拉流+内参合成+静态TF) ──────�
 
 - ROS2 Humble 已安装
 - `apriltag_ros` 已安装并能正常检测 Tag
-- 相机接入二选一：
+- 相机接入三选一：
   - **ROS 相机模式**（差速车等）：相机驱动发布 `/image_raw` 和 `/camera_info`，且已标定
   - **RTSP 模式**（机器狗）：相机提供 RTSP 流，先用 `scripts/calibrate_rtsp` 标定（见 2.6）
+  - **Odin1 模式**：odin 驱动发布 `/odin1/image/undistorted`（去畸变流），内参用包内
+    `config/odin_camera_info.yaml`（见 2.7）
 - Tag 贴在停靠目标上，且 TF 树连通（`base_link → 相机光学系 → tag36h11:0`）
 - 机器人发布里程计（默认话题 `/odom_combined`，RTSP/机器狗用 `odom_topic` 参数指定）
 - 机器人已被外部服务（Nav2 / 业务节点 / 遥控）送到 Tag 视野范围内
@@ -279,7 +320,7 @@ ros2 launch tagdocking docking.launch.py \
 | 参数 | 说明 |
 |------|------|
 | `rtsp_url` | RTSP 地址。非空即切换到机器狗模式（替代 camera_info_bridge） |
-| `camera_info_file` | 内参 YAML（`calibrate_rtsp` 生成，rtsp 模式必填） |
+| `camera_info_file` | 内参 YAML（`calibrate_rtsp` 生成；不传时自动用包内 `config/rtsp_camera_info.yaml`，包内也没有才报错） |
 | `odom_topic` | 狗的里程计话题（默认 `/odom_combined`，按实际改） |
 | `camera_mount_x/y/z` | 相机在 base_link 下的安装位置（米） |
 | `camera_mount_yaw/pitch/roll_deg` | 相机安装姿态（0=正前水平；低头用正 pitch，抬头用负 pitch） |
@@ -294,6 +335,65 @@ ros2 launch tagdocking docking.launch.py \
 
 > 若狗的相机/TF 已由其他节点提供，设 `rtsp_camera` 的
 > `publish_static_tf:=false` 避免重复广播。
+
+### 2.7 Odin1 相机部署 (use_odin)
+
+后装 odin1 视觉模组的机器狗（RTSP 广角流压缩后 tag 太小难识别时）。odin 驱动
+只发 `/odin1/image/undistorted`（去畸变 RGB 1600x1296，全分辨率下 16cm tag
+@1m ≈ 117px，约为 RTSP 640 宽流的 4~5 倍像素），但**没有 camera_info 话题、
+图像 frame_id 为空、也没有 `base_link→相机` TF**。`camera_info_bridge` 的
+合成模式一次补齐三样，下游管线不变：
+
+```
+odin_driver ─→ /odin1/image/undistorted
+camera_info_bridge ─→ /camera_sync/image_raw + /camera_sync/camera_info (内参合成+frame_id重打)
+                   ─→ 静态TF base_link→相机光学系
+apriltag_node ─→ /detections + TF ─→ docking_node ─→ /cmd_vel
+```
+
+内参无需标定：去畸变图像的针孔内参就是 odin 标定（`odin_ros_driver/config/
+calib.yaml`）里的 A11/A22/u0/v0，已抄录为包内 `config/odin_camera_info.yaml`
+（随包自动安装）。**换 odin 机身（不同序列号）后需从对应机身的 calib.yaml
+重新抄录**。
+
+**启动停泊**（按实际安装位姿传 `camera_mount_*`）：
+
+```bash
+ros2 launch tagdocking docking.launch.py \
+    base_type:=omni \
+    use_odin:=true \
+    odom_topic:=/odom \
+    camera_mount_z:=0.30   # odin 在 base_link 下的安装位姿, 按实际填
+# 然后与 RTSP 模式相同: ros2 service call /docking_node/start_docking std_srvs/srv/Trigger
+```
+
+关键 launch 参数：
+
+| 参数 | 说明 |
+|------|------|
+| `use_odin` | true 时用 `/odin1/image/undistorted` + 内参合成替代普通相机话题 |
+| `camera_info_file` | 缺省自动用包内 `config/odin_camera_info.yaml` |
+| `camera_mount_x/y/z`、`camera_mount_yaw/pitch/roll_deg` | 与 RTSP 模式同一套安装位姿参数 |
+| `camera_downscale` | 默认 0=自动 ×2（800x648）；传 1 用全分辨率 1600x1296（仅追更远小 tag 时用，见下方延迟说明） |
+| `image_topic` | 缺省即 `/odin1/image/undistorted`，可显式覆盖 |
+
+**延迟实测（2026-09-08, Jetson）**：odin 源 ~55ms、桥 ~45ms 都很快，瓶颈在
+apriltag —— 全分辨率 1600x1296 下它只消化 ~6fps，odin 22fps 输入把 RELIABLE
+订阅队列塞满，检出时间戳年龄积到 **~1.15s**。默认 `downscale=2 + 桥
+max_fps=10 限流`（桥在订阅回调里直接丢超额帧）后队列不再积压，延迟回落到
+**~0.1s**。全分辨率小 tag 场景若嫌 5~6fps 检出率低，可 `camera_downscale:=1`
+并在桥上加大限流（保持限流 ≤ apriltag 实际消化率即可不积压）。
+
+> test_apriltag 读数提示：`>` 汇总行每 **2s** 打一次、且是**最近 50 次**检测
+> 的均值 —— 移动 tag 后数值"追上来"要几秒是显示平滑，不是管线延迟；看单次
+> 行 `[n] 距离=...`（每 10 次检测打一行）或加 `--sample-batch 10` 更跟手。
+
+> 单独验证（不起底盘）：`ros2 run tagdocking camera_info_bridge --ros-args
+> -p image_topic:=/odin1/image/undistorted
+> -p camera_info_file:=config/odin_camera_info.yaml
+> -p frame_id:=camera_color_optical_frame -p downscale:=2 -p max_fps:=10.0
+> -p publish_static_tf:=true -p mount.z:=0.30`，tag 放视野内后
+> `ros2 run tf2_ros tf2_echo base_link tag36h11:0` 应输出合理位姿。
 
 ---
 
@@ -608,7 +708,25 @@ stopgo.drift_tol: 0.15                # rad — 前进中方位漂移上限 (走
 - **停泊位置系统性偏差**：几乎总是 `tag.size` 不对 / 相机内参不准 /
   相机安装 TF（mount.*）不准，用 `scripts/test_apriltag --known-distance` 验证
 
-### 6.3 两阶段停泊 (final_straight.*)
+### 6.3 静止站立 (posture.*) — 走停 × 呼吸抑制
+
+```yaml
+base.l1w_prefix: "/l1w_control"       # 狗模式服务/状态话题前缀 (zsibot_l1_control)
+posture.enable: true                  # 总开关; 无桥时运行期自动降级停用
+posture.static_settle_sec: 1.2        # s — 停→量测最短间隔 (RTSP 延迟+锁定过渡+呼吸衰减)
+posture.lock_ack_timeout_sec: 2.0     # s — 等 posture_state==static_stand; 超时本次停降级
+posture.unlock_ack_timeout_sec: 2.0   # s — 等 motion_enabled==True (含固件退出 LOCK 滞后)
+posture.unlock_retries: 2             # 次 — stand_up 重发上限, 耗尽 → MOTION_FAILED
+posture.min_stable_frames: 3          # 帧 — 规划前所需连续 accepted 新鲜帧 (1=关闭)
+posture.stable_frame_timeout_sec: 2.5 # s — 等不满 N 帧就带当前位姿规划 (防闪烁卡死)
+posture.service_wait_sec: 1.0         # s — 服务发现宽限, 超过判定无桥并停用
+```
+
+行为细节见 §1 "静止站立 × 呼吸抑制"。实机调参：若解锁偶尔超时（狗退出
+LOCK 慢），加大 `unlock_ack_timeout_sec`；若每停耗时可接受且想更快，把
+`min_stable_frames` 降到 2 或调小 `static_settle_sec`。
+
+### 6.4 两阶段停泊 (final_straight.*)
 
 ```yaml
 final_straight.enable: true           # 两阶段开关; false 恢复单阶段
@@ -619,7 +737,7 @@ final_straight.yaw_threshold_deg: 10.0  # deg — 直行失败门槛 (launch 默
 进入 `start_distance` 后无条件纯直行不调角；首次进入时方位误差超门槛报
 导航失败（自动重试）。见 §4.3 APPROACH。
 
-### 6.4 搜索参数 (search.*)
+### 6.5 搜索参数 (search.*)
 
 ```yaml
 search.angular_speed: 0.3             # rad/s — 每步旋转速度
@@ -631,7 +749,7 @@ search.timeout_sec: 60.0              # 整体搜索超时
 # search.rotate_time_sec 已弃用 (角度步进化后不再读取)
 ```
 
-### 6.5 容差 / 安全 / 超时
+### 6.6 容差 / 安全 / 超时
 
 ```yaml
 tolerance.position_m: 0.05            # m — 前后/横向 ±5cm 视为到位
@@ -639,13 +757,13 @@ tolerance.yaw_deg: 10.0               # deg — 方位 ±10° 视为对准
 tolerance.stable_time_sec: 1.0        # s — 稳定持续此时长才判 DOCKED
 
 safety.minimum_distance_m: 0.15       # m — 距 tag 更近直接判 DOCKED, 防碰撞
-timeout_sec: 120.0                    # 全局停泊超时 (覆盖所有活动态)
-approach_timeout_sec: 60.0            # APPROACH 阶段超时
+timeout_sec: 180.0                    # 全局停泊超时 (静止站立每停 +1.5-2.5s, 120→180)
+approach_timeout_sec: 90.0            # APPROACH 阶段超时 (60→90)
 final_servo_timeout_sec: 30.0         # FINAL_SERVO 阶段超时
 # final_servo.max_linear_speed / max_yaw_speed: 遗留, 走停式下未使用
 ```
 
-### 6.6 重试与泊出 (retry.* / undock.*)
+### 6.7 重试与泊出 (retry.* / undock.*)
 
 ```yaml
 retry.max_retries: 2                  # 失败自动倒车重试次数 (仅直行对准失败会触发)
@@ -660,7 +778,7 @@ undock.angular_rate: 0.3              # rad/s — 泊出转向速度
 undock.timeout_sec: 30.0              # 泊出超时
 ```
 
-### 6.7 相机与话题
+### 6.8 相机与话题
 
 ```yaml
 camera.max_latency_ms: 150            # ms — 位姿时效窗口下限
@@ -757,6 +875,7 @@ python3 scripts/calibrate_rtsp --url rtsp://...   # RTSP 模式 (纯 ssh 无 GUI
 | 停在 SEARCH_TAG 一直转圈 | Tag 未检测到 | `ros2 topic hz /camera_sync/image_raw`；检查 `dock_tag_id`、光照、`tag.size` |
 | 检测频率极低 / `Synchronized pairs: 0` | image 与 camera_info 时间戳不配对 | 由 camera_info_bridge 解决；确认 apriltag 订阅的是 `/camera_sync/image_raw` 而非裸话题 |
 | `TF lookup failed` / TF 查不到 | 坐标系链路断 | 检查 `base_link → 相机光学系 → tag` 链路；ROS 相机模式依赖机器人 URDF，RTSP 模式由 rtsp_camera 发静态 TF（`mount.*` 参数） |
+| 有检测但 TF 查询全失败（TF 树无 tag 帧） | apriltag_ros 3.4.0+（上游 ROS2 重写，节点名 `/apriltag`）参数为嵌套 `tag.ids`/`tag.frames`/`tag.sizes` 且无 `publish_tf`（TF 无条件发布），旧 fork 为扁平 `tag_ids`/`tag_frames`/`publish_tf`；传错的一套被静默忽略 → tag 不在配置里 → 不解算位姿、不广播 TF | launch/脚本已两套同传兼容两代版本；`ros2 param list /apriltag` 核对参数是否生效，`ros2 run tf2_ros tf2_echo camera_color_optical_frame tag36h11:0` 验证 TF |
 | 转向后丢 tag 回 SEARCH_TAG | 转太快出 FOV / settle 太短 | 减小 `stopgo.max_turn_step` 或 `jog_angular_rate`；加大 `stopgo.turn_settle_sec` |
 | 直行失败报导航失败（自动重试） | 进入直行距离时方位误差 > 门槛 | 看"直行失败"日志里的方位误差；阶段 1 对准不足可收紧 `stopgo.yaw_threshold_deg`，或放宽 `final_straight.yaw_threshold_deg` |
 | 重试耗尽落 MOTION_FAILED | 多次直行失败 / 倒车时里程计不走 | 看日志定位具体原因；检查底盘是否响应 `/cmd_vel`、里程计话题是否正确 |
@@ -826,6 +945,39 @@ rclpy.spin(MockDetector())
 
 （另需假的 `/odom` 发布节点；距离随 mock TF 固定不变，主要用于验证状态机
 流转与话题/服务联通。）
+
+### 8.3 台架走停闭环 (mock_l1w_control)
+
+无狗桌面上验证"停→静止站立→稳定帧→规划→解锁→走"完整闭环与模式时序。
+`scripts/mock_l1w_control` 节点名就叫 `l1w_control`，docking 侧默认前缀
+`/l1w_control` 免配置；它镜像真桥的语义（锁定拒绝非零 cmd_vel、latched
+状态回传），并积分 `/cmd_vel` 发布 `/dog/odom` 让 `ActionExecutor` 里程计
+判停闭环：
+
+```bash
+# 终端 1: 停靠栈 (无 rtsp_url → 走 ROS 相机桥路径; 也可直接起 docking_node)
+ros2 launch tagdocking docking.launch.py
+
+# 终端 2: 模式接口替身 (integrates /cmd_vel → /dog/odom)
+ros2 run tagdocking mock_l1w_control
+
+# 终端 3: 假检测 + 假 TF (§8.2 的两条腿) → 触发停靠
+ros2 service call /docking_node/start_docking std_srvs/srv/Trigger
+```
+
+日志断言：
+
+1. 每停依序出现：`停稳 → 请求静止站立` → `静止站立已锁定` → `已清空旧位姿`
+   → `走停 规划` → `请求恢复运动模式` → `运动模式已恢复` → `子步`
+2. mock 统计（退出时打印）：`static_stand` 每停恰 1 次、`stand_up` 每次起步
+   恰 1 次（逐 tick 重发即有 bug）
+3. 锁定窗内无非零 cmd_vel —— 出现 `!!! VIOLATION` 即失败
+4. DOCKED 后无 stand_up（保持锁定）；`start_undock` → stand_up 早于首条非零
+   cmd_vel；锁定窗内 `cancel_docking` → ~0.5s 内 stand_up
+5. 故障注入：`fail_lock:=true` → 一条降级 warn 仍完成；`reject_unlock:=true`
+   → ~6s 内 MOTION_FAILED；机动中手动调 `/l1w_control/static_stand` →
+   立即 `外部锁定打断机动`
+6. 完全不起 mock → 一条"服务不可用"warn，行为与无此功能时一致
 
 ---
 

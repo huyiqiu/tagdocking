@@ -1,0 +1,20 @@
+# Odin1 RGB 相机内参 — 专用于 /odin1/image/undistorted (去畸变后图像)
+#
+# 来源: odin_ros_driver config/calib.yaml (机身序列号 O1-P050100046) 的
+# FishPoly 鱼眼标定。驱动 buildUndistortMap() (host_sdk_sample.h) 用同一套
+# K (A11/A22/u0/v0) 把输出像素归一化后反投影回畸变图, 因此**去畸变图像的
+# 针孔内参就是该套 K**, 畸变系数在 remap 中已全部去除 (此处 distortion 为空)。
+# 标定里的 skew A12≈0.079 同样被驱动在去畸变时去除, 不保留。
+#
+# 注意: 内参随 odin 机身走 (不同序列号标定不同), 换机身需从对应机身的
+# calib.yaml 重新抄录 A11/A22/u0/v0 到 camera_matrix。
+#
+# 格式与 scripts/calibrate_rtsp 输出一致 (camera_info_bridge / rtsp_camera 通用)。
+width: 1600
+height: 1296
+camera_matrix:
+  [732.139165, 0.0,       794.769501,
+   0.0,        731.988178, 625.242812,
+   0.0,        0.0,        1.0]
+distortion: []
+distortion_model: plumb_bob

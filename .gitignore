@@ -23,3 +23,6 @@ reference/
 doc/
 
 profile/
+# TF 视图调试产物 (tf2_tools view_frames 输出)
+frames_*.gv
+frames_*.pdf

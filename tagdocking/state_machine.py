@@ -211,6 +211,18 @@ class DockingStateMachine:
                 f'停靠失败且已达最大重试次数({self._max_retries})')
             self._transition_to(DockingState.MOTION_FAILED)
 
+    def abort_motion(self, reason: str = ''):
+        """系统级失败 — 直接落 MOTION_FAILED, 不再重试。
+
+        与 fail() 的区别: fail() 在 RETRYING 态再转 RETRYING 是 no-op
+        (_transition_to 对同状态直接返回), 会把节点卡死在倒车步; 而无法
+        恢复运动模式 (stand_up 重试耗尽) / 被外部锁定打断机动这类系统级
+        失败, 倒车重试毫无意义且同样发不出 cmd_vel, 必须直落终态。
+        """
+        if reason:
+            self._node.get_logger().error(f'运动中止：{reason}')
+        self._transition_to(DockingState.MOTION_FAILED)
+
     def retry_search(self):
         """RETRYING 倒车到位后调用: 转 SEARCH_TAG 重新锁定。
 
@@ -292,10 +304,12 @@ class DockingStateMachine:
                     self._tag_lost_count += 1
                 else:
                     self._tag_lost_count = 0
-                tag_lost_limit = int(1.0 / 0.05)  # ~1s at 20Hz = 20 cycles
+                loss_timeout = params.get('tag', {}).get('tag_loss_timeout_sec', 1.0)
+                tag_lost_limit = max(1, int(loss_timeout / 0.05))  # 20Hz 循环
                 if self._tag_lost_count > tag_lost_limit:
                     self._node.get_logger().warn(
-                        '接近过程中二维码丢失超过 1s → SEARCH_TAG 重新锁定')
+                        f'接近过程中二维码丢失超过 {loss_timeout:.1f}s → '
+                        f'SEARCH_TAG 重新锁定')
                     self._tag_lost_count = 0
                     self._transition_to(DockingState.SEARCH_TAG)
                     return self._state

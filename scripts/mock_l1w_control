@@ -1,0 +1,198 @@
+#!/usr/bin/env python3
+"""台架测试替身: 模拟 zsibot_l1_control (l1w_control) 的模式接口与门控。
+
+节点名就叫 l1w_control, docking 侧默认 base.l1w_prefix=/l1w_control 无需改配置。
+用途: 无狗桌面上跑通"停→锁→稳定帧→规划→解锁→走"全闭环 —— 配合
+docking.launch.py (camera_info_bridge 相机路径或回放 /detections) 时, 本替身
+积分 /cmd_vel 发布 /dog/odom, ActionExecutor 才能里程计判停。
+
+镜像真桥的契约 (zsibot_l1_control_node.cpp):
+  ~/static_stand (Trigger)  → posture=static_stand, motion_enabled=false (锁定)
+  ~/stand_up    (Trigger)   → posture=standing,     motion_enabled=true  (滞后 unlock_lag_sec)
+  ~/posture_state (String, transient local)  → static_stand/standing/not_standing
+  ~/motion_enabled (Bool,  transient local)  → cmd_vel 门控本身
+  /cmd_vel 门控: 锁定时拒绝非零指令 (零指令静默丢弃, 与真桥一致)
+
+参数:
+  ack_delay_sec    服务受理 → 状态翻转的延迟 (默认 0.15)
+  unlock_lag_sec   stand_up 后固件退出 LOCK 的额外滞后 (默认 0.4)
+  fail_lock        static_stand 回 success 但从不锁定 (测降级路径)
+  reject_unlock    stand_up 回 success 但从不解锁 (测 MOTION_FAILED 路径)
+  initial_state    初始姿态: standing (默认, 正常停泊前提) | not_standing
+  integrate_odom   积分 /cmd_vel 发布 /dog/odom (默认 true; 接真底盘时设 false)
+  odom_topic       里程计输出话题 (默认 /dog/odom)
+
+用法:
+  ros2 run tagdocking mock_l1w_control            # 或 python3 scripts/mock_l1w_control
+  # 断言看日志: [MOCK] STATIC_STAND #N / STAND_UP #N 每停/每次起步恰一次;
+  # 锁定窗内出现非零 cmd_vel 会打 [MOCK] !!! VIOLATION。
+"""
+
+import math
+import threading
+
+import rclpy
+from rclpy.node import Node
+from rclpy.executors import ExternalShutdownException
+from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
+from geometry_msgs.msg import Twist
+from nav_msgs.msg import Odometry
+from std_msgs.msg import Bool, String
+from std_srvs.srv import Trigger
+
+
+class MockL1wControl(Node):
+    def __init__(self):
+        super().__init__('l1w_control')
+
+        self._ack_delay = float(self.declare_parameter('ack_delay_sec', 0.15).value)
+        self._unlock_lag = float(self.declare_parameter('unlock_lag_sec', 0.4).value)
+        self._fail_lock = bool(self.declare_parameter('fail_lock', False).value)
+        self._reject_unlock = bool(self.declare_parameter('reject_unlock', False).value)
+        self._state = str(self.declare_parameter('initial_state', 'standing').value)
+        self._integrate_odom = bool(self.declare_parameter('integrate_odom', True).value)
+        self._odom_topic = str(self.declare_parameter('odom_topic', '/dog/odom').value)
+
+        qos = QoSProfile(depth=1,
+                         reliability=ReliabilityPolicy.RELIABLE,
+                         durability=DurabilityPolicy.TRANSIENT_LOCAL)
+        self._posture_pub = self.create_publisher(String, 'posture_state', qos)
+        self._motion_pub = self.create_publisher(Bool, 'motion_enabled', qos)
+        self._odom_pub = self.create_publisher(Odometry, self._odom_topic, 10)
+
+        self.create_service(Trigger, 'static_stand', self._on_static_stand)
+        self.create_service(Trigger, 'stand_up', self._on_stand_up)
+        self.create_subscription(Twist, '/cmd_vel', self._on_cmd_vel, 10)
+
+        self._lock = threading.Lock()
+        self._pending = None            # (apply_at_ns, target_state) 或 None
+        self._static_stand_calls = 0
+        self._stand_up_calls = 0
+        self._last_cmd = None           # 上一帧 cmd_vel (零抑制判定)
+        self._x = self._y = self._yaw = 0.0
+
+        self.create_timer(0.02, self._apply_pending)     # 50Hz 状态机
+        if self._integrate_odom:
+            self.create_timer(1.0 / 30.0, self._publish_odom)
+        self._publish_status()
+        self.get_logger().info(
+            f'[MOCK] l1w_control 就绪 | 初始={self._state} '
+            f'fail_lock={self._fail_lock} reject_unlock={self._reject_unlock}')
+
+    # ── 状态翻转 (延迟生效, 模拟固件过渡) ─────────────────────────
+
+    def _on_static_stand(self, request, response):
+        self._static_stand_calls += 1
+        self.get_logger().info(
+            f'[MOCK] STATIC_STAND #{self._static_stand_calls}')
+        response.success = True
+        response.message = 'mock static_stand'
+        if self._fail_lock:
+            self.get_logger().warn('[MOCK] fail_lock: 回 success 但不锁定')
+            return response
+        with self._lock:
+            self._pending = (self.now_ns() + int(self._ack_delay * 1e9),
+                             'static_stand')
+        return response
+
+    def _on_stand_up(self, request, response):
+        self._stand_up_calls += 1
+        self.get_logger().info(f'[MOCK] STAND_UP #{self._stand_up_calls}')
+        response.success = True
+        response.message = 'mock stand_up'
+        if self._reject_unlock:
+            self.get_logger().warn('[MOCK] reject_unlock: 回 success 但不解锁')
+            return response
+        with self._lock:
+            self._pending = (self.now_ns()
+                             + int((self._ack_delay + self._unlock_lag) * 1e9),
+                             'standing')
+        return response
+
+    def _apply_pending(self):
+        with self._lock:
+            if self._pending is None:
+                return
+            apply_at, target = self._pending
+            if self.now_ns() < apply_at:
+                return
+            self._pending = None
+        if self._state == target:
+            return
+        self._state = target
+        self._publish_status()
+        self.get_logger().info(f'[MOCK] posture → {self._state}')
+
+    # ── 门控 + 里程计积分 ─────────────────────────────────────────
+
+    def _on_cmd_vel(self, msg: Twist):
+        locked = (self._state == 'static_stand')
+        nonzero = (abs(msg.linear.x) > 1e-3 or abs(msg.linear.y) > 1e-3
+                   or abs(msg.angular.z) > 1e-3)
+        if locked and nonzero:
+            self.get_logger().error(
+                f'[MOCK] !!! VIOLATION: 锁定窗内收到非零 cmd_vel '
+                f'(vx={msg.linear.x:+.3f} vy={msg.linear.y:+.3f} '
+                f'wz={msg.angular.z:+.3f})')
+            return
+        if locked:
+            # 零指令: 真桥静默丢弃 (零+零抑制), 不打印避免刷屏
+            self._last_cmd = msg
+            return
+        if nonzero:
+            self.get_logger().info(
+                f'[MOCK] cmd_vel vx={msg.linear.x:+.3f} vy={msg.linear.y:+.3f} '
+                f'wz={msg.angular.z:+.3f}', throttle_duration_sec=0.5)
+        self._last_cmd = msg
+
+    def _publish_odom(self):
+        # 积分最近一帧 cmd_vel (体速度), 供 ActionExecutor 里程计判停闭环
+        msg = Odometry()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = 'odom'
+        msg.child_frame_id = 'base_link'
+        if self._last_cmd is not None and self._state != 'static_stand':
+            dt = 1.0 / 30.0
+            vx, vy, wz = (self._last_cmd.linear.x, self._last_cmd.linear.y,
+                          self._last_cmd.angular.z)
+            self._yaw += wz * dt
+            self._x += (vx * math.cos(self._yaw) - vy * math.sin(self._yaw)) * dt
+            self._y += (vx * math.sin(self._yaw) + vy * math.cos(self._yaw)) * dt
+        msg.pose.pose.position.x = self._x
+        msg.pose.pose.position.y = self._y
+        msg.pose.pose.orientation.w = math.cos(self._yaw / 2.0)
+        msg.pose.pose.orientation.z = math.sin(self._yaw / 2.0)
+        self._odom_pub.publish(msg)
+
+    # ── latched 状态 ──────────────────────────────────────────────
+
+    def _publish_status(self):
+        posture = String()
+        posture.data = self._state
+        self._posture_pub.publish(posture)
+        motion = Bool()
+        motion.data = (self._state == 'standing')   # 门控语义与真桥一致
+        self._motion_pub.publish(motion)
+
+    def now_ns(self) -> int:
+        return self.get_clock().now().nanoseconds
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = MockL1wControl()
+    try:
+        rclpy.spin(node)
+    except (KeyboardInterrupt, ExternalShutdownException):
+        pass
+    finally:
+        node.get_logger().info(
+            f'[MOCK] 统计: static_stand×{node._static_stand_calls} '
+            f'stand_up×{node._stand_up_calls}')
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()

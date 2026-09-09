@@ -13,14 +13,20 @@ find_package(std_srvs REQUIRED)
 # ── Zsibot SDK bridge (C++) ───────────────────────────────────────
 # 链接系统已装的 zsibot-sdk 静态库 (libzsibot.a) 及其运行库 libnetwork.so;
 # 头文件在 /usr/local/include/zsibot/include (dpkg: zsibot-sdk, simple-socket)。
-add_executable(zsibot_bridge src/zsibot_bridge_node.cpp)
-target_include_directories(zsibot_bridge PRIVATE /usr/local/include/zsibot/include)
-target_link_libraries(zsibot_bridge
-  /usr/local/lib/libzsibot.a
-  /usr/local/lib/libnetwork.so
-  pthread)
-ament_target_dependencies(zsibot_bridge rclcpp geometry_msgs nav_msgs std_srvs)
-install(TARGETS zsibot_bridge DESTINATION lib/${PROJECT_NAME})
+# SDK 不完整 (缺 libnetwork.so) 的机器自动跳过本目标: 备用 SDK 桥不用于
+# cmd_vel 链路, 不应阻塞整个包的编译。
+if(EXISTS /usr/local/lib/libzsibot.a AND EXISTS /usr/local/lib/libnetwork.so)
+  add_executable(zsibot_bridge src/zsibot_bridge_node.cpp)
+  target_include_directories(zsibot_bridge PRIVATE /usr/local/include/zsibot/include)
+  target_link_libraries(zsibot_bridge
+    /usr/local/lib/libzsibot.a
+    /usr/local/lib/libnetwork.so
+    pthread)
+  ament_target_dependencies(zsibot_bridge rclcpp geometry_msgs nav_msgs std_srvs)
+  install(TARGETS zsibot_bridge DESTINATION lib/${PROJECT_NAME})
+else()
+  message(STATUS "zsibot SDK 不完整 (缺 libzsibot.a 或 libnetwork.so), 跳过 zsibot_bridge")
+endif()
 
 # ── Generate action interface ─────────────────────────────────────
 rosidl_generate_interfaces(${PROJECT_NAME}
@@ -46,6 +52,7 @@ install(PROGRAMS
   scripts/test_jog_distance
   scripts/test_apriltag
   scripts/calibrate_camera
+  scripts/mock_l1w_control
   DESTINATION lib/${PROJECT_NAME}
 )
 

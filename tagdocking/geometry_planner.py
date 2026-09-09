@@ -12,7 +12,8 @@ Diff-drive (and omni once centred) — aim-and-go / pure pursuit:
   stay within the lateral tolerance?" is exactly "is |lat| within tolerance?"
   — no diverging turn-away/turn-back oblique manoeuvre.
 
-Omni / quadruped additionally use a direct lateral slide to centre.
+Omni / quadruped: turn in place to align the heading with the tag normal,
+then direct lateral slide onto the normal line, then straight in.
 
 Every motion is executed odometry-closed (stop-and-go): the robot stops,
 grabs a sharp frame, plans one bounded step, dead-reckons it via odometry,
@@ -67,7 +68,8 @@ class GeometryPlanner:
 
     # ── Public API ──────────────────────────────────────────────────
 
-    def plan(self, dist: float, lat: float, yaw: float) -> ActionPlan:
+    def plan(self, dist: float, lat: float, yaw: float,
+             normal: float | None = None) -> ActionPlan:
         """Return the next action based on the current tag pose.
 
         Args:
@@ -76,11 +78,31 @@ class GeometryPlanner:
             yaw:  bearing to the tag (rad, CCW+) == atan2(lat, dist).  The
                   system measures only the *direction* to the tag, not the
                   tag's own facing, so yaw and lat are coupled.
+            normal: tag outward normal direction in robot frame (rad, CCW+).
+                  Omni only — enables the heading-alignment turn.  None keeps
+                  the legacy bearing-only behaviour (diff-drive unaffected).
 
         Returns:
             ActionPlan with the next discrete action.
 
-        Strategy — aim-and-go (pure pursuit):
+        Strategy — omni (with ``normal``): align → slide → straight.
+            The lateral slide is docking-correct ONLY when the heading is
+            already parallel to the tag normal: sliding by ``lat`` then both
+            centres the bearing AND lands the robot ON the normal line.
+            Off-normal, a bearing-centring slide still centres the tag but
+            moves the robot AWAY from the normal line (perpendicular offset
+            grows), and the final straight-in would hit the dock skewed.
+            So the omni order per stop-and-go iteration is:
+              1. heading error vs normal (normal + π) beyond threshold →
+                 turn in place (node clamps to max_turn_step, re-measures);
+              2. |lat| beyond tolerance → slide by lat (side test = which
+                 side of the normal line we are on, since heading ∥ normal);
+              3. otherwise straight in along the (now normal) line.
+            The slide magnitude ``lat`` is a direct, reliable measurement,
+            unlike the standoff-point construction of plan_sequence() which
+            amplifies normal noise — hence align-first, slide-second.
+
+        Strategy — aim-and-go (pure pursuit, diff-drive):
             Driving straight forward preserves ``lat`` (the robot moves along
             its own x-axis).  So "will a forward jog leave us outside the
             ±lateral tolerance at the target?" reduces to "is |lat| already
@@ -98,7 +120,17 @@ class GeometryPlanner:
             ActionExecutor, so a turn never overshoots and flings the tag out
             of frame.
         """
-        # ── Omni / quadruped: real lateral DOF → direct slide ──
+        # ── Omni / quadruped: real lateral DOF → align, then slide ──
+        # Step 1 — heading alignment with the tag normal.  Rotation about the
+        # robot's own axis never changes the line-of-sight-to-normal angle, but
+        # it does change the heading-vs-normal error by exactly the turn — so
+        # this converges in clamped steps, re-measured at every stop.  Skipped
+        # beyond ±90°: there the tag faces away (or the solvePnP flip leaked
+        # through the EMA) and chasing it would spin the robot.
+        if self._is_omni and normal is not None:
+            heading_err = normalize_angle(normal + math.pi)
+            if self._yaw_threshold < abs(heading_err) <= math.pi / 2:
+                return ActionPlan(kind='yaw', turn_angle=heading_err)
         if self._is_omni and abs(lat) > self._lateral_threshold:
             return self._start_lateral(dist, lat, yaw)
 
@@ -131,6 +163,16 @@ class GeometryPlanner:
         nothing, but the method is kept so those call sites stay valid.
         """
         pass
+
+    def set_jog_limits(self, jog_min: float, jog_max: float) -> None:
+        """运行期更新走停步长上下限。
+
+        jog_max/jog_min 是 ROS 参数，但构造时一次性拷进本类 —— 不同步的话
+        ``ros2 param set`` 改了也不生效。节点在每次规划前调用本方法把当前
+        参数值同步进来，实现免重启调整。
+        """
+        self._jog_min = jog_min
+        self._jog_max = jog_max
 
     # ── Turn-drive-turn sequence (normal-line docking) ───────────────
 
@@ -266,6 +308,12 @@ class GeometryPlanner:
         line of sight.  Positive lat → tag is left → robot moves left
         (positive lateral) to centre under the tag.  Diff-drive never calls
         this — it corrects lateral error by aiming at the tag (see plan()).
+
+        Precondition: plan() has already aligned the heading with the tag
+        normal (heading-err turn fires before this).  Heading ∥ normal makes
+        the slide axis perpendicular to the normal line, so sliding by ``lat``
+        lands the robot ON the normal line — "tag side" and "side of the
+        normal line" coincide only under that precondition.
         """
         return ActionPlan(kind='forward',
                           jog_distance=abs(lat),

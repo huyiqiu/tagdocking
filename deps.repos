@@ -1,0 +1,34 @@
+# tagdocking 运行依赖 — 版本锁定 (与已验证可用的 apt 版本一一对应)
+#
+# 背景: apriltag_ros 上游 ROS2 重写 (3.4.0+, 节点名 /apriltag) 的参数名是嵌套的
+# tag.ids/tag.frames/tag.sizes, 而旧 fork 用扁平 tag_ids/tag_frames —— 版本漂移
+# 会直接导致"有检测、无 TF"。锁定版本即锁定行为。
+#
+# 用法 (在其他节点上, whale-nav 工作空间根目录执行):
+#   sudo apt install python3-vcstool                    # 或 pip install vcstool
+#   vcs import src < src/tagdocking/deps.repos          # 拉源码进工作空间
+#   rosdep install --ignore-src --from-paths src -y     # 其余依赖 (opencv 等)
+#   colcon build --packages-up-to tagdocking apriltag_ros
+#
+# 源码构建的包会 overlay 覆盖系统里 apt 装的同名包, 保证所有节点同版本,
+# 且不受 apt upgrade 引入不兼容新版本的影响。
+#
+# 版本对应关系 (2026-09-07 本机 dpkg 实测):
+#   ros-humble-apriltag      3.4.5  ← apriltag tag v3.4.5   (94be783)
+#   ros-humble-apriltag-msgs 2.0.2  ← apriltag_msgs tag 2.0.2 (62a272a)
+#   ros-humble-apriltag-ros  3.4.0  ← 上游未打 3.4.0 tag, 暂 pin master;
+#                                     首次导入后建议 vcs export --exact
+#                                     > deps.repos 锁定当前 commit 防漂移
+repositories:
+  apriltag:
+    type: git
+    url: https://github.com/AprilRobotics/apriltag.git
+    version: v3.4.5
+  apriltag_msgs:
+    type: git
+    url: https://github.com/christianrauch/apriltag_msgs.git
+    version: 2.0.2
+  apriltag_ros:
+    type: git
+    url: https://github.com/AprilRobotics/apriltag_ros.git
+    version: master

@@ -51,6 +51,7 @@ from .pose_buffer import PoseBuffer
 from .geometry_planner import GeometryPlanner, ActionPlan
 from .action_executor import ActionExecutor
 from .state_machine import DockingStateMachine, DockingState
+from .posture_mode import PostureMode
 
 
 class DockingNode(Node):
@@ -97,6 +98,18 @@ class DockingNode(Node):
         self._sm = DockingStateMachine(self)
         self._sm._max_retries = int(self._p('retry.max_retries'))
 
+        # ── 静止站立(锁定)管理器: 每个停看点的"停"升级为 ──────────────
+        # 停→static_stand 锁定(不喘)→稳定帧→规划→stand_up 解锁→走。
+        # 需要 self._p 与 self._sm, 必须在定时器启动前创建。
+        self._posture = PostureMode(self)
+        # 已规划待发的机动序列: 规划在锁定下完成后暂存, 由 _launch_pending_seq
+        # 在恢复运动模式 (motion_enabled=True) 后原样启动, 解锁等待期间
+        # 不重测/重规划。
+        self._pending_seq: list | None = None
+        # 停稳解冻后的连续 accepted 帧计数 (稳定帧门), _reset_visual_state 清零
+        self._stable_frames = 0
+        self._stable_window_start_ns = 0
+
         # ── Base adapter ──────────────────────────────────────────
         self._adapter = self._create_adapter()
 
@@ -125,6 +138,8 @@ class DockingNode(Node):
         self._raw_normal: float | None = None
         self._last_detection_ns = 0
         self._tf_fail_count = 0
+        self._det_msg_count = 0         # /detections 消息总数 (搜索停留日志诊断: 检测流是否活着)
+        self._dwell_msg_start = 0       # 本次停留开始时的消息计数 (算"期内消息"差值)
 
         # Previous control-loop state, for detecting transitions that must
         # cancel any in-progress stop-and-go action (e.g. APPROACH→SEARCH_TAG
@@ -149,7 +164,7 @@ class DockingNode(Node):
         # 丢弃所有帧（运动模糊、视野边缘的坏帧绝不能污染规划用的位姿）。停稳
         # settle 结束后解冻，并清空滤波/缓冲，强制下一次规划只用停稳后的新鲜帧。
         self._frozen = False
-        # Each iteration advances at most jog_max (~0.15 m) on the straight leg,
+        # Each iteration advances at most jog_max (stopgo.jog_max, runtime-tunable)
         # so covering a metre-plus approach plus refinement turns needs a
         # generous ceiling. This is only a runaway backstop — normal docking
         # converges (drive shrinks, no more clamping) well before it. APPROACH's
@@ -227,6 +242,7 @@ class DockingNode(Node):
         self.declare_parameter('tag.frame', 'tag36h11:0')
         self.declare_parameter('tag.id', 0)
         self.declare_parameter('tag.fresh_timeout_sec', 1.0)
+        self.declare_parameter('tag.tag_loss_timeout_sec', 2.5)
         self.declare_parameter('tag.ema_alpha', 0.5)
         self.declare_parameter('tag.max_pose_jump_m', 0.3)
 
@@ -271,6 +287,7 @@ class DockingNode(Node):
         self.declare_parameter('search.step_angle_deg', 30.0)
         self.declare_parameter('search.rotate_time_sec', 0.8)  # deprecated, unused
         self.declare_parameter('search.pause_time_sec', 1.5)
+        self.declare_parameter('search.initial_look_sec', 4.0)
         self.declare_parameter('search.hold_time_sec', 0.5)
         self.declare_parameter('search.search_direction', 1)
         self.declare_parameter('search.timeout_sec', 60.0)
@@ -316,6 +333,22 @@ class DockingNode(Node):
         self.declare_parameter('stopgo.small_turn_rad', 0.1)
         self.declare_parameter('stopgo.theta_shrink_ratio', 2.0)
         self.declare_parameter('stopgo.drift_tol', 0.15)
+
+        # ── 静止站立 (posture) — 走停 × 呼吸抑制 ──────────────────────
+        # 每个停看点的"停"升级为: static_stand 锁定(不喘) → 等稳定帧 →
+        # 规划 → stand_up 解锁 → 走。接口在 zsibot_l1_control (l1w_control);
+        # 无桥 (备用桥/纯台架) 时 service_wait_sec 宽限后自动降级停用。
+        self.declare_parameter('base.l1w_prefix', '/l1w_control')
+        self.declare_parameter('posture.enable', True)
+        # 停→量测最短间隔: 覆盖 RTSP 延迟 (0.1~0.5s) + CMD_LOCK_MODE 过渡 +
+        # 呼吸衰减。与 stopgo.turn_settle_sec 同一起点, 实际取两者较大值。
+        self.declare_parameter('posture.static_settle_sec', 1.2)
+        self.declare_parameter('posture.lock_ack_timeout_sec', 2.0)
+        self.declare_parameter('posture.unlock_ack_timeout_sec', 2.0)
+        self.declare_parameter('posture.unlock_retries', 2)
+        self.declare_parameter('posture.min_stable_frames', 3)
+        self.declare_parameter('posture.stable_frame_timeout_sec', 2.5)
+        self.declare_parameter('posture.service_wait_sec', 1.0)
 
         # Detection topic
         self.declare_parameter('detection_topic', '/detections')
@@ -379,6 +412,9 @@ class DockingNode(Node):
 
     def _on_detections(self, msg: AprilTagDetectionArray):
         """Store detection timestamps; actual TF query happens in control loop."""
+        # 计数无条件递增 (冻结/终态早退之前): 停留日志用它区分"检测流断了"
+        # 和"tag 不在视野" —— 前者计数不涨, 后者只有有效检测归零。
+        self._det_msg_count += 1
         # 机动期间冻结检测：盲转/盲走过程中相机帧运动模糊、二维码常在视野边缘，
         # 这些坏帧一律丢弃，绝不更新 _filtered_*、_pose_buffer 或 _last_detection_ns。
         # 规划器因此只会读到小车停稳后新采的帧。
@@ -463,6 +499,7 @@ class DockingNode(Node):
                     self._filtered_dist = raw_dist
                     self._filtered_lat = raw_lat
                     self._jump_reject_count = 0
+                self._stable_frames = 0   # 跳变帧打断"连续 accepted"计数
                 return False
             else:
                 self._jump_reject_count = 0
@@ -517,6 +554,7 @@ class DockingNode(Node):
         # Remember the side the tag was last seen on, to bias recovery search.
         if abs(self._filtered_lat) > 1e-3:
             self._last_seen_lat = self._filtered_lat
+        self._stable_frames += 1   # accepted 帧: 稳定帧门计数
         return True
 
     def _tag_fresh(self) -> bool:
@@ -568,6 +606,15 @@ class DockingNode(Node):
 
         state = self._sm.state
 
+        # 机动中被外部切入静止站立 (如网页台"静止站立"按钮): cmd_vel 已被桥
+        # 拒绝、里程计不会再走, 立即中止而不是静默耗完接近超时。
+        # (external_lock 要求 motion_enabled==False, 解锁刚完成时 posture_state
+        # 的滞后残留不会误判。)
+        if self._executor.is_active and self._posture.external_lock:
+            self.get_logger().error('机动期间被外部切入静止站立 → MOTION_FAILED')
+            self._sm.abort_motion('外部锁定打断机动')
+            state = self._sm.state
+
         # On leaving the stop-and-go states (e.g. APPROACH→SEARCH_TAG re-lock,
         # or any error/terminal transition), abort any half-finished action so
         # it cannot resume later against a stale odometry reference.
@@ -591,6 +638,13 @@ class DockingNode(Node):
         if (state == DockingState.SEARCH_TAG
                 and self._prev_state != DockingState.SEARCH_TAG):
             self._reset_search()
+        # 终态恢复运动模式 (DOCKED 除外): 释放 cmd_vel 给遥控/网页台。
+        # DOCKED 按约定保持静止站立 (泊出时由 _run_undock 先解锁);
+        # UNDOCKED 时狗本就在运动模式。
+        if (self._prev_state != state and state in (
+                DockingState.TAG_LOST, DockingState.TIMEOUT,
+                DockingState.MOTION_FAILED, DockingState.CANCELLED)):
+            self._posture.release(now_ns, reason=f'进入终态 {state.name}')
         self._prev_state = state
 
         # ── Per-state behaviour ───────────────────────────────────
@@ -690,16 +744,28 @@ class DockingNode(Node):
                 throttle_duration_sec=1.0)
             return
 
+        # ── Case 2.4: 静止站立锁定 + 停振窗口 (呼吸抑制) ───────────────
+        # 停稳边界 (_mark_stopped) 已请求 static_stand; 这里等 posture_state
+        # 变为 static_stand 且距停稳 >= posture.static_settle_sec (覆盖 RTSP
+        # 延迟 + CMD_LOCK_MODE 过渡), 之后才解冻量测 —— 量测窗内狗完全静止,
+        # tag 位姿不再被步态呼吸晃动。降级/停用时本门直接放行。
+        if not self._posture.lock_settled(now_ns):
+            self._adapter.publish_stop()
+            return
+
         # ── settle 窗口刚结束：解冻并清空运动期的一切旧数据 ────────────
         # 强制下一次规划只用小车停稳后新采的新鲜帧。清空后本 tick 不规划，
         # 等 _on_detections（已解冻）收到一帧停稳后的检测重新播种滤波。
         if self._frozen:
-            self._frozen = False
-            self._filter_init = False          # EMA 重新播种（首帧新鲜帧作种子）
-            self._last_detection_ns = 0        # _tag_fresh() 归零，等待新帧
-            self._pose_buffer.clear()          # 丢弃所有历史缓冲位姿
+            self._reset_visual_state()
             self._adapter.publish_stop()
             self.get_logger().info('走停：机动结束，已清空旧位姿，等待停稳后的新鲜帧重新测量')
+            return
+
+        # ── Case 2.5: 已规划待发 —— 恢复运动模式后立即原样起步 ─────────
+        # 规划在锁定下已完成并暂存 _pending_seq; 等 stand_up 确认期间
+        # 不重测/不重规划。
+        if not self._launch_pending_seq(base_type, now_ns):
             return
 
         # ── Case 3: idle & settled — measure and plan a fresh sequence ─
@@ -710,6 +776,21 @@ class DockingNode(Node):
                 f'位姿={"无" if tag_pose is None else "有"}）',
                 throttle_duration_sec=1.0)
             return
+
+        # ── 稳定帧门: 规划只认停稳解冻后连续 accepted 的新鲜帧 ──────────
+        # EMA 已被解冻重新播种, 再要求 N 帧一致只多花 ~0.2-0.5s (6-10fps),
+        # 却能把单帧噪声挡在规划之外。等不满时超时放行 (防闪烁卡死),
+        # 设 1 即关闭。与 posture.enable 无关 —— 感知侧去噪永远值得。
+        min_frames = int(self._p('posture.min_stable_frames'))
+        if min_frames > 1 and self._stable_frames < min_frames:
+            if self._stable_window_start_ns == 0:
+                self._stable_window_start_ns = now_ns
+            if (now_ns - self._stable_window_start_ns) * 1e-9 < float(
+                    self._p('posture.stable_frame_timeout_sec')):
+                self._adapter.publish_stop()
+                return
+            self.get_logger().warn(
+                '稳定帧数量不足, 以当前位姿继续规划', throttle_duration_sec=5.0)
 
         if self._maneuver_iters >= self._max_maneuver_iters:
             self.get_logger().warn(
@@ -763,6 +844,12 @@ class DockingNode(Node):
                 # 的摆头。方位(bearing)只依赖标签在画面中的位置, 稳定可靠。
                 go_straight = True
 
+        # 走停步长运行期可调: ros2 param set <节点> stopgo.jog_max 0.5 即时生效,
+        # 无需重启 —— 每次规划前把当前参数同步进规划器 (launch 也可传 jog_max:=)。
+        self._planner.set_jog_limits(
+            jog_min=self._p('stopgo.jog_min'),
+            jog_max=self._p('stopgo.jog_max'))
+
         if go_straight:
             seq = self._planner.plan_straight(tag_pose.dist)
             self.get_logger().info(
@@ -770,15 +857,20 @@ class DockingNode(Node):
                 f'距离={tag_pose.dist:.3f}m → 目标={target_distance:.3f}m',
                 throttle_duration_sec=2.0)
         elif self._is_omni(base_type):
-            # Omni：逐帧小步规划 —— 横移对中 → 原地微转 → 直线前进。
+            # Omni：逐帧小步规划 —— 原地对准法线 → 横移上法线 → 直线前进。
             # 不用 plan_sequence 的法线盲机动：其 standoff 点 A = tag + d_target·n
             # 在 dist ≈ d_target 时贴在机器人脚下, turn1=atan2(A) 对厘米级测量
             # 噪声极敏感（实测 dock_distance=1.2 @ dist=1.28 规划出 ±44° 小挪
             # 动）；且大角度盲转的腿式滑移让真实位移超出里程计判停值，下一轮
             # 测量突变（dist 跌破 d_target → A 翻到身后 → 转 124° 往回走），
-            # 正反馈打转。omni 有横向自由度，直接横移消横偏，每步停稳重测，
-            # 转向只剩小角度对准。
-            step = self._planner.plan(tag_pose.dist, tag_pose.lat, bearing)
+            # 正反馈打转。
+            # 但"直接横移消横偏"只在车头已与 tag 法线平行时才成立：法线不平行的
+            # 时候横移 lat 虽能把 tag 挪到画面正中，车体却离法线更远（垂直偏距
+            # 增大），最终斜着冲向码垛。故 omni 顺序必须是：先原地转齐法线
+            # （转角 = normal+π, 仍受 max_turn_step 逐步钳制+停稳重测），横移
+            # 才等价于"平移到法线上"（左右侧判定 = lat 符号），最后直线前进。
+            step = self._planner.plan(tag_pose.dist, tag_pose.lat, bearing,
+                                      normal=tag_pose.normal)
             if step.kind == 'yaw':
                 # 大角度对准按 max_turn_step 分批：每步停稳重测，避免一次
                 # 大盲转的滑移污染下一轮测量。
@@ -813,20 +905,22 @@ class DockingNode(Node):
             f'法线={math.degrees(self._raw_normal):+.1f}° '
             f'| 直行={go_straight} 方位误差={math.degrees(bearing_err):.1f}°'
             f'(失败门槛{math.degrees(straight_yaw_tol):.1f}°) '
-            f'| 路径 [{", ".join(steps)}]')
+            f'| 路径 [{", ".join(steps)}]', throttle_duration_sec=1.0)
 
         if len(seq) == 1 and seq[0].kind == 'done':
             self._adapter.publish_stop()
             # Leave APPROACH→FINAL_SERVO/DOCKED to the state machine (it checks
             # the same tolerance on tag_pose).
+            # 容差内: 保持静止站立 (不发 stand_up), 由 FINAL_SERVO→DOCKED
+            # 确认 —— 到位后狗不喘、姿态最稳。
             return
 
-        # Load the sequence and launch its first sub-step.
-        self._maneuver_queue = list(seq)
-        self._maneuver_active = True
-        self._frozen = True          # 开始盲动：冻结检测，运动期丢弃所有帧
-        self._maneuver_iters += 1
-        self._start_next_maneuver_step(base_type)
+        # 规划完成 → 暂存待发, 由 _launch_pending_seq 在恢复运动模式
+        # (motion_enabled=True) 后原样启动 —— 解锁等待期间不再重测/重规划,
+        # 上面的规划日志因此每停只打一次。
+        self._pending_seq = list(seq)
+        if not self._launch_pending_seq(base_type, now_ns):
+            return
 
     def _run_retry(self, base_type: str, now_ns: int):
         """重试倒车的一个 tick: 盲退 retry.backup_distance, 到位后 → SEARCH_TAG。
@@ -847,7 +941,7 @@ class DockingNode(Node):
             )
             if done:
                 self._maneuver_active = False
-                self._executor.mark_stop_time(now_ns)
+                self._mark_stopped(now_ns)
                 self._sm.retry_search()
             self._publish_action_cmd(base_type)
             return
@@ -857,6 +951,11 @@ class DockingNode(Node):
         rate = float(self._p('retry.linear_rate'))
         if dist < 1e-3:
             self._sm.retry_search()
+            self._adapter.publish_stop()
+            return
+        # 上一轮失败/到站时狗可能仍处于静止站立 (DOCKED 约定), cmd_vel 会被
+        # 桥拒绝 → 里程计不走 → 15s 重试超时。先恢复运动模式再盲退。
+        if not self._posture.motion_ready(now_ns):
             self._adapter.publish_stop()
             return
         self._executor.start_jog(
@@ -903,6 +1002,11 @@ class DockingNode(Node):
         if not self._has_odom:
             self._adapter.publish_stop()
             self.get_logger().warn('泊出：等待里程计...', throttle_duration_sec=1.0)
+            return
+        # DOCKED 按约定保持静止站立; 盲退前必须 stand_up 并等 motion_enabled,
+        # 否则 cmd_vel 被桥拒绝 → 泊出超时。phase0→1 链式段已解锁不再处理。
+        if not self._posture.motion_ready(now_ns):
+            self._adapter.publish_stop()
             return
         self._undock_phase = 0
         if not self._start_undock_step(base_type):
@@ -971,7 +1075,7 @@ class DockingNode(Node):
             )
             if done:
                 self._maneuver_active = False
-                self._executor.mark_stop_time(now_ns)
+                self._mark_stopped(now_ns)
             self._publish_action_cmd(base_type)
             return
 
@@ -982,11 +1086,14 @@ class DockingNode(Node):
 
         # ── Case 2.5: 稳定窗口刚结束 → 解冻，强制下一帧只用停稳后的新鲜帧
         if self._frozen:
-            self._frozen = False
-            self._filter_init = False
-            self._last_detection_ns = 0
-            self._pose_buffer.clear()
+            self._reset_visual_state()
             self._search_detect_start = 0
+            self._adapter.publish_stop()
+            return
+
+        # ── Case 2.6: 检测期同样静止站立 (首次进入/重进搜索时自武装补锁) ──
+        # 锁定下检测, 二维码位姿不被呼吸晃动; 降级/停用时直接放行。
+        if not self._posture.lock_settled(now_ns):
             self._adapter.publish_stop()
             return
 
@@ -1003,13 +1110,19 @@ class DockingNode(Node):
             self._adapter.publish_stop()
             return
 
-        # 检测停留：累计 pause_time_sec 的持续不可见，然后转下一步
+        # 检测停留：累计 pause_time_sec 的持续不可见，然后转下一步。
+        # 第 0 步停留加长 (initial_look_sec)：开局 RTSP/检测流冷启动，
+        # tag 可能就在视野里而流还没出帧，别急着转走。
         pause_time = self._p('search.pause_time_sec')
+        if self._search_step == 0:
+            pause_time = max(pause_time, self._p('search.initial_look_sec'))
         if self._search_detect_start == 0:
             self._search_detect_start = now_ns
+            self._dwell_msg_start = self._det_msg_count
             self._adapter.publish_stop()
             self.get_logger().info(
-                f'搜索：检测停留 (步数={self._search_step})',
+                f'搜索：检测停留 (步数={self._search_step}, '
+                f'停留={pause_time:.1f}s)',
                 throttle_duration_sec=1.0)
             return
 
@@ -1017,7 +1130,18 @@ class DockingNode(Node):
             self._adapter.publish_stop()
             return
 
-        # 停留期满仍未见到 → 转下一步
+        # 停留期满仍未见到 → 先恢复运动模式再转下一步。解锁等待期间保持
+        # 停留状态 (不重置 _search_detect_start), 否则每步多等一个 pause_time。
+        if not self._posture.motion_ready(now_ns):
+            self._adapter.publish_stop()
+            return
+
+        # 停留期满仍未见到 → 转下一步。诊断：这段停留里 /detections 到了几条？
+        # 0 条 = 检测流断了 (相机/桥/apriltag 问题)，而非 tag 不在视野。
+        self.get_logger().info(
+            f'搜索：停留 {pause_time:.1f}s 未见 tag '
+            f'(步数={self._search_step}, '
+            f'期内消息={self._det_msg_count - self._dwell_msg_start}) → 转下一步')
         self._search_detect_start = 0
         self._search_step += 1
         step_angle = math.radians(self._p('search.step_angle_deg'))
@@ -1052,7 +1176,29 @@ class DockingNode(Node):
                 return
         # Queue drained without launching anything → maneuver is over.
         self._maneuver_active = False
-        self._executor.mark_stop_time(self.get_clock().now().nanoseconds)
+        self._mark_stopped(self.get_clock().now().nanoseconds)
+
+    def _launch_pending_seq(self, base_type: str, now_ns: int) -> bool:
+        """处理已规划的待发序列。返回 False = 本 tick 到此为止, 调用方立即 return
+        (仍在等 stand_up 解锁, 或已起步 —— 起步后若贯穿落入 Case 3 会在同一
+        tick 重测重规划、覆写刚启动的队列); True = 无待发序列, 继续量测规划。
+
+        规划完成后序列暂存 _pending_seq, 由本方法在静止站立解锁确认
+        (motion_enabled=True) 后原样启动 —— 解锁等待期间不重测/不重规划,
+        规划日志因此每停只打一次。启动后冻结检测 (盲动期丢弃所有帧)。
+        """
+        if self._pending_seq is None:
+            return True
+        if not self._posture.motion_ready(now_ns):
+            self._adapter.publish_stop()
+            return False
+        seq, self._pending_seq = self._pending_seq, None
+        self._maneuver_queue = list(seq)
+        self._maneuver_active = True
+        self._frozen = True          # 开始盲动：冻结检测，运动期丢弃所有帧
+        self._maneuver_iters += 1
+        self._start_next_maneuver_step(base_type)
+        return False
 
     def _launch_step(self, plan: ActionPlan, base_type: str) -> bool:
         """Start one executor action from an ActionPlan and re-ref odometry.
@@ -1131,6 +1277,28 @@ class DockingNode(Node):
         else:
             self._adapter.publish_stop()
 
+    def _mark_stopped(self, now_ns: int):
+        """停稳边界: 视觉 settle 时钟 + 静止站立锁定请求 (每停只武装一次)。
+
+        泊出 phase0→1 的链式段故意不走这里 —— 无缝盲链中间没有停看点,
+        锁定只发生在确实要"停下来看"的时刻。
+        """
+        self._executor.mark_stop_time(now_ns)
+        self._posture.on_stop(now_ns)
+
+    def _reset_visual_state(self):
+        """解冻 + 丢弃运动期全部旧位姿 + 重置稳定帧计数。
+
+        强制下一次规划只用停稳解冻后新采的新鲜帧 (EMA 重新播种);
+        稳定帧门 (_stable_frames) 从零重新累计。
+        """
+        self._frozen = False
+        self._filter_init = False          # EMA 重新播种（首帧新鲜帧作种子）
+        self._last_detection_ns = 0        # _tag_fresh() 归零，等待新帧
+        self._pose_buffer.clear()          # 丢弃所有历史缓冲位姿
+        self._stable_frames = 0
+        self._stable_window_start_ns = 0
+
     def _reset_maneuver(self):
         """Clear any queued/active blind maneuver and its iteration counter.
 
@@ -1141,7 +1309,8 @@ class DockingNode(Node):
         self._maneuver_queue = []
         self._maneuver_active = False
         self._maneuver_iters = 0
-        self._frozen = False
+        self._pending_seq = None
+        self._reset_visual_state()
         self._straight_failed = False
 
     def _reset_search(self):
@@ -1160,7 +1329,7 @@ class DockingNode(Node):
         else:
             self._search_direction = 1.0 if self._p('search.search_direction') >= 0 else -1.0
         self._executor.cancel()
-        self._frozen = False
+        self._reset_visual_state()
         self._maneuver_active = False
 
     # ── Helpers for the action executor ────────────────────────────
@@ -1197,6 +1366,9 @@ class DockingNode(Node):
     def _build_params_dict(self) -> dict:
         return {
             'timeout_sec': self._p('timeout_sec'),
+            'tag': {
+                'tag_loss_timeout_sec': self._p('tag.tag_loss_timeout_sec'),
+            },
             'search': {
                 'angular_speed': self._p('search.angular_speed'),
                 'step_angle_deg': self._p('search.step_angle_deg'),

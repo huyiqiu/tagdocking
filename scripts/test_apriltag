@@ -52,6 +52,17 @@ def _describe_lat(lat: float) -> str:
         return '偏左' if lat > 0 else '偏右'
     return f'{"左" if lat > 0 else "右"}侧 {ad:.2f}m'
 
+def _describe_face(deg: float) -> str:
+    """用中文描述 Tag 面的水平朝向 (正=面向左)。"""
+    ad = abs(deg)
+    if ad < 5:
+        return '正对'
+    if ad < 15:
+        return '轻微左偏' if deg > 0 else '轻微右偏'
+    if ad < 45:
+        return '左偏' if deg > 0 else '右偏'
+    return '大角度左偏' if deg > 0 else '大角度右偏'
+
 
 class TestApriltag(Node):
     """AprilTag 实时测量，中文可读输出。"""
@@ -95,8 +106,11 @@ class TestApriltag(Node):
         self._buf_dist = deque(maxlen=self._sample_batch)
         self._buf_lat  = deque(maxlen=self._sample_batch)
         self._buf_yaw  = deque(maxlen=self._sample_batch)
+        self._buf_face  = deque(maxlen=self._sample_batch)
+        self._buf_pitch = deque(maxlen=self._sample_batch)
         self._count = 0
         self._tf_fails = 0
+        self._tf_seen_ok = False   # 首次 TF 成功后清零失败计数 (启动期不算)
         self._last_msg_ns = 0
         self._last_det_ns = 0      # 最近一次目标 Tag 检出时刻: /detections 正常发布
                                    # ≠ Tag 在画面里, 移开 Tag 后 apriltag_node 仍发空数组
@@ -190,6 +204,13 @@ class TestApriltag(Node):
             self._tf_fails += 1
             return
 
+        # 首次成功后清零: 启动期 (DDS 发现 + 首帧 /tf 到达前) 的查询会失败几
+        # 拍 —— 本机高负载实测 ~3s/28 次。不清零的话汇总里 "TF 失败 N 次" 会
+        # 被启动期污染且永不减少, 看不出链路真实健康度。
+        if not self._tf_seen_ok:
+            self._tf_seen_ok = True
+            self._tf_fails = 0
+
         # TF 查询 src_frame→tag 的结果已经是 src_frame 坐标系的表示。
         # 取轴方式取决于 src_frame 是光学系还是常规 REP-103 系：
         #   光学坐标系 (camera_*_optical_frame): z=前, x=右, y=下
@@ -203,27 +224,75 @@ class TestApriltag(Node):
             dist = t.transform.translation.x
             lat  = t.transform.translation.y
 
-        # 方位角 = 需要转多少弧度才能正对 Tag
-        # atan2(lat, dist)，正=Tag在左边，需要左转(CCW)
+        # 方位角 = tag 的方向 (atan2(lat, dist), 正=Tag在左边, 需要左转CCW)。
+        # 注意这是"tag 在哪个方向", 只由位置决定, 与 tag 面的摆放角度无关 —
+        # 斜着摆 tag 这个数不变。
         yaw = math.atan2(lat, dist) if dist > 0.001 else 0.0
+
+        # Tag 真实朝向 (相对视线): n = tag 外法向 (z_up:=false, 旋转矩阵第三
+        # 列), 翻面自纠后必须指向相机 (n·f < 0, f = 单位视线方向)。以视线为
+        # 基准分解: face_yaw 水平偏角 (正=面向左), face_pitch 俯仰 (正=仰)。
+        # 用视线而非相机光轴做基准的原因: 光轴口径会把 tag 在画面里的位置
+        # 混进朝向读数 (正对视线的 tag 拿到画面右侧 22° 处会读出 22°), 与
+        # tag 摆放位置无关的"斜了多少度"才是要验证的量。
+        # docking 的 turn-drive-turn 对齐用的就是这个法向
+        # (tagdocking.utils.tag_normal_angle 同口径)。
+        q = t.transform.rotation
+        nx = 2.0 * (q.x * q.z + q.w * q.y)
+        ny = 2.0 * (q.y * q.z - q.w * q.x)
+        nz = 1.0 - 2.0 * (q.x * q.x + q.y * q.y)
+        tr = t.transform.translation
+        tnorm = math.sqrt(tr.x * tr.x + tr.y * tr.y + tr.z * tr.z)
+        if tnorm < 1e-6:
+            return
+        fx, fy, fz = tr.x / tnorm, tr.y / tnorm, tr.z / tnorm
+        if nx * fx + ny * fy + nz * fz > 0.0:   # 外法向必须指向相机
+            nx, ny, nz = -nx, -ny, -nz
+        # r = f × up = 视线系的"水平右" (光学系 up=(0,-1,0); REP-103 up=(0,0,1))
+        if is_optical:
+            ux, uy, uz = 0.0, -1.0, 0.0
+        else:
+            ux, uy, uz = 0.0, 0.0, 1.0
+        rx = fy * uz - fz * uy
+        ry = fz * ux - fx * uz
+        rz = fx * uy - fy * ux
+        rnorm = math.sqrt(rx * rx + ry * ry + rz * rz)
+        if rnorm < 1e-9:      # 视线近竖直 (极端俯仰), 水平分解无意义
+            face_yaw = 0.0
+        else:
+            rx, ry, rz = rx / rnorm, ry / rnorm, rz / rnorm
+            # face_yaw = atan2(n·左, -n·f), 左 = -r
+            face_yaw = math.degrees(math.atan2(
+                -(nx * rx + ny * ry + nz * rz),
+                -(nx * fx + ny * fy + nz * fz)))
+        # u = r × f = 视线系的"上" (r、f 正交单位, u 亦单位)
+        ux2 = ry * fz - rz * fy
+        uy2 = rz * fx - rx * fz
+        uz2 = rx * fy - ry * fx
+        face_pitch = math.degrees(math.atan2(
+            nx * ux2 + ny * uy2 + nz * uz2,
+            -(nx * fx + ny * fy + nz * fz)))
 
         self._buf_dist.append(dist)
         self._buf_lat.append(lat)
         self._buf_yaw.append(yaw)
+        self._buf_face.append(face_yaw)
+        self._buf_pitch.append(face_pitch)
 
         # 只在新数据到达时打印（10 行一次，避免刷屏）
         if self._count <= 3 or self._count % 10 == 0:
-            self._print_one(dist, lat, yaw)
+            self._print_one(dist, lat, yaw, face_yaw, face_pitch)
 
         if self._count % self._sample_batch == 0:
             self._print_summary()
 
     # ── 单次测量 ──────────────────────────────────────────────────
 
-    def _print_one(self, dist, lat, yaw):
+    def _print_one(self, dist, lat, yaw, face_yaw, face_pitch):
         yaw_deg = math.degrees(yaw)
         direction = _describe_yaw(yaw_deg)
         pos = _describe_lat(lat)
+        facing = _describe_face(face_yaw)
 
         # 正常距离
         if dist > 0.15:
@@ -237,7 +306,8 @@ class TestApriltag(Node):
         print(f'  [{self._count:4d}]  '
               f'{color}距离={dist:.3f}m{reset}  |  '
               f'Tag在{pos}  |  '
-              f'朝向={direction} ({yaw_deg:+.0f}°)  |  '
+              f'方位={direction} ({yaw_deg:+.0f}°)  |  '
+              f'Tag朝向={facing} ({face_yaw:+.0f}°) 俯仰({face_pitch:+.0f}°)  |  '
               f'{"⚠ 太近!" if dist < 0.15 else "    "}')
 
     # ── 实时摘要（每 2 秒）────────────────────────────────────────
@@ -255,10 +325,14 @@ class TestApriltag(Node):
         d_std  = statistics.stdev(self._buf_dist)
         l_mean = statistics.mean(self._buf_lat)
         y_mean = math.degrees(statistics.mean(self._buf_yaw))
+        f_mean = statistics.mean(self._buf_face)
+        f_std  = statistics.stdev(self._buf_face)
+        p_mean = statistics.mean(self._buf_pitch)
 
         parts = [f'距离={d_mean:.3f}±{d_std:.3f}m']
         parts.append(f'横向={l_mean:+.3f}m')
-        parts.append(f'朝向偏差={y_mean:+.1f}°')
+        parts.append(f'方位={y_mean:+.1f}°')
+        parts.append(f'Tag朝向={f_mean:+.1f}°±{f_std:.1f}° 俯仰{p_mean:+.1f}°')
         if self._known_distance > 0:
             err = d_mean - self._known_distance
             parts.append(f'(与已知值差 {err:+.3f}m)')
@@ -281,6 +355,10 @@ class TestApriltag(Node):
         l_std  = statistics.stdev(self._buf_lat) if n >= 3 else 0.0
         y_mean = math.degrees(statistics.mean(self._buf_yaw))
         y_std  = math.degrees(statistics.stdev(self._buf_yaw)) if n >= 3 else 0.0
+        f_mean = statistics.mean(self._buf_face)
+        f_std  = statistics.stdev(self._buf_face) if n >= 3 else 0.0
+        p_mean = statistics.mean(self._buf_pitch)
+        p_std  = statistics.stdev(self._buf_pitch) if n >= 3 else 0.0
 
         # 质量评估
         if d_std < 0.005:
@@ -296,7 +374,9 @@ class TestApriltag(Node):
         print(f'  ───────────────────────────────────────────')
         print(f'  距离:  {d_mean:.4f} ± {d_std:.4f} m    数据质量: {quality}')
         print(f'  横向:  {l_mean:.4f} ± {l_std:.4f} m    ({_describe_lat(l_mean)})')
-        print(f'  朝向:  {y_mean:.2f} ± {y_std:.2f} °     ({_describe_yaw(y_mean)})')
+        print(f'  方位:  {y_mean:.2f} ± {y_std:.2f} °     ({_describe_yaw(y_mean)}, tag的方向角, 只跟位置走)')
+        print(f'  朝向:  {f_mean:+.2f} ± {f_std:.2f} °     ({_describe_face(f_mean)}, tag面相对视线的偏角, 与位置无关)')
+        print(f'  俯仰:  {p_mean:+.2f} ± {p_std:.2f} °     (相对视线; 正=仰/上边远离相机, 负=俯)')
         if self._known_distance > 0:
             err = d_mean - self._known_distance
             pct = err / self._known_distance * 100
@@ -313,7 +393,19 @@ class TestApriltag(Node):
 
 def _launch_apriltag_node(tag_family: str, tag_size: float, tag_id: int,
                           image_topic: str) -> subprocess.Popen:
-    """启动 apriltag_node 子进程。"""
+    """启动 apriltag_node 子进程。已有实例在跑时返回 None (复用其 /detections)。
+
+    两个 apriltag_node 同时广播同一个 tag TF 帧 (tag<family>:<id>) 时, tf2
+    返回后到者, 数值在两套解算间来回跳 —— 表现为距离/横向读数乱跳。launch
+    栈 (docking.launch.py) 自带一个 apriltag_node, 此时本脚本直接复用即可。
+    """
+    if subprocess.run(['pgrep', '-f', 'apriltag_ros/apriltag_node'],
+                      stdout=subprocess.DEVNULL,
+                      stderr=subprocess.DEVNULL).returncode == 0:
+        print('  ⚠ 已有 apriltag_node 在运行 (launch 栈?), 复用其 /detections, '
+              '不再另起 (避免双广播者导致 TF 乱跳)')
+        return None
+
     tag_frame = f'tag{tag_family}:{tag_id}'
     cmd = [
         'ros2', 'run', 'apriltag_ros', 'apriltag_node',
@@ -322,6 +414,13 @@ def _launch_apriltag_node(tag_family: str, tag_size: float, tag_id: int,
         '-p', f'size:={tag_size}',
         '-p', f'tag_ids:=[{tag_id}]',
         '-p', f'tag_frames:=[{tag_frame}]',
+        # apriltag_ros 3.4.0+ (上游 ROS2 重写, 节点名 /apriltag) 只认嵌套参数
+        # tag.ids/tag.frames/tag.sizes, 且无 publish_tf/z_up (TF 无条件发布);
+        # 旧 fork 只认扁平 tag_ids/tag_frames。未识别的参数被静默忽略,
+        # 两套同传兼容两代版本 —— 只传扁平参数时 3.4.0 会"有检测、无 TF"。
+        '-p', f'tag.ids:=[{tag_id}]',
+        '-p', f'tag.frames:=[{tag_frame}]',
+        '-p', f'tag.sizes:=[{tag_size}]',
         '-p', 'publish_tf:=true',
         '-p', 'z_up:=false',
         # decimate=2 (apriltag_ros 默认) 检测前先把图降采样一半: rtsp_camera 桥
