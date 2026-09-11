@@ -35,7 +35,8 @@ class ActionExecutor:
                  final_approach_distance: float = 1.0,
                  yaw_threshold: float = 0.05,
                  turn_lead_per_speed: float = 0.30,
-                 turn_slow_rad: float = 0.14):
+                 turn_slow_rad: float = 0.14,
+                 min_angular_rate: float = 0.12):
         self._turn_settle_ns = int(turn_settle_sec * 1e9)
         self._turn_undershoot = turn_undershoot
         self._max_turn_step = max_turn_step
@@ -55,6 +56,16 @@ class ActionExecutor:
         #      微调本值。
         self._turn_lead_per_speed = turn_lead_per_speed
         self._turn_slow_rad = turn_slow_rad
+        # 必须 > l1w_control 的 min_angular_z 死区 (0.10): 低于死区的角速度会被
+        # clampAxis 直接截成 0, 狗原地不动。与 stopgo.lateral_rate 同一道理,
+        # 但转向通道有两级减速会叠乘, 更容易掉进死区:
+        #   3° 转向 < small_turn_rad(0.1rad) → 0.3×0.5 = 0.15
+        #   起步即 remaining < turn_slow_rad(0.14rad) → 再 ×0.5 = 0.075 < 0.10
+        # → 命令被清零, 狗不动, 里程计只剩噪声, 反向看门狗 (0.34° 门槛) 立刻
+        # 判 "opposite commanded direction"。双码 yaw 步长上限只有 3°, 每一个
+        # 候选都落在这个区间, 所以双码的转向修正曾经从来没有真正执行过。
+        # 减速的目的是削惯性冲量, 不是发不出去的指令 —— 掉到死区以下就抬回。
+        self._min_angular_rate = max(0.0, min_angular_rate)
         # 本步起始角速度(含 start_turn 的小角半速), 近目标减速段的基准,
         # 保证只降一档、不会逐帧累乘到 0。
         self._turn_base_angular = 0.0
@@ -188,10 +199,10 @@ class ActionExecutor:
 
         self.turn_count += 1
         self._action = 'turning'
-        # Slow down for small turns
+        # Slow down for small turns, but never below the chassis dead zone.
         rate = abs(angular_rate)
         if abs(damped) < self._small_turn_rad:
-            rate *= 0.5
+            rate = max(rate * 0.5, min(self._min_angular_rate, abs(angular_rate)))
         self._action_angular = rate if damped >= 0 else -rate
         self._action_linear = 0.0
         self._action_target = abs(damped)
@@ -366,8 +377,9 @@ class ActionExecutor:
         if (remaining < self._turn_slow_rad
                 and abs(self._action_angular)
                 > abs(self._turn_base_angular) * 0.5 + 1e-9):
-            self._action_angular = math.copysign(
-                abs(self._turn_base_angular) * 0.5, self._action_angular)
+            slowed = max(abs(self._turn_base_angular) * 0.5,
+                         min(self._min_angular_rate, abs(self._turn_base_angular)))
+            self._action_angular = math.copysign(slowed, self._action_angular)
         # 提前量按当前速率线性缩放; 钳到目标一半, 保证极小目标角至少执行
         # 一半 —— 否则 1° 级微调会在起步前就被提前量整个吞掉, 规划器看到
         # 误差不变, 无限重发同一小转。

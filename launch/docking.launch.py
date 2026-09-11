@@ -49,15 +49,20 @@ from ament_index_python.packages import get_package_share_directory
 
 DUAL_TUNING_ARGS = (
     'observation_distance', 'observation_tolerance', 'forward_step',
-    'reverse_step', 'lateral_step', 'yaw_step_deg', 'settle_sec',
+    'reverse_step', 'lateral_step', 'yaw_step_deg', 'yaw_fine_step_deg',
+    'straight_yaw_tol_deg', 'straight_yaw_max_turns',
+    'prealign_tolerance_deg', 'prealign_step_deg', 'prealign_max_steps',
+    'settle_sec',
     'missing_confirm_sec', 'missing_timeout_sec', 'qualification_sec',
     'dock_distance', 'dock_tolerance', 'straight_start_distance',
+    'reverse_limit', 'reverse_count',
+    'standoff_reverse_limit', 'standoff_reverse_count',
     'min_lateral_m', 'lateral_tolerance_m', 'observe_timeout_sec',
     'camera_wait_sec', 'visibility_margin_px', 'visibility_sample_pad_px',
     'visibility_samples', 'score_improvement', 'feedback_min_improvement',
     'feedback_fail_windows', 'no_candidate_windows', 'log_period_sec',
     'odom_fresh_sec', 'action_timeout_sec', 'response_timeout_sec',
-    'odom_noise_m', 'odom_noise_rad',
+    'odom_noise_m', 'odom_noise_rad', 'action_startup_sec',
     'pile_lock_distance', 'crouch_settle_sec',
 )
 
@@ -207,6 +212,13 @@ def launch_setup(context):
     if dual_enable.lower() not in ('true', 'false'):
         raise ValueError('dual_enable must be true or false')
     dual_enabled = dual_enable.lower() == 'true'
+    # 匍匐 profile 开关: 照 dual_enable 单独声明 (布尔不进 DUAL_TUNING_ARGS 的
+    # float() 批量路径), 空串保留 yaml 权威值。
+    dual_crouch = LaunchConfiguration('dual_crouch_enable').perform(context).strip()
+    if dual_crouch == '':
+        dual_crouch = 'true' if _yaml_params.get('dual.crouch_enable') else 'false'
+    if dual_crouch.lower() not in ('true', 'false'):
+        raise ValueError('dual_crouch_enable must be true or false')
     dual_tuning = {}
     for name in ('projection_mode', 'camera_info_topic'):
         value = LaunchConfiguration('dual_' + name).perform(context).strip()
@@ -220,7 +232,10 @@ def launch_setup(context):
         value = LaunchConfiguration('dual_' + name).perform(context).strip()
         if value:
             number = float(value)
-            if name in ('visibility_samples', 'feedback_fail_windows', 'no_candidate_windows'):
+            if name in ('visibility_samples', 'feedback_fail_windows',
+                        'no_candidate_windows', 'prealign_max_steps',
+                        'reverse_count', 'standoff_reverse_count',
+                        'straight_yaw_max_turns'):
                 if not number.is_integer():
                     raise ValueError('dual_' + name + ' must be an integer')
                 number = int(number)
@@ -448,6 +463,7 @@ def launch_setup(context):
           # 两侧, 否则节点找的 TF frame 名与 apriltag 广播的对不上。
           # dual_enable=false 时零改动 (yaml 权威, 节点全程旁路)。
           + ([dual_tuning, {'dual.enable': dual_enabled,
+               'dual.crouch_enable': dual_crouch.lower() == 'true',
                'dual.wall_tag_size': wall_tag_size,
                'dual.pile_tag_id': pile_tag_id,
                'dual.pile_tag_size': pile_tag_size}]
@@ -552,6 +568,11 @@ def generate_launch_description():
                               description='双二维码对准总开关 true/false: 墙码(36h11:0)+桩码 '
                                           '联合对准 → 纯直行 → 距墙码 0.50m 停泊 '
                                           '(空 = 使用 yaml 的 dual.enable)'),
+        DeclareLaunchArgument('dual_crouch_enable', default_value='',
+                              description='匍匐 profile 开关 true/false: false=全程站立 '
+                                          '(默认, 匍匐单轮转向附带 4.5~7cm 前移已弃用); '
+                                          'true=原匍匐搜索/对准流程 '
+                                          '(空 = 使用 yaml 的 dual.crouch_enable)'),
         DeclareLaunchArgument('wall_tag_size', default_value='',
                               description='墙码边长 (m, 36h11:0): dual 启用时 apriltag 按此解 PnP '
                                           '(空 = 使用 yaml 的 dual.wall_tag_size, 默认 0.15)'),

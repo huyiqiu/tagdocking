@@ -104,6 +104,16 @@ class DockingNode(Node):
         self._dual_diag_ns = {}
         self._dual_info = {}
         self._dual_watch = None
+        # 连续"过期"帧的起点与最大观测延迟: 双码用固定 dual.fresh_sec 时效窗
+        # (不走单码的自适应窗), 链路延迟一旦长期超窗, 每帧都被静默丢弃, 外层
+        # 只看到"从未见过 tag"而一直转圈搜索。攒够一段时间就明确报错。
+        self._dual_expired_since_ns = 0
+        self._dual_expired_worst_ms = 0.0
+        # 趴下前的单码粗对准 (见 _dual_prealign): 双码枚举的步长上限只有几度,
+        # 它是精调器不是收敛器; 锁定时残留的十几度方位必须先用单码大步收掉。
+        self._dual_prealigned = False
+        self._dual_prealign_steps = 0
+        self._dual_prealign_active = False
 
         # ── Geometry planner (normal-line alignment) ──────────────
         self._planner = GeometryPlanner(
@@ -127,6 +137,7 @@ class DockingNode(Node):
             yaw_threshold=math.radians(self._p('stopgo.yaw_threshold_deg')),
             turn_lead_per_speed=self._p('stopgo.turn_lead_per_speed'),
             turn_slow_rad=self._p('stopgo.turn_slow_rad'),
+            min_angular_rate=self._p('stopgo.min_angular_rate'),
         )
 
         # ── State machine ─────────────────────────────────────────
@@ -389,6 +400,10 @@ class DockingNode(Node):
         for name, default in DUAL_DEFAULTS.items():
             self.declare_parameter('dual.' + name, default)
         self.declare_parameter('dual.enable', False)
+        # 匍匐 profile 开关: false = 全程站立 (匍匐单轮转向每次附带 4.5~7cm 前移,
+        # 小角度无法精确调整, 见 README 6.5b); true = 保留原匍匐搜索/对准流程。
+        # 不进 DUAL_DEFAULTS: 布尔过不了 positivity 校验。
+        self.declare_parameter('dual.crouch_enable', False)
         self.declare_parameter('dual.camera_info_topic', '/camera_sync/camera_info')
         self.declare_parameter('dual.projection_mode', 'raw')
         # 墙码边长 (36h11:0, apriltag 节点按此解 PnP; launch 侧同步透传)
@@ -396,8 +411,11 @@ class DockingNode(Node):
         # 桩码 ID/边长 (ID=51 现场已确认; 换桩改配置或 launch pile_tag_id:=)
         self.declare_parameter('dual.pile_tag_id', 51)
         self.declare_parameter('dual.pile_tag_size', 0.05)
-        # 相机系目标: 距墙码 1.0m 处完成双码对准 → 纯直行
-        self.declare_parameter('dual.straight_start_distance', 1.0)
+        # 相机系站位距离: 距墙码 1.70m (= observation_distance - tolerance) 处
+        # 完成双码对准 → 直行 (站立全程, 桩码 ~0.9m 在站位处可见)。
+        # 它同时是 near 字段: approach 桩码丢失闭锁的窗口上界 (站立下 locked 的
+        # 唯一入口), 以及 yaw_cap 远/近分档与 visible() allow_exit 的边界。
+        self.declare_parameter('dual.straight_start_distance', 1.70)
         # 相机系停泊距离: 摄像头距墙码 0.50m = 停泊完成
         self.declare_parameter('dual.dock_distance', 0.50)
         # 对准判据: 两码方位 (base_link 系 bearing) 同时 ≤ ±tol 保持 hold
@@ -414,6 +432,8 @@ class DockingNode(Node):
         self.declare_parameter('stopgo.jog_max', 0.50)
         self.declare_parameter('stopgo.jog_linear_rate', 0.08)
         self.declare_parameter('stopgo.jog_angular_rate', 0.3)
+        # 转向角速度下限 — 必须 > l1w_control 的 min_angular_z 死区 (0.10)。
+        self.declare_parameter('stopgo.min_angular_rate', 0.12)
         self.declare_parameter('stopgo.turn_creep_linear', 0.0)  # 已弃用，固定纯原地转
         self.declare_parameter('stopgo.lateral_rate', 0.08)
         # 狗固件横移通道航位推算严重低估（实测 odom 0.507m / 实际约 2m，
@@ -748,12 +768,57 @@ class DockingNode(Node):
                 f'dual detection {reason}: stamp={stamp} '
                 f'age_ms={(now-stamp)/1e6:.1f} pending={len(self._dual_pending)}')
 
+    def _note_dual_expired(self, stamp, now):
+        """双码时效窗全帧拒收: 攒够一段时间就报错, 不再静默转圈搜索。
+
+        双码走固定 dual.fresh_sec 窗 (不像单码那样按实测检测间隔自适应放宽),
+        因此链路延迟一旦长期超窗, 每一帧都在 fresh() 门被丢掉: observe() 从不
+        被调用 → _last_detection_ns 永不更新 → tag_visible 恒 False → 外层只
+        能判定"从未见过 tag", 一路转圈搜索到 search.timeout_sec, 日志里却明明
+        每帧都打着"双码发现"。这种"看得见却用不上"必须明确报错, 把实测延迟和
+        窗口值一起打出来, 而不是让现场去猜。
+
+        单帧过期是正常抖动, 只有"连续过期跨越 grace"才判为链路问题; 任何一帧
+        通过时效窗都会把计时器清零 (见 _on_dual_detections)。
+        """
+        window = float(self._dual.p('fresh_sec'))
+        grace_ns = int(max(3.0, 5.0 * window) * 1e9)
+        age_ms = (now - stamp) / 1e6          # 负值 = 未来戳 (时钟不同步)
+        if self._dual_expired_since_ns == 0 or now < self._dual_expired_since_ns:
+            self._dual_expired_since_ns = now
+            self._dual_expired_worst_ms = age_ms
+        elif abs(age_ms) > abs(self._dual_expired_worst_ms):
+            self._dual_expired_worst_ms = age_ms
+        if now - self._dual_expired_since_ns < grace_ns:
+            return
+        span = (now - self._dual_expired_since_ns) / 1e9
+        worst = self._dual_expired_worst_ms
+        cause = ('检测时间戳超前于本地时钟 (时钟不同步)' if worst < 0 else
+                 f'感知链路延迟 {worst:.0f}ms 超过时效窗 {window*1e3:.0f}ms')
+        self._dual_expired_since_ns = 0
+        self._dual_expired_worst_ms = 0.0
+        self._adapter.publish_stop()
+        self._executor.cancel()
+        self._sm.abort_motion(
+            f'双码时效窗连续 {span:.1f}s 拒收全部检测帧 — {cause}; '
+            f'两码一直被检测到但从未进入观测 (外层因此只能转圈搜索)。'
+            f'排查: 降低相机/检测链路延迟, 或上调 dual.fresh_sec '
+            f'(当前 {window:.2f}s, 须 > 实测 age_ms)')
+
+    def _clear_dual_expiry(self):
+        """任何"非过期"的帧结局都终止连续计时 —— 只有连续过期才算链路故障。"""
+        self._dual_expired_since_ns = 0
+        self._dual_expired_worst_ms = 0.0
+
     def _discard_dual_pending(self):
         """Fence task / freeze / visual windows by ORIGINAL sensor time."""
         if self._dual.enabled:
             self._dual_pending.clear()
             self._dual_window_ns = self.get_clock().now().nanoseconds
             self._dual_received_ns = max(self._dual_received_ns, self._dual_window_ns)
+            # 冻结/离开视觉态期间的丢帧与链路延迟无关, 不得计入连续过期,
+            # 否则解冻后的第一帧就会拿着跨越冻结期的旧起点直接判死。
+            self._clear_dual_expiry()
 
     def _invalidate_dual_pose(self):
         self._dual.invalidate()
@@ -766,11 +831,9 @@ class DockingNode(Node):
         stamp = msg.header.stamp.sec * 1000000000 + msg.header.stamp.nanosec
         ids = {d.id for d in msg.detections}
         wall_id, pile_id = int(self._p('tag.id')), self._dual.pile_tag_id
-        if wall_id in ids and pile_id in ids:
-            self._dual_log('found',
-                f'双码发现: wall_id={wall_id} pile_id={pile_id} stamp={stamp} '
-                f'age_ms={(now-stamp)/1e6:.1f} stage={self._dual.stage} '
-                f'frozen={self._frozen} outer={self._sm.state.name} (仅检测，尚未通过TF/观测检查)', now)
+        # "双码发现" 已移除: 它只报告"检测器看见了", 与能否使用无关, 每 2s 一条
+        # 却把真正的决策日志冲散。检测是否被采纳由 "双码有效" / dual detection
+        # <reason> 两路如实反映, 信息不丢。
         if self._sm.state not in (DockingState.SEARCH_TAG, DockingState.ALIGN,
                                   DockingState.APPROACH, DockingState.FINAL_SERVO):
             self._discard_dual_pending()
@@ -782,6 +845,7 @@ class DockingNode(Node):
         if (stamp <= self._dual_received_ns or stamp < self._dual_window_ns
                 or stamp < self._dual.settle_until_ns):
             self._dual_diagnostic('rejected duplicate/old/window', stamp, now)
+            self._clear_dual_expiry()   # 水位/停稳窗拒收, 不是延迟
             return
         # Future stamps must not poison the monotonic watermark.
         if not self._dual.fresh(now, stamp):
@@ -789,7 +853,12 @@ class DockingNode(Node):
                 self._dual_received_ns = stamp
                 self._invalidate_dual_pose()
             self._dual_diagnostic('expired/future', stamp, now)
+            self._note_dual_expired(stamp, now)
             return
+        # 时效通过 = 链路延迟回到窗内: 这里是"不再全帧过期"的唯一确证点,
+        # 比 observe() 成功更早也更准 (observe 还会因稳定性过滤失败, 那与
+        # 延迟无关, 不该把延迟计时器留着继续走)。
+        self._clear_dual_expiry()
         self._dual_received_ns = stamp
         if wall_id not in ids:
             # Confirmed absence supersedes older pending observations: none may
@@ -1088,7 +1157,12 @@ class DockingNode(Node):
             if done:
                 if self._dual.enabled:
                     self.get_logger().info(f'dual action COMPLETE signed_odom={self._dual_watch.signed:+.6f}; awaiting settled visual feedback')
-                    self._dual.action_completed()
+                    # 粗对准步不进双码的视觉反馈账: 它没有 active_feedback
+                    # (未走 action_started), 记进去只会污染 feedback 判据。
+                    # 清标志统一在 _mark_stopped —— 那是本 tick 之后、且能同时
+                    # 覆盖"队列排空一步都没起来"的路径。
+                    if not self._dual_prealign_active:
+                        self._dual.action_completed()
                     self._dual_watch = None
                 if self._maneuver_queue:
                     # Chain straight into the next sub-step by odometry — no
@@ -1146,9 +1220,16 @@ class DockingNode(Node):
                 self._sm.abort_motion('dual docking requires odometry')
                 return
             self._lookup_camera_offset()
+            # 步骤 1.5: 趴下前先用单码 (墙码) 把方位粗对准到 ±prealign_tolerance。
+            # 双码枚举的单步上限只有几度, 它是精调器不是收敛器 —— 锁定那一刻
+            # 残留多少方位误差, 双码就得一步几度地啃回来。现场锁定时方位差
+            # 20.4°, 双码要 ~30 步 × 2.4s ≈ 70s, 顶着观测超时走。
+            if not self._dual_prealign(tag_visible, tag_pose, base_type, now_ns):
+                return
             # 步骤 2: 搜索锁定墙码后先趴下 —— 桩码贴桩底座更矮, 站立视角看不到,
             # 双码对准/接近全程匍匐。切换期间停车等待 (响应+settle 非阻塞轮询)。
-            if not self._dual_posture.ensure_crouch(now_ns):
+            # crouch_enable=false (站立 profile) 跳过: 狗本来就站着。
+            if self._dual.crouch and not self._dual_posture.ensure_crouch(now_ns):
                 if self._dual_posture.failure:
                     self._executor.cancel()
                     self._sm.abort_motion('dual 姿态切换: ' + self._dual_posture.failure)
@@ -1329,10 +1410,6 @@ class DockingNode(Node):
 
         if go_straight:
             seq = self._planner.plan_straight(tag_pose.dist)
-            self.get_logger().info(
-                f'走停 直线阶段 iter={self._maneuver_iters}: '
-                f'距离={tag_pose.dist:.3f}m → 目标={target_distance:.3f}m',
-                throttle_duration_sec=2.0)
         elif self._is_omni(base_type):
             # Omni：逐帧小步规划。两阶段模式下:
             #   远场 (dist > tighten_distance): normal=None, plan() 走纯方位
@@ -1383,15 +1460,26 @@ class DockingNode(Node):
                     steps.append(f'前进 {p.jog_distance:+.3f}m')
             else:
                 steps.append(p.kind)
-        self.get_logger().info(
-            f'走停 规划 iter={self._maneuver_iters}: '
-            f'二维码 距离={tag_pose.dist:.3f}m 横向={tag_pose.lat:+.3f}m '
-            f'方位={bearing_deg:+.1f}° 法线={math.degrees(tag_pose.normal):+.1f}° '
-            f'| 原始 距离={self._raw_dist:.3f} 横向={self._raw_lat:+.3f} '
-            f'法线={math.degrees(self._raw_normal):+.1f}° '
-            f'| 直行={go_straight} 方位误差={math.degrees(bearing_err):.1f}°'
-            f'(失败门槛{math.degrees(straight_yaw_tol):.1f}°) '
-            f'| 路径 [{", ".join(steps)}]', throttle_duration_sec=1.0)
+        if go_straight:
+            # 直行阶段只关注距离: 决策 = plan_straight(dist), 角度/航向完全不
+            # 参与判断, 日志同步精简 —— 不打方位/法线/门槛字段 (直行语境里
+            # bearing 随 dist 缩小自然变大, 打出来只会误导"直行还在管角度")。
+            # 保留距离+路径: [done] 逐秒重复是"规划说到位而状态机不收"的
+            # 唯一现场证据, 必须可见。
+            self.get_logger().info(
+                f'走停 直线阶段 iter={self._maneuver_iters}: '
+                f'距离={tag_pose.dist:.3f}m → 目标={target_distance:.3f}m '
+                f'| 路径 [{", ".join(steps)}]', throttle_duration_sec=1.0)
+        else:
+            self.get_logger().info(
+                f'走停 规划 iter={self._maneuver_iters}: '
+                f'二维码 距离={tag_pose.dist:.3f}m 横向={tag_pose.lat:+.3f}m '
+                f'方位={bearing_deg:+.1f}° 法线={math.degrees(tag_pose.normal):+.1f}° '
+                f'| 原始 距离={self._raw_dist:.3f} 横向={self._raw_lat:+.3f} '
+                f'法线={math.degrees(self._raw_normal):+.1f}° '
+                f'| 方位误差={math.degrees(bearing_err):.1f}°'
+                f'(失败门槛{math.degrees(straight_yaw_tol):.1f}°) '
+                f'| 路径 [{", ".join(steps)}]', throttle_duration_sec=1.0)
 
         if len(seq) == 1 and seq[0].kind == 'done':
             self._adapter.publish_stop()
@@ -1685,6 +1773,77 @@ class DockingNode(Node):
         self._maneuver_active = False
         self._mark_stopped(self.get_clock().now().nanoseconds)
 
+    def _dual_prealign(self, tag_visible: bool, tag_pose, base_type: str,
+                       now_ns: int) -> bool:
+        """趴下前用单码 (墙码) 把方位粗对准。True = 可以进入双码。
+
+        为什么需要它: 双码 _correction 枚举的单步上限是 yaw_cap (远场 8°、近场
+        3°), 每步还要停稳-重测-重规划 ~2.4s。它的定位是"精调器" —— 用两码的
+        地平面几何把 theta/e 双自由度收进毫米/度级, 而不是从十几度的初始误差
+        开始收敛。现场 `二维码已锁定：距离=1.371m` 之后直接趴下进双码, 锁定
+        时的方位误差 (实测 20.4°) 没有任何粗对准, 双码只能一步几度地啃, ~30 步
+        × 2.4s ≈ 70s 顶着 dual.observe_timeout_sec (90s) 走, 必然失败。
+
+        为什么放在趴下之前: 站立视角看墙码 (0.15m, 挂墙上) 最清楚, 桩码本来就
+        看不见 —— 粗对准只需要墙码, 没有理由先趴下再转。
+
+        为什么用单码而非双码的 geometry(): 粗对准只要收一个自由度 (车头朝向
+        墙码), 墙码 bearing = atan2(lat, dist) 是直接量测, 不依赖两码基线、
+        不会因为桩码缺失而无解。精度不够正是交给双码的理由。
+
+        预算耗尽不判失败, 只告警后移交: 粗对准是加速器, 收敛与失败判定的责任
+        在双码 (它有 observe_timeout / max_actions / 看门狗)。两处都判失败会
+        让现场同一个故障出现两种说法。
+        """
+        if self._dual.stage != 'acquire' or self._dual_prealigned:
+            # 粗对准只属于 acquire 相位 (双码还没拿到过一次有效双码观测)。
+            # 一旦进了 observe/approach/locked, 朝向由双码几何或锁定直行负责,
+            # 单码 bearing 再插手只会和双码抢方向盘。
+            return True
+        tol = math.radians(self._dual.p('prealign_tolerance_deg'))
+        budget = int(self._dual.p('prealign_max_steps'))
+        if not tag_visible or tag_pose is None:
+            self._adapter.publish_stop()
+            self.get_logger().info('单码粗对准: 等待停稳后的墙码新鲜帧',
+                                   throttle_duration_sec=1.0)
+            return False
+        bearing = math.atan2(tag_pose.lat, tag_pose.dist)
+        if abs(bearing) <= tol:
+            self._dual_prealigned = True
+            self.get_logger().info(
+                f'单码粗对准完成: 墙码方位={math.degrees(bearing):+.2f}deg '
+                f'≤ {math.degrees(tol):.1f}deg (用了 {self._dual_prealign_steps} 步, '
+                f'距离={tag_pose.dist:.3f}m) → 交给双码精调')
+            return True
+        if self._dual_prealign_steps >= budget:
+            self._dual_prealigned = True
+            self.get_logger().warn(
+                f'单码粗对准预算耗尽 ({budget} 步) 仍有方位 '
+                f'{math.degrees(bearing):+.2f}deg > {math.degrees(tol):.1f}deg — '
+                f'仍交给双码 (由其超时/看门狗判定), 但入桩概率低。'
+                f'排查: 转向是否真的执行 (看 signed_odom)、'
+                f'dual.prealign_step_deg 是否太小、墙码量测是否抖动')
+            return True
+        # bearing > 0 = 墙码在车左 → 左转 (CCW, turn_angle > 0)。与双码的
+        # 光学 bearing 符号相反 (光学 x 向右), 这里用的是 base 系 lat。
+        step = min(math.radians(self._dual.p('prealign_step_deg')),
+                   float(self._p('stopgo.max_turn_step')), abs(bearing))
+        self._dual_prealign_steps += 1
+        self.get_logger().info(
+            f'单码粗对准 #{self._dual_prealign_steps}/{budget}: 墙码 '
+            f'距离={tag_pose.dist:.3f}m 横向={tag_pose.lat:+.3f}m '
+            f'方位={math.degrees(bearing):+.2f}deg (门槛 {math.degrees(tol):.1f}deg) '
+            f'→ 原地转 {math.degrees(math.copysign(step, bearing)):+.2f}deg')
+        # _dual_prealign_active 让 _launch_pending_seq / _launch_step 把这一步
+        # 当成"非双码"处理: 不查 dual.pending_valid (双码这会儿还没规划过,
+        # 没有 pending_plan), 也不记进 dual 的动作预算/合格状态。看门狗照装 ——
+        # 底盘不动 (死区/锁定) 必须现在就炸, 而不是拖到双码去误判几何。
+        self._dual_prealign_active = True
+        self._pending_seq = [ActionPlan(kind='yaw',
+                                        turn_angle=math.copysign(step, bearing))]
+        self._launch_pending_seq(base_type, now_ns)
+        return False
+
     def _launch_pending_seq(self, base_type: str, now_ns: int) -> bool:
         """处理已规划的待发序列。返回 False = 本 tick 到此为止, 调用方立即 return
         (仍在等 stand_up 解锁, 或已起步 —— 起步后若贯穿落入 Case 3 会在同一
@@ -1696,7 +1855,8 @@ class DockingNode(Node):
         """
         if self._pending_seq is None:
             return True
-        if self._dual.enabled and not self._dual.pending_valid(now_ns):
+        if (self._dual.enabled and not self._dual_prealign_active
+                and not self._dual.pending_valid(now_ns)):
             self._pending_seq = None
             self._adapter.publish_stop()
             self._dual.stopped(now_ns)
@@ -1776,7 +1936,8 @@ class DockingNode(Node):
             self._dual_watch = ActionWatch(plan, now,
                 (self._odom_x, self._odom_y, self._odom_yaw),
                 self._executor._action_target, speed, self._dual.p)
-            self._dual.action_started(plan, now)
+            if not self._dual_prealign_active:
+                self._dual.action_started(plan, now)
         self._publish_action_cmd(base_type)
         return True
 
@@ -1785,6 +1946,10 @@ class DockingNode(Node):
         reason = ('dual missing action start reference' if watch is None else watch.check(
             now, (self._odom_x,self._odom_y,self._odom_yaw), getattr(self,'_odom_stamp_ns',0)))
         if reason:
+            if self._dual_prealign_active:
+                # 现场必须能一眼分清"粗对准阶段底盘没动"和"双码精调出问题":
+                # 前者是站立单码转向 (死区/锁定/服务), 后者是匍匐双码几何。
+                reason = '单码粗对准阶段 — ' + reason
             self._adapter.publish_stop()
             self._executor.cancel()
             self._pending_seq = None
@@ -1832,6 +1997,11 @@ class DockingNode(Node):
         """
         self._executor.mark_stop_time(now_ns)
         self._posture.on_stop(now_ns)
+        # 粗对准那一步到此结束 —— 标志必须在"停稳"这个唯一收口处清掉, 而不是
+        # 只在动作正常完成时清: 队列排空一步都没起来 (步长太小被跳过) 也走这里。
+        # 漏清的后果是静默的: 之后真正的双码动作会被当成粗对准步, 既不查
+        # pending_valid 也不记 action_started, 双码的预算/合格状态全部作废。
+        self._dual_prealign_active = False
         if self._dual.enabled:
             self._dual.stopped(now_ns)
 
@@ -1872,6 +2042,12 @@ class DockingNode(Node):
         self._dual_posture.reset()          # 姿态序列回 IDLE (新轮 dock 重新趴下)
         self._dual_stand_grace_ns = 0
         self._dual_diag_ns.clear()
+        self._clear_dual_expiry()          # 新一轮从零计延迟, 不继承上轮
+        # 新一轮 dock 重做粗对准: 上一轮结束时的朝向与本轮无关 (中间可能
+        # 搜索转了一圈、也可能倒车重锁), 预算同样从零。
+        self._dual_prealigned = False
+        self._dual_prealign_steps = 0
+        self._dual_prealign_active = False
         self._dual.reset()                 # 复位双码相位闩 (直行/对准保持)
 
     def _reset_search(self):

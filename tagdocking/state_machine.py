@@ -448,10 +448,15 @@ class DockingStateMachine:
         # Check if close enough for final servo.
         # 用 2x 容差(而非 3x)收紧进入阈值: 进入 FINAL_SERVO 时距目标 <=6cm,
         # 避免 FINAL_SERVO 期间还要大幅移动导致近距离 tag 检测抖动丢失。
-        distance = math.hypot(tag_pose.dist - target_distance, tag_pose.lat)
+        # 距离-only: 两阶段直行"故意不修横向、入口横向误差带到终点"(docking_node
+        # 入口检查语义), hypot 里掺 lat 等于拿直行保证不了的量当门槛 —— 2026-09
+        # 实测: [done] 后 hypot(0.006, 0.110)=0.110 > 0.10 进不了 FINAL_SERVO,
+        # [done] 每秒重规划死循环直到超时。横向/角度的最终裁决统一交给
+        # _eval_final_servo 的方位门 (15° ≈ dist·tan15°, 已隐含横向预算)。
+        distance = abs(tag_pose.dist - target_distance)
         if distance < pos_tol * 2:  # 2x tolerance → transition to FINAL_SERVO
             self._node.get_logger().info(
-                f'距离足够近（位置误差={distance:.3f}m）→ FINAL_SERVO')
+                f'距离足够近（距离误差={distance:.3f}m）→ FINAL_SERVO')
             self._transition_to(DockingState.FINAL_SERVO)
             return
 
