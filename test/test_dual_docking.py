@@ -82,14 +82,20 @@ def test_duplicate_stale_and_missing_reset_stability():
 
 
 def test_wall_only_bounded_reverse():
-    c = controller()
-    for i in range(6):
-        n = frames(c, start=10+i*5, missing=True, count=10)
+    # 预算取小值: 本用例测的是"墙码单码后退有界、耗尽即判失败"这个机制, 不是
+    # 生产配置里那个数。写死 6 次在预算从 0.30m/8 次调到 0.80m/16 次之后就静默
+    # 失效了 (而 16 次 × 4s 还会先撞上 acquire_timeout_sec, 失败串也就不再是
+    # 预算)。
+    c = DualTagDocking(Node(**{'dual.reverse_count': 4., 'dual.reverse_limit': .20}))
+    c.set_extrinsics((.2, .03, .4), (-.5, .5, -.5, .5))
+    c.camera = CameraModel(1600, 1296, 400., 400., 800., 648.)
+    for i in range(4):
+        n = frames(c, start=10+i*4, missing=True, count=10)
         step = plan(c, n)[0]
         assert step.jog_distance == -.05
         c.action_started(step, n)
         c.stopped(n)
-    n = frames(c, start=40, missing=True, count=10)
+    n = frames(c, start=26, missing=True, count=10)
     assert plan(c, n) is None
     assert 'budget' in c.failure
 
@@ -111,7 +117,9 @@ def test_near_unqualified_and_far_loss_never_latch():
     assert plan(c, n) is None and c.stage != 'locked'
     c.progress = True
     c.qualified_ns = n
-    n = frames(c, depth=1.75, missing=True, start=12, count=10)
+    # "远" = 直行包络 (straight_envelope = obs+tol = 1.90) 之外, 不再是 near
+    # (1.70) 之外: 1.70~1.90 是直行提交区, 桩码在那里合法离场并须闭锁。
+    n = frames(c, depth=2.2, missing=True, start=12, count=10)
     assert plan(c, n) is None and c.stage != 'locked'
 
 

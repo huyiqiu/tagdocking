@@ -865,6 +865,34 @@ H−cy−required=660.76），即 **`z_min ≈ 0.0745 + 1.108·y`**（y = 相机
 墙码 z≈1.5~1.65m 才丢失。这决定了角度必须在 ~1.8m 站位一次对准完毕，也决定了
 `dual.straight_start_distance` 必须从 1.0 抬到 1.70（丢失闭锁的资格门，见 4）。
 
+**提交直行处的死区（2026-09-11 现场，已修）**：狗在墙码 z≈1.78m 完成对准
+（墙/桩 bearing ≈ 1°、theta ≈ 1.5°、e ≈ 10mm、J ≈ 0.03），此时**直行即可成功**，
+却报 `no visible translation candidate; independent stable-window budget
+exhausted` 停在原地。桩码底边余量已被吃到 <10px（`visibility_margin_px` 8 +
+`visibility_sample_pad_px` 2），于是每条前进候选都被严格 `visible()` 否掉。
+而本该放行它的"桩码垂直离场"豁免有两把锁：
+
+- `progress`（已**完成**一步合格直行）—— 首步之前它恒为 false；
+- 墙距 ≤ `straight_start_distance`(1.70) —— 提交发生在观察窗内任意处（1.70~1.90）。
+
+两把锁都只能靠"先前进一步"打开，而前进正是被否掉的那件事 —— 互为前提的死锁，
+三个独立稳定窗口耗尽即 MOTION_FAILED。修法两条：
+
+1. 放行的航向证据改为**两个来源任一**（`heading_committed`）：① 已完成的合格
+   直行（`progress`+`qualified_ns`，最强）；② **两码持住对准**的直行承诺
+   （`committed_ns`，即 aligned + `align_hold_sec`，正是 observe→approach
+   那一跳所依据的同一份证据）。首步只有 ②。两者都由任何纠偏撤销
+   （`action_started` / `observe`），**预测本身永远不产生证据**，纠偏候选
+   （yaw/横移）也永远不享受放行。
+2. 距离门改用**直行包络** `observation_distance + observation_tolerance`(1.90)，
+   且丢失闭锁必须**同步抬**（见 4）—— 否则 1.70~1.90 的合法离场会掉进
+   `pile missing outside qualified final entry` 硬失败，等于用一个新失效模式
+   换掉旧的。仍保留硬距离上界：站位窗外（远场）的陈旧 stage 不得借此放行。
+
+诊断补强：`margin_report()` 现在附带 `桩码垂直离场=放行 / 不放行(缺 …)`，逐条
+列出四个前提里缺哪个。余量表只说桩码底边剩几 px，不说那几 px 该不该拦人 ——
+现场日志里余量一路 61.6→49.3→39.0→25.8→+8px 然后三窗判死，缺的其实是放行。
+
 1. **找双码**：无墙码执行有界原地搜索（最多一圈且受搜索总超时）；只有墙码先停看，
    在持续新鲜墙码检测中确认缺小码后，每次退 0.05m。全轮后退最多 0.30m/6 次，
    获取双码默认限时 60s，获取后 observe 独立限时 120s；仍受总体任务超时限制。
@@ -933,10 +961,16 @@ H−cy−required=660.76），即 **`z_min ≈ 0.0745 + 1.108·y`**（y = 相机
      亲手堵死唯一的出路。
 4. **锁向与直行末段**：本轮已经双码对齐并前进，最近合格观测未过资格时限
    （`dual.qualification_sec`=12s，每次合格前进刷新），且墙距
-   ≤ `dual.straight_start_distance`(1.70m —— 桩码丢失闭锁的资格门：站立下
-   桩码在墙码 z≈1.5~1.65m 处丢失，旧值 1.0 会让闭锁永不触发而硬失败)，在
+   ≤ **直行包络** `observation_distance + observation_tolerance`(1.90m)，在
    持续新鲜墙码帧中确认小码缺失 ≥1.5s 才锁向。远处/未对齐丢小码停车等待后
    失败；不降级墙码纠角。锁向后小码再现也不转/横移，墙码丢失或流停就停。
+
+   闭锁窗口曾用 `dual.straight_start_distance`(1.70 = 观察窗**下**沿)，与
+   `visible()` 的桩码垂直离场放行同用一个数。两者一起抬到窗上沿是同一个
+   修复的两半（2026-09-11 现场，见"提交直行处的死区"）：直行的提交发生在
+   观察窗内任意处，若放行只认 ≤1.70 而闭锁也只认 ≤1.70，1.70~1.90 就成了
+   死区；只抬放行不抬闭锁，则那段合法离场会掉进
+   `pile missing / invalid outside qualified final entry` 硬失败。
 
    **直行阶段的墙码 bearing 微调（设计决定 1）**：locked 不再是纯前进 ——
    每停把墙码 bearing 归零就是对墙码做 **pure pursuit**：1.8m 处横偏 y₀ 的狗
@@ -1011,7 +1045,9 @@ ROI/binning 非平凡值不支持，须供应已按输出图像归一化、缩�
 参数在 `config/docking.yaml` 的 dual 区集中维护；launch 可传 `dual_observation_distance:=1.8`、
 `dual_forward_step:=0.05`、`dual_settle_sec:=1.5`、`dual_dock_distance:=0.50` 等同名下划线参数
 （默认空值保留 YAML）；保留已验证的 stopgo 速度和里程计比例。
-`dual.straight_start_distance` **兼容旧名字但改变含义**：只作近距缺小码资格门，非距离锁向。
+`dual.straight_start_distance` **兼容旧名字但改变含义**：只剩 yaw_cap 远/近
+分档与参数排序校验两处用法；桩码垂直离场放行与丢失闭锁改用直行包络
+`observation_distance + observation_tolerance`(1.90)。
 `dual.pile_fresh_timeout_sec` 已弃用，统一改用 `dual.fresh_sec`。
 其它重点：`missing_confirm_sec=1.5`、`missing_timeout_sec=8`、`qualification_sec=12`、
 `max_actions=160`、`dock_tolerance=0.02`、`straight_yaw_tol_deg=1.5`/`straight_yaw_max_turns=3`、

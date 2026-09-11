@@ -413,8 +413,10 @@ class DockingNode(Node):
         self.declare_parameter('dual.pile_tag_size', 0.05)
         # 相机系站位距离: 距墙码 1.70m (= observation_distance - tolerance) 处
         # 完成双码对准 → 直行 (站立全程, 桩码 ~0.9m 在站位处可见)。
-        # 它同时是 near 字段: approach 桩码丢失闭锁的窗口上界 (站立下 locked 的
-        # 唯一入口), 以及 yaw_cap 远/近分档与 visible() allow_exit 的边界。
+        # 它只剩 yaw_cap 远/近分档与排序校验两处用法: 桩码垂直离场放行与
+        # approach 丢失闭锁改用 straight_envelope (= obs + tol = 1.90) ——
+        # 直行提交发生在观察窗内任意处, 用窗下沿当放行门会在 1.7~1.9 造出
+        # "要先走一步才准走第一步"的死区 (见 dual_docking.straight_envelope)。
         self.declare_parameter('dual.straight_start_distance', 1.70)
         # 相机系停泊距离: 摄像头距墙码 0.50m = 停泊完成
         self.declare_parameter('dual.dock_distance', 0.50)

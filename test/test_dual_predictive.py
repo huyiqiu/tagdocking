@@ -196,17 +196,31 @@ def test_camera_wait_is_finite():
     assert 'CameraInfo unavailable' in c.failure
 
 
-def test_vertical_exit_requires_completed_qualified_forward_and_never_correction():
+def test_vertical_exit_never_relaxes_for_corrections_or_uncommitted_headings():
+    """桩码垂直离场的放行边界。允许它的是"航向已有新鲜证据"(两个来源),
+    不允许它的是纠偏、未提交的阶段、包络之外与过期的承诺。"""
     c = controller()
     c.stage = 'approach'
     c.wall,c.pile = (0,-.2,1.),(0,.3,.1)
     c.stamp = int(20e9)
     forward = ActionPlan(kind='forward',jog_distance=.02)
-    assert not c.visible(forward)[0]
-    c.progress,c.qualified_ns = True,c.stamp
+    assert not c.visible(forward)[0]          # 无任何航向证据 → 不放行
+    c.progress,c.qualified_ns = True,c.stamp  # 证据①: 已完成的合格直行
     assert c.visible(forward)[0]
+    c.progress,c.qualified_ns = False,0
+    c.committed_ns = c.stamp                  # 证据②: 持住对准的直行承诺
+    assert c.visible(forward)[0]
+    # 纠偏永不享受放行 —— 垂直离场只对纯直行成立。
     assert not c.visible(ActionPlan(kind='yaw',turn_angle=.01))[0]
     assert not c.visible(ActionPlan(kind='forward',jog_distance=.003,lateral_distance=.003))[0]
+    c.wall = (0,-.2,c.straight_envelope+.05)  # 直行包络之外 (远场 stage 陈旧)
+    assert not c.visible(forward)[0]
+    c.wall = (0,-.2,1.)
+    c.stage = 'observe'                       # observe 仍须保住两码 (J 要它)
+    assert not c.visible(forward)[0]
+    c.stage = 'approach'
+    c.stamp = int((20+c.p('qualification_sec')+1)*1e9)   # 承诺过期
+    assert not c.visible(forward)[0]
     assert c.stage == 'approach'  # Prediction alone never locks heading.
 
 
@@ -614,3 +628,84 @@ def test_yaw_cap_bounds_are_validated():
                       {'dual.prealign_max_steps': 2.5}):
         with pytest.raises(ValueError):
             DualTagDocking(Node(**overrides))
+
+
+def shortcam(height):
+    """真实相机, 只是画幅下沿更近 —— 等价于现场那台相对桩码装得偏高的相机:
+    桩码 (0.9m 处) 中心仍在画面内 (检测器看得见它, 量测照常进来), 但保守的
+    外接立方体包络已经戳出下沿, 于是 visible() 的严格门否掉一切前进候选。
+    现场的余量序列 61.6→49.3→39.0→25.8→+8px 就是这条路。"""
+    return CameraModel(1600, height, 400., 400., 800., 648.)
+
+
+# 站位处 (墙码光学 z=1.8) 桩码中心在 740 画幅内, 首步 5cm 之后出画幅 ——
+# 即"桩码恰在提交直行处离场", 现场那一幕。
+COMMIT_WORLD = ((2.0, .03, .6), (1.1, .03, .2))
+
+
+def commit_frames(c, robot, now, detect=True):
+    """四帧稳定窗口; detect=True 时桩码按这台相机的画幅判在不在。"""
+    for _ in range(4):
+        now += .2
+        wall, pile = [sensor(p, robot, c.t, 0.) for p in COMMIT_WORLD]
+        missing = detect and (pile[2] <= 0 or
+                              400*pile[1]/pile[2]+648 > c.camera.height)
+        c.observe(round(now*1e9), round(now*1e9), wall,
+                  None if missing else pile, pile_missing=missing)
+    return now, wall, pile
+
+
+def test_first_straight_step_at_the_commit_distance_is_not_deadlocked():
+    """2026-09-11 现场死锁: 1.78m 提交直行, bearing≈1°、J≈0.03 —— 直行本可
+    成功, 但每条前进候选都被桩码底边否掉, 三窗耗尽判 MOTION_FAILED
+    ('no visible translation candidate; independent stable-window budget
+    exhausted')。
+
+    两把锁互为前提: 放行要求 progress (已完成一步合格直行) 且 z ≤ near
+    (1.70) —— 而这两条都只能靠先前进一步拿到, 前进正是被否掉的那件事。
+    """
+    c = controller()
+    c.camera = shortcam(740)
+    now, wall, pile = commit_frames(c, [0., 0., 0.], 10., detect=False)
+    assert c.aligned(c.wall, c.pile), '前提: 此位姿确实已对准'
+    assert c.near < c.wall[2] <= c.straight_envelope, '前提: 提交距离在观察窗内、near 之上'
+    assert min(c.current_margins()) < c.required_margin, '前提: 桩码包络已戳出下沿'
+    assert not c.progress, '前提: 首步之前没有任何已完成的合格直行'
+    step = plan(c, round(now*1e9))[0]
+    assert c.stage == 'approach'
+    assert step.jog_distance > 0 and not step.turn_angle and not step.lateral_distance
+    assert c.no_candidates == 0 and not c.failure
+
+
+def test_pile_exit_at_the_commit_distance_latches_and_reaches_done():
+    """放行与闭锁是同一个判断的两半: 若桩码可在 1.70~1.90 合法离场而闭锁仍
+    只认 ≤ 1.70, 那段离场就会掉进 'pile missing outside qualified final
+    entry' 硬失败 —— 修复自己制造的新失效模式。整条链路必须走到 done。"""
+    c = controller()
+    c.camera = shortcam(740)
+    robot = [0., 0., 0.]
+    now = 10.
+    locked = False
+    for _ in range(140):
+        now, wall, pile = commit_frames(c, robot, now)
+        seq = plan(c, round(now*1e9))
+        assert not c.failure, c.failure
+        if seq is None:
+            continue
+        step = seq[0]
+        if c.stage == 'locked' and not locked:
+            locked = True
+            assert wall[2] > c.near, '前提: 闭锁发生在 near 之上 (旧门槛会硬失败)'
+        if step.kind == 'done':
+            assert locked and c.progress and abs(wall[2]-.5) <= c.p('dock_tolerance')
+            return
+        assert not step.lateral_distance
+        c.action_started(step, round(now*1e9))
+        robot[0] += math.cos(robot[2])*step.jog_distance
+        robot[1] += math.sin(robot[2])*step.jog_distance
+        robot[2] += step.turn_angle
+        now += max(abs(step.jog_distance)/.08, abs(step.turn_angle)/.15)+.4
+        c.action_completed()
+        c.stopped(round(now*1e9))
+        now += 1.9
+    pytest.fail('提交距离桩码离场后未能走到 done')

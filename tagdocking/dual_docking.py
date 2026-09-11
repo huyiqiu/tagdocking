@@ -11,8 +11,9 @@ from .geometry_planner import ActionPlan
 
 DEFAULTS = {
     # 站位 1.8m: 站立全程下桩码 (~0.9m) 在此清晰可见 (z_min = 0.0745+1.108·y,
-    # 见 README 6.5b); straight_start_distance=1.70 = obs - tol, 四处用法
-    # (排序校验 / yaw_cap 分档 / visible allow_exit / 丢失闭锁) 见节点声明。
+    # 见 README 6.5b); straight_start_distance=1.70 = obs - tol, 现在只剩两处
+    # 用法 (排序校验 / yaw_cap 远近分档) —— 桩码垂直离场放行与丢失闭锁已改用
+    # straight_envelope (= obs + tol), 见该 property 的死区说明。
     'observation_distance': 1.8, 'observation_tolerance': 0.1,
     'forward_step': 0.05, 'reverse_step': 0.05, 'lateral_step': 0.03,
     'yaw_step_deg': 8.0, 'yaw_fine_step_deg': 3.0,
@@ -172,8 +173,42 @@ class DualTagDocking:
 
     @property
     def near(self):
-        # Compatibility: the old name is ONLY a pile-loss eligibility gate.
+        # Compatibility: the old name is now ONLY the yaw_cap far/near split.
         return float(self._node._p('dual.straight_start_distance'))
+
+    @property
+    def straight_envelope(self):
+        """墙码深度上界, 之内视为"直行段已归位" —— 桩码垂直离场放行与桩码
+        丢失闭锁共用这一个数, 二者是同一个判断的两半。
+
+        原来两处都用 near (= obs - tol = 1.70), 而 approach 的提交发生在观察
+        窗内任意处 (obs ± tol, 即 1.70~1.90)。于是 1.78m 提交直行的狗落进一
+        个死区: 放行要求 z ≤ 1.70, 而走到 1.70 的唯一办法是先前进 —— 前进
+        又要放行。2026-09-11 现场就死在这里 (桩码底边余量已被吃到 <10px,
+        bearing ≈ 1°, J ≈ 0.03, 直行本可成功), 三窗耗尽判 MOTION_FAILED。
+        提到窗上沿后整个直行段连续可行, 同时保留硬距离上界: 远场 (站位窗外)
+        的 stage 陈旧不得借此放行。
+        闭锁必须跟着一起提: 若桩码可在 1.70~1.90 合法离场而闭锁仍只认
+        ≤ 1.70, 那段离场就会落进 'pile missing outside qualified final entry'
+        硬失败 —— 放行制造出的新失效模式。
+        """
+        return self.p('observation_distance')+self.p('observation_tolerance')
+
+    @property
+    def heading_committed(self):
+        """直行航向是否有新鲜证据。两个独立来源, 任一即可:
+
+        ① progress + qualified_ns —— 一步合格直行真正执行完成 (最强证据);
+        ② committed_ns —— approach 阶段两码持住对准 (aligned + align_hold_sec),
+           也正是 observe→approach 那一跳所依据的同一份证据。
+
+        首步只有 ②: 要求 ① 就等于"要先走一步才准走第一步"。两者都由纠偏
+        撤销 (action_started / observe), 预测本身永远不产生证据。
+        """
+        window = self.p('qualification_sec')*1e9
+        return any(stamp and self.stamp-stamp <= window
+                   for stamp in (self.qualified_ns if self.progress else 0,
+                                 self.committed_ns))
 
     @property
     def yaw_cap(self):
@@ -238,6 +273,9 @@ class DualTagDocking:
         self.request_stand = False
         self._travel_qualification = 0
         self.qualified_ns = 0
+        # 直行承诺时刻 (两码持住对准): 桩码垂直离场放行的第二个证据来源,
+        # 见 heading_committed。与 qualified_ns 同生共死, 任何纠偏都撤销。
+        self.committed_ns = 0
         self.started_ns = 0
         self.observe_started_ns = 0
         self.no_candidates = 0
@@ -317,7 +355,7 @@ class DualTagDocking:
         aligned = self.aligned(wall, pile)
         self.hold_ns = (self.hold_ns or stamp) if aligned else 0
         if not aligned:
-            self.qualified_ns = 0
+            self.qualified_ns = self.committed_ns = 0
         return True
 
     @property
@@ -395,7 +433,7 @@ class DualTagDocking:
             self._travel_qualification = self.pending_stamp
         elif plan.turn_angle or plan.lateral_distance:
             # A correction after qualified travel invalidates that heading.
-            self.qualified_ns = 0
+            self.qualified_ns = self.committed_ns = 0
         self.pending_aligned = False
         self.pending_reverse_kind = ''
 
@@ -459,9 +497,9 @@ class DualTagDocking:
         """
         if self.camera is None:
             return False, None
-        allow_exit = (self.stage == 'approach' and self.progress and self.qualified_ns
-                      and self.stamp-self.qualified_ns <= self.p('qualification_sec')*1e9
-                      and self.wall[2] <= self.near and plan.jog_distance > 0
+        allow_exit = (self.stage == 'approach' and self.heading_committed
+                      and self.wall[2] <= self.straight_envelope
+                      and plan.jog_distance > 0
                       and not plan.lateral_distance and not plan.turn_angle
                       and self.aligned(self.wall, self.pile))
         margins = [float('inf')]*4
@@ -522,6 +560,21 @@ class DualTagDocking:
             return False, after
         return min(after) >= min(base), after
 
+    def exit_report(self):
+        """桩码垂直离场放行的逐条前提 —— 现场"为什么前进被否"的唯一答案。
+
+        余量表只说桩码底边剩几 px, 不说那几 px 该不该拦人。2026-09-11 的日志
+        里余量一路掉到 +8px 然后三窗判死, 而当时缺的其实是放行 (bearing 1°、
+        J 0.03, 直行就能成)。四条前提逐条打出来, 下一次一眼就能看到是哪条。
+        """
+        checks = (('stage=approach', self.stage == 'approach'),
+                  ('航向有证据', bool(self.heading_committed)),
+                  (f'z<=直行包络{self.straight_envelope:.2f}m',
+                   self.wall is not None and self.wall[2] <= self.straight_envelope),
+                  ('两码对准', self.aligned(self.wall, self.pile)))
+        bad = [name for name, ok in checks if not ok]
+        return '桩码垂直离场=' + ('放行' if not bad else '不放行(缺 '+'/'.join(bad)+')')
+
     def margin_report(self):
         """Per-tag edge margins of the current pose, for failure logs."""
         if self.camera is None:
@@ -538,6 +591,7 @@ class DualTagDocking:
                 parts.append(f'{name}=<{exc}>')
                 continue
             parts.append(f'{name} L/R/T/B={b[0]:.0f}/{b[1]:.0f}/{b[2]:.0f}/{b[3]:.0f}px')
+        parts.append(self.exit_report())
         return ' '.join(parts)
 
     def _no_candidate(self, reason):
@@ -712,9 +766,13 @@ class DualTagDocking:
             missing_time = (self.stamp-self.missing_ns)*1e-9 if self.missing_ns else 0
             if (self.stage == 'approach' and self.progress and self.qualified_ns
                     and now-self.qualified_ns <= self.p('qualification_sec')*1e9
-                    and d <= self.near and missing_time >= self.p('missing_confirm_sec')):
+                    and d <= self.straight_envelope
+                    and missing_time >= self.p('missing_confirm_sec')):
                 self.stage = 'locked'
-                self._node.get_logger().info('dual heading LOCKED: qualified near-range pile loss')
+                self._node.get_logger().info(
+                    f'dual heading LOCKED: 合格直行段桩码丢失 (墙码 z={d:.3f}m '
+                    f'≤ 直行包络 {self.straight_envelope:.2f}m, 丢失确认 '
+                    f'{missing_time:.1f}s) — 此后只按墙码直行')
                 return self._advance(d)
             if self.stage == 'acquire' and missing_time >= self.p('missing_confirm_sec'):
                 # 桩码 5cm 可见性半径有限, 不可见有两种原因, 按墙码距离分流 ——
@@ -792,6 +850,13 @@ class DualTagDocking:
         held = self.hold_ns and self.stamp-self.hold_ns >= float(self._node._p('dual.align_hold_sec'))*1e9
         if not held:
             return None
+        # 直行承诺登记在此 —— aligned() + held (两码持住对准满 align_hold_sec)
+        # 刚刚双双成立, 这正是 observe→approach 那一跳所依据的同一份证据。桩码
+        # 垂直离场的放行必须认它, 否则首步死锁 (见 heading_committed)。
+        # 必须排在下面的 stage 切换与余量日志之前: 那行日志要如实反映本次决策
+        # 用的放行状态, 否则"提交直行"那一刻的日志会说"不放行", 紧接着又发出
+        # 前进 —— 现场读日志的人先信哪一句?
+        self.committed_ns = self.stamp
         if self.stage == 'observe':
             obs = self.p('observation_distance')
             # 下沿 (d < obs-tol) 不在这里判: 站位守卫排在 aligned() 之前,

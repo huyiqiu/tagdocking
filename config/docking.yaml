@@ -185,8 +185,10 @@ docking_node:
     dual.pile_tag_id: 51                       # must differ from tag.id
     dual.pile_tag_size: 0.05
     # 站位: 距墙码 1.70m (= observation_distance - tolerance) 处完成对准 → 直行。
-    # 同时是 near 字段, 四处用法: 排序校验 / yaw_cap 远近分档 / visible()
-    # allow_exit / approach 桩码丢失闭锁窗口上界 (站立下 locked 的唯一入口)。
+    # 同时是 near 字段, 现在只剩两处用法: 排序校验 / yaw_cap 远近分档。
+    # visible() 的桩码垂直离场放行与 approach 丢失闭锁 (站立下 locked 的唯一
+    # 入口) 已改用直行包络 obs+tol = 1.90 —— 直行的提交发生在观察窗内任意处,
+    # 拿窗下沿当放行门会在 1.70~1.90 造出"要先走一步才准走第一步"的死区。
     dual.straight_start_distance: 1.70
     dual.dock_distance: 0.50
     dual.align_tolerance_deg: 3.0              # each optical bearing, not their average
