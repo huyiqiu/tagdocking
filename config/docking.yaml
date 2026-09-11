@@ -7,10 +7,16 @@ docking_node:
     camera.max_latency_ms: 150                # ms — 时效窗口下限 (高帧率时生效)
     camera.latency_interval_margin: 3.0       # 窗口 = 检测间隔 × 此值 (容忍 ~2 帧丢失)
     camera.expected_fps: 30
+    # 相机光学中心装在底盘中心线左 lateral_offset_m 处 (+y, + = 相机偏左),
+    # base→camera 静态 TF 的 mount.y 未含此偏移 → 量测 lat 系统性偏小该值 →
+    # 节点认为"正对"时底盘中心实际在 tag 法线右该值处, 停泊偏右、左腿撞桩。
+    # 此值加回 raw_lat 后规划器在直行前触发左移修正 (量测驱动每停重测,
+    # 非一次性盲移, 盲移在 SEARCH 抖动重入会叠加)。本机实测 = 3cm。
+    camera.lateral_offset_m: 0.03
 
     # ── Tag Identification ──
     tag.family: "36h11"
-    tag.size: 0.16                            # m — tag edge length
+    tag.size: 0.15                            # m — tag edge length
     tag.frame: "tag36h11:0"                   # TF frame name
     tag.id: 0                                 # tag ID to dock to
     tag.fresh_timeout_sec: 2.0                # tag considered stale after N seconds (6fps + 转向盲区, 放宽避免误判 TAG_LOST)
@@ -53,7 +59,7 @@ docking_node:
     #      → stand_up 恢复运动 → 等 motion_enabled==True → 起步
     # 锁定期间 cmd_vel 会被桥拒绝, 因此必须 stand_up 后才能走; DOCKED 保持
     # 锁定 (泊出自动先解锁); 取消/超时/失败终态自动恢复运动模式。
-    posture.enable: true                      # 呼吸抑制总开关 — 运行期可调: 无 l1w_control 接口的狗 ros2 param set <节点> posture.enable false 即关 (也可 launch 传 posture_enable:=false); 无桥时也会自动降级停用
+    posture.enable: false                     # 呼吸抑制总开关 (默认关) — 运行期可调: ros2 param set <节点> posture.enable true 即开 (也可 launch 传 posture_enable:=true); 无桥时也会自动降级停用
     posture.static_settle_sec: 1.2            # s — 停→量测最短间隔 (RTSP 延迟 + 锁定过渡 + 呼吸衰减; 与 turn_settle_sec 同起点取 max)
     posture.lock_ack_timeout_sec: 2.0         # s — 等 posture_state 确认; 超时本次停降级为未锁定继续
     posture.unlock_ack_timeout_sec: 2.0       # s — 等 motion_enabled==True (含固件退出 LOCK 滞后)
@@ -62,12 +68,27 @@ docking_node:
     posture.stable_frame_timeout_sec: 2.5     # s — 等不满 N 帧就带当前位姿规划 (防闪烁卡死)
     posture.service_wait_sec: 1.0             # s — 服务发现宽限, 超过后判定无桥并停用
 
+    # ── 充电收尾 (charge) — DOCKED 后 静止(锁定)→阻尼 ──
+    # 停泊成功后狗站在充电桩上方, 锁定后切阻尼泄力, 保持站立 (不趴下):
+    #   static_stand (静止锁定) → passive (阻尼泄电机, 站立)
+    # 与 posture.enable 完全无关: 呼吸抑制只管停-看循环的量测稳定,
+    # 关闭它不影响收尾 — DOCKED 后照做。收尾完成后 cmd_vel 被桥门控
+    # (锁定/阻尼态), 泊出 /start_undock 会自动 stand_up 恢复运动再盲退。
+    charge.enable: true                       # 充电收尾总开关
+    charge.passive: true                      # 阻尼(泄力)步开关 — 运行期可调 (锁定完成那一刻读参); false 时收尾止于锁定 (仅站立)
+    charge.static_stand: false                # DOCKED 后先 static_stand 锁定再阻尼; false=跳过静止锁定, 直接阻尼 (passive, 站立泄力)
+    charge.static_ack_timeout_sec: 3.0        # s — static_stand 等待确认
+    charge.lie_down_settle_sec: 4.0           # s — (已弃用) 趴下动作时长, 当前流程不再使用 lie_down
+    charge.passive_settle_sec: 2.0            # s — passive 服务受理后等待 (非硬件阻尼反馈)
+    charge.retries: 1                         # 次 — 每步服务重试
+    charge.service_wait_sec: 1.0              # s — 无桥宽限, 超时降级告警 (DOCKED 仍为成功)
+
     # ── Stop-and-Go Parameters ──
     stopgo.lateral_threshold: 0.05           # m — 左右横偏容许 ±5cm, 超过才转向对准
     stopgo.yaw_threshold_deg: 10.0           # deg — 角度容许 ±10°, 超过才转向
     stopgo.tune_angle: 0.0                   # rad — oblique correction (diff-drive), 0=disabled
     stopgo.jog_min: 0.05                     # m — minimum jog distance per step
-    stopgo.jog_max: 0.30                     # m — maximum jog distance per step (运行期可调: launch 传 jog_max:=0.4 或 ros2 param set <节点> stopgo.jog_max; 0.15 太碎: 每次起停切换 4~6s 开销; 步长放大依赖 odom_scale 准确, VIO 下标定为 1.0)
+    stopgo.jog_max: 0.20                     # m — maximum jog distance per step (运行期可调: launch 传 jog_max:=0.4 或 ros2 param set <节点> stopgo.jog_max; 0.15 太碎: 每次起停切换 4~6s 开销; 步长放大依赖 odom_scale 准确, VIO 下标定为 1.0)
     stopgo.jog_linear_rate: 0.08             # m/s — constant speed during forward jog
     stopgo.jog_angular_rate: 0.3             # rad/s — constant speed during turn
     stopgo.turn_creep_linear: 0.0            # m/s — 已弃用: "边走边转"叠加前进会驶出目标横向范围; 固定纯原地转, 角度靠里程计校准 (此参数不再被读取, 保留仅为兼容)
@@ -78,35 +99,124 @@ docking_node:
     # （低估 ~4 倍，前进/转向通道正常）。判停目标 = 距离/该系数，即狗真实
     # 位移达到目标时才判停。标定：跑 test_lateral_distance --distance 0.5，
     # 卷尺量实际位移 L，系数 = L / 报告中的横向位移。
-    # 当前 1.0 = 未启用补偿（换设备测试中，待定标后回填）。
+    # 当前 1.0 = 未启用补偿（2026-09 确认: 当前设备/固件无需标定; 上面的
+    # 低估数据仅旧设备, 标定方法留作换设备时参考）。走停每停重测重规划,
+    # 尺度误差由量测闭环兜底, 不累积进终点位姿。
     stopgo.lateral_odom_scale: 1.0
     # 前进/后退通道同样低估（后退实测 odom 0.493m/实际 1m+，~2 倍；前进
     # 用户报告误差也很大，倍数待精标）。标定：跑
     # test_jog_distance --distance 0.3（前进）/ --distance -0.3（后退），
     # 卷尺量实际位移 L，系数 = L / 报告中的实际位移。
-    # 当前 1.0 = 未启用补偿。
+    # 当前 1.0 = 未启用补偿（2026-09 确认: 当前设备/固件无需标定, 同上）。
     stopgo.jog_odom_scale: 1.0
     stopgo.jog_backward_odom_scale: 1.0
-    stopgo.turn_settle_sec: 0.8              # s — wait after turn for image to clear (加长: 避免模糊帧被 jump rejection 误拒)
-    stopgo.turn_undershoot: 0.75             # fraction — turn only x% of commanded angle
+    stopgo.turn_settle_sec: 1.5              # s — wait after turn for image to clear (加长: 避免模糊帧被 jump rejection 误拒)
+    stopgo.turn_undershoot: 0.75             # fraction — turn only x% of commanded angle (仅 legacy full=False 路径; 走停/泊出盲转走 full=True 不经过此值)
+    # 盲转停止滞后补偿 (scripts/test_turn_angle 同款两板斧): odom 判停到底盘
+    # 真停之间隔着 控制周期(50ms)+/dog/odom 延迟+底盘减速惯性, 0.3rad/s 全速
+    # 盲转实测每次多转 ~5-7° (对接日志: 目标 ±9.7° 实转 15-17°, 误差符号每步
+    # 翻转 → 法线对准 2° 门槛永远进不去 → 原地摆头极限环, 横移分支触发不了)。
+    stopgo.turn_lead_per_speed: 0.30         # rad/(rad/s) — 提前量: 剩余角 ≤ 此值×当前速率即提前发零速, 滑行补足剩余角 (由对接日志反推滞后 0.30-0.43s; 欠/过量恒定时微调本值)
+    stopgo.turn_slow_rad: 0.14               # rad — 距目标此角度内减速到半速, 减小惯性冲量
     stopgo.max_turn_step: 0.17               # rad (~10°) — 单次转向硬上限, 小步转+每步重看, 低帧率下 tag 不易转出视野而丢失
     stopgo.small_turn_rad: 0.1               # rad — below this, turn at half speed
     stopgo.theta_shrink_ratio: 2.0           # dynamic bearing tolerance: max(yaw_threshold, dist/ratio)
     stopgo.drift_tol: 0.15                   # rad — bearing drift limit during jog
 
-    # ── Final Servo (stability confirmation) ──
+    # ── Final Servo (到位即 DOCKED) ──
+    # stop-and-go 下规划器已把车停在目标距离 (plan_straight 距离到位即 [done]
+    # 停车), 这里只做确认: 距离在 tolerance.position_m 内 + 方位 ≤ yaw_tol_deg
+    # 即单帧判定 DOCKED —— 不再累积 1s 稳定(呼吸摆动凑不齐)也不查横向
+    # (横向是方位 atan2(横向,距离) 的投影, 15° 已隐含 ≤ dist·tan15° ≈ 14cm)。
     final_servo.max_linear_speed: 0.05        # m/s — (legacy, not used in stop-and-go)
     final_servo.max_yaw_speed: 0.2            # rad/s — (legacy)
     final_servo.distance: 0.20                # m — enter FINAL_SERVO within this distance
+    final_servo.yaw_tol_deg: 15.0             # deg — 到 dock_distance 即判定的方位门槛 (直行阶段不再追角度, 15° 内都接受)
 
     # ── Final Straight (两阶段停泊) ──
-    # 阶段1(APPROACH): 正常带角度修正的接近, 尽量对准。
+    # 阶段1(APPROACH) 按远/近分两级:
+    #   远场 (dist > tighten_distance): 粗对准+前进。放宽方位/横向容忍 (far_*
+    #     参数), 不做法线对准/横移 (normal=None → pure pursuit 一键瞄准前进)。
+    #     1.5m 处 AprilTag normal 噪声 ±10° 被 dist 放大成 ±0.3m 横移噪声, 是
+    #     远场反复/反向横移的根源 — 远场只进不平移, 先走进再精调。
+    #   近场 (dist ≤ tighten_distance): 收紧到入口包络, 才做"先对齐法线再横移"
+    #     → 直行。法线门槛不收紧 (normal 近场抖动 4~5°, 收紧会摆头)。跨区
+    #     前进步长钳到恰好停在区界, 入口检查拿到最新鲜量测。
     # 阶段2(直行): 进入 start_distance 后无条件纯直行, 不再调角(像停车入库)。
-    #   进入时做一次性失败检查: 方位误差 > yaw_threshold_deg 则对准过差、
-    #   入库会撞偏 → 报 MOTION_FAILED 导航失败。容许 ±10° 内入库。
+    #   进入时做一次性失败检查(入口包络): 方位 > yaw_threshold_deg 或
+    #   |横向| > entry_lateral_m 则对准过差、入库会撞偏 → 报失败走重试
+    #   (倒车重锁)。直行阶段不修横向, 入口误差会一路带到终点, 故入口从严。
     final_straight.enable: true                       # 两阶段停泊开关; false 恢复单阶段
     final_straight.start_distance: 0.85               # m — 直行阶段起点 (须 > dock_target.distance)
-    final_straight.yaw_threshold_deg: 10.0            # deg — 直行失败门槛: 进入直行距离时方位误差超此值则报导航失败
+    final_straight.yaw_threshold_deg: 3.0             # deg — 入口方位门槛: 进入直行距离时超此值报导航失败; 近场方位修正门槛同此值 (launch 默认 3.0 会覆盖)
+    final_straight.normal_yaw_threshold_deg: 2.0      # deg — 近场法线(normal)对准门槛下限: 低于噪声, 实际生效门槛见 normal_turn_min_deg
+    # 法线转向触发门槛 = max(normal_yaw_threshold_deg, 本值) (deg)。
+    # normal 有平面 PnP 二义性 (mirror 解, 近场 ±10° 双峰: 实测解卷绕后在
+    # ~170°/~190° 两簇间跳, 车体转 15° 读数几乎不变), 3帧 EMA 后残差仍 ±3-5°
+    # → 2026-09 对接日志: 2° 门槛下原地摆头极限环, 横移永远触发不了。
+    # 残差航向不查 normal, 由直行入口 (bearing+横向) 兜底, 容忍 final_servo 15°。
+    final_straight.normal_turn_min_deg: 6.0
+    final_straight.entry_lateral_m: 0.05              # m — 入口横向门槛: 进入直行距离时 |横向| 超此值报导航失败 (一次性入口检查)
+    final_straight.lateral_threshold_m: 0.02          # m — 近场横移修正 / 捷径横向门槛: 比入口更紧。量测补偿加回相机 3cm 偏置后, 入口 0.03 的容差会把真实 0.03m 偏移放行直行 → 左腿撞桩; 近场修正与捷径改用此值 (须 < stopgo.lateral_threshold 保证规划器会滑)
+    final_straight.tighten_distance: 1.3              # m — 远/近分界: dist ≤ 此值进入近场精调 (法线对准+横移+直行), > 则远场粗对准+纯前进 (建议 ≥ start_distance + jog_max)
+    final_straight.far_yaw_threshold_deg: 15.0        # deg — 远场粗对准方位门槛: dist > tighten_distance 时方位 ≤ 此值即前进, 不做微调/横移 (远场 normal 不可靠不宜微调)
+    final_straight.far_lateral_m: 0.20                # m — 远场粗对准横向门槛: dist > tighten_distance 时 |lat| ≤ 此值即前进; 远场只要求大方向对, 不消横向偏 (走到近场再说)
+
+    # ── Dual optical stop/look docking (single-tag parameters above unchanged) ──
+    # All distances below are optical z (not base x or Euclidean range).
+    # 1.5m observation -> dual corrections after every jog -> qualified near
+    # pile loss only -> heading locked -> 0.50m parked, then request passive.
+    dual.enable: false
+    dual.wall_tag_size: 0.15
+    dual.pile_tag_id: 51                       # must differ from tag.id
+    dual.pile_tag_size: 0.05
+    dual.straight_start_distance: 1.0          # compatibility: ONLY near pile-loss eligibility, never distance latch
+    dual.dock_distance: 0.50
+    dual.align_tolerance_deg: 3.0              # each optical bearing, not their average
+    dual.align_hold_sec: 0.5                   # same settled window, unique frames
+    dual.pile_fresh_timeout_sec: 2.0           # deprecated; dual.fresh_sec now governs both tags
+    dual.observation_distance: 1.5
+    dual.observation_tolerance: 0.1
+    dual.forward_step: 0.05
+    dual.reverse_step: 0.05
+    dual.lateral_step: 0.03
+    dual.yaw_step_deg: 3.0
+    dual.settle_sec: 1.5
+    dual.min_frames: 3
+    dual.fresh_sec: 0.6
+    dual.tf_skew_sec: 0.02
+    dual.missing_confirm_sec: 1.5
+    dual.missing_timeout_sec: 8.0
+    dual.qualification_sec: 8.0
+    dual.reverse_limit: 0.6
+    dual.reverse_count: 12
+    dual.acquire_timeout_sec: 45.0
+    dual.dock_tolerance: 0.02
+    dual.mount_tolerance_deg: 2.0
+    dual.stable_position_m: 0.03               # consecutive optical-center displacement limit
+    dual.max_actions: 160
+    dual.camera_info_topic: "/camera_sync/camera_info"
+    dual.projection_mode: "raw"              # explicit: raw K+D or rectified P; remapping does NOT rectify
+    dual.min_lateral_m: 0.003
+    dual.lateral_tolerance_m: 0.02
+    dual.observe_timeout_sec: 90.0
+    dual.camera_wait_sec: 5.0
+    dual.visibility_margin_px: 8.0
+    dual.visibility_sample_pad_px: 2.0
+    dual.visibility_samples: 12
+    dual.score_improvement: 0.002
+    dual.feedback_min_improvement: 0.01
+    dual.feedback_fail_windows: 3
+    dual.no_candidate_windows: 3
+    dual.log_period_sec: 2.0
+    dual.odom_fresh_sec: 0.5
+    dual.action_timeout_sec: 6.0
+    dual.response_timeout_sec: 2.0
+    dual.odom_noise_m: 0.001
+    dual.odom_noise_rad: 0.002
+    dual.pile_lock_distance: 0.30               # m — pile optical z at which to switch to standing (30cm: any closer and the pile tag leaves the crouched FOV; requires aligned heading first)
+    dual.crouch_settle_sec: 3.0                 # s — lie_down settle wait (success + timer; no dedicated posture_state value for crouch)
+    dual.posture_retries: 2                     # x — crouch/stand service retries before dual aborts
 
     # ── Docking Tolerance ──
     tolerance.position_m: 0.05                # m — 前后 ±5cm 视为到位

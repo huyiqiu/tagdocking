@@ -29,16 +29,37 @@ Usage:
   # camera_mount_* (与 rtsp 模式同一套参数), 内参自动用包内 odin_camera_info.yaml:
   ros2 launch tagdocking docking.launch.py base_type:=omni use_odin:=true \\
       camera_mount_z:=0.30 camera_mount_pitch_deg:=0.0
+
+  # 双二维码模式 (墙码 36h11:0 15cm + 桩码 5cm 联合对准 → 纯直行 → 距墙码
+  # 0.50m 停泊): 桩码 ID=51 已确认; 全分辨率保 5cm 桩码远距可检。
+  ros2 launch tagdocking docking.launch.py dual_enable:=true \\
+      pile_tag_id:=51 camera_downscale:=1
 """
 
 import os
 import subprocess
 import sys
+import yaml
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, OpaqueFunction
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 from ament_index_python.packages import get_package_share_directory
+
+
+DUAL_TUNING_ARGS = (
+    'observation_distance', 'observation_tolerance', 'forward_step',
+    'reverse_step', 'lateral_step', 'yaw_step_deg', 'settle_sec',
+    'missing_confirm_sec', 'missing_timeout_sec', 'qualification_sec',
+    'dock_distance', 'dock_tolerance', 'straight_start_distance',
+    'min_lateral_m', 'lateral_tolerance_m', 'observe_timeout_sec',
+    'camera_wait_sec', 'visibility_margin_px', 'visibility_sample_pad_px',
+    'visibility_samples', 'score_improvement', 'feedback_min_improvement',
+    'feedback_fail_windows', 'no_candidate_windows', 'log_period_sec',
+    'odom_fresh_sec', 'action_timeout_sec', 'response_timeout_sec',
+    'odom_noise_m', 'odom_noise_rad',
+    'pile_lock_distance', 'crouch_settle_sec',
+)
 
 
 def launch_setup(context):
@@ -71,6 +92,22 @@ def launch_setup(context):
     dock_distance = float(LaunchConfiguration('dock_distance').perform(context))
     final_straight_distance = float(LaunchConfiguration('final_straight_distance').perform(context))
     final_straight_yaw_deg = float(LaunchConfiguration('final_straight_yaw_deg').perform(context))
+    # 直行入口横向门槛 — 空值时用 yaml 权威值 (同 jog_max 的约定)
+    entry_lateral_m = LaunchConfiguration('entry_lateral_m').perform(context).strip()
+    # 相机安装横向偏移补偿 (m, + = 相机偏左) — 空值时用 yaml 权威值
+    camera_lateral_offset_m = LaunchConfiguration('camera_lateral_offset_m').perform(context).strip()
+    # 近场横移修正/捷径横向门槛 (m) — 空值时用 yaml 权威值
+    final_straight_lateral_threshold = LaunchConfiguration('final_straight_lateral_threshold').perform(context).strip()
+    # 近场法线对准门槛 (deg) — 空值时用 yaml 权威值
+    final_straight_normal_yaw_deg = LaunchConfiguration('final_straight_normal_yaw_deg').perform(context).strip()
+    # 远/近分界 (m): dist ≤ 此值近场精调, > 此值远场粗对准+纯前进 — 空值时用 yaml 权威值
+    final_straight_tighten_distance = LaunchConfiguration('final_straight_tighten_distance').perform(context).strip()
+    # 远场粗对准方位门槛 (deg) — 空值时用 yaml 权威值
+    final_straight_far_yaw_deg = LaunchConfiguration('final_straight_far_yaw_deg').perform(context).strip()
+    # 远场粗对准横向门槛 (m) — 空值时用 yaml 权威值
+    final_straight_far_lateral_m = LaunchConfiguration('final_straight_far_lateral_m').perform(context).strip()
+    # 到位即 DOCKED 的方位门槛 (deg) — 空值时用 yaml 权威值
+    final_servo_yaw_deg = LaunchConfiguration('final_servo_yaw_deg').perform(context).strip()
     # 走停单步最大 jog 距离 — 空值时用 yaml 权威值 (同 base_type 的约定)
     jog_max = LaunchConfiguration('jog_max').perform(context).strip()
 
@@ -78,6 +115,10 @@ def launch_setup(context):
     l1w_prefix = LaunchConfiguration('l1w_prefix').perform(context).strip()
     posture_enable = LaunchConfiguration('posture_enable').perform(context).strip()
     static_settle_sec = LaunchConfiguration('static_settle_sec').perform(context).strip()
+    # 充电收尾 (charge.*) — 空值时用 yaml 权威值
+    charge_enable = LaunchConfiguration('charge_enable').perform(context).strip()
+    charge_passive = LaunchConfiguration('charge_passive').perform(context).strip()
+    charge_static_stand = LaunchConfiguration('charge_static_stand').perform(context).strip()
 
     # ── RTSP 相机模式 (机器狗) ──
     rtsp_url = LaunchConfiguration('rtsp_url').perform(context).strip()
@@ -149,6 +190,75 @@ def launch_setup(context):
     # AprilTag frame name convention: tag<family>:<id>
     tag_frame = f'tag{family}:{dock_tag_id}'
 
+    # ── 双二维码模式 (dual.*) 参数解析 ───────────────────────────
+    # apriltag 节点启动即需桩码 ID/边长 (逐 tag 解 PnP + 广播 TF), 而
+    # docking.yaml 是 dual.* 的权威默认 —— launch 参数空时从 yaml 读,
+    # 显式传参才覆盖 (与 base_type 同款约定)。
+    try:
+        with open(config_path) as f:
+            _yaml_params = (yaml.safe_load(f) or {}).get(
+                'docking_node', {}).get('ros__parameters', {})
+    except Exception:
+        _yaml_params = {}
+
+    dual_enable = LaunchConfiguration('dual_enable').perform(context).strip()
+    if dual_enable == '':
+        dual_enable = 'true' if _yaml_params.get('dual.enable') else 'false'
+    if dual_enable.lower() not in ('true', 'false'):
+        raise ValueError('dual_enable must be true or false')
+    dual_enabled = dual_enable.lower() == 'true'
+    dual_tuning = {}
+    for name in ('projection_mode', 'camera_info_topic'):
+        value = LaunchConfiguration('dual_' + name).perform(context).strip()
+        if value:
+            dual_tuning['dual.' + name] = value
+    # Select rectified only for the known undistorted Odin source, never merely
+    # because apriltag's subscription happens to be named image_rect.
+    if 'dual.projection_mode' not in dual_tuning and use_odin and image_topic == '/odin1/image/undistorted':
+        dual_tuning['dual.projection_mode'] = 'rectified'
+    for name in DUAL_TUNING_ARGS:
+        value = LaunchConfiguration('dual_' + name).perform(context).strip()
+        if value:
+            number = float(value)
+            if name in ('visibility_samples', 'feedback_fail_windows', 'no_candidate_windows'):
+                if not number.is_integer():
+                    raise ValueError('dual_' + name + ' must be an integer')
+                number = int(number)
+            dual_tuning['dual.' + name] = number
+    # 墙码边长: 空 = yaml dual.wall_tag_size, 再退 tag_size 参数
+    _arg = LaunchConfiguration('wall_tag_size').perform(context).strip()
+    wall_tag_size = (float(_arg) if _arg
+                     else float(_yaml_params.get('dual.wall_tag_size')
+                                or tag_size))
+    # 桩码 ID: 空 = yaml dual.pile_tag_id
+    _arg = LaunchConfiguration('pile_tag_id').perform(context).strip()
+    pile_tag_id = (int(_arg) if _arg
+                   else int(_yaml_params.get('dual.pile_tag_id') or 51))
+    # 桩码边长: 空 = yaml dual.pile_tag_size
+    _arg = LaunchConfiguration('pile_tag_size').perform(context).strip()
+    pile_tag_size = (float(_arg) if _arg
+                     else float(_yaml_params.get('dual.pile_tag_size')
+                                or 0.05))
+
+    pile_frame = f'tag{family}:{pile_tag_id}'
+    if dual_enabled:
+        if pile_tag_id == dock_tag_id:
+            raise RuntimeError(
+                f'双码配置错误: 桩码 ID ({pile_tag_id}) 与墙码 ID '
+                f'({dock_tag_id}) 相同 —— apriltag 无法区分两个同 ID tag, '
+                '请传 pile_tag_id:=<其他ID> 或改 yaml dual.pile_tag_id')
+        # 5cm 桩码在降采样图上 1m 外低于 36h11 检测下限 → 双码建议全分辨率
+        if use_rtsp:
+            _eff_scale = camera_downscale
+        elif use_odin:
+            _eff_scale = odin_downscale
+        else:
+            _eff_scale = 1
+        if _eff_scale != 1:
+            print(f'[docking.launch] 警告: 双码模式下 5cm 桩码在降采样 '
+                  f'({_eff_scale}x) 图上 1m 外不可检, 建议 '
+                  'camera_downscale:=1 (全分辨率)', file=sys.stderr)
+
     # 同步桥输出话题。apriltag_ros 的 image_transport::CameraSubscriber 从 image
     # 话题名同级派生 camera_info (image_raw → camera_info), 所以 apriltag 必须订阅
     # 桥的 image 输出, 才能拿到时间戳对齐的 camera_info。
@@ -166,6 +276,7 @@ def launch_setup(context):
             package='tagdocking',
             executable='rtsp_camera',
             name='rtsp_camera',
+            arguments=['--ros-args', '--log-level', 'rtsp_camera:=error'],
             parameters=[{
                 'rtsp_url': rtsp_url,
                 'camera_info_file': camera_info_file,
@@ -240,23 +351,33 @@ def launch_setup(context):
         ))
 
     # ── AprilTag detection node ─────────────────────────────────
+    # 双码模式: 墙码 + 桩码两 tag 逐 tag 边长 (嵌套 tag.sizes; 桩码 5cm 与
+    # 墙码 15cm 边长不同, 旧 fork 的单一 size 参数解不出桩码正确 PnP ——
+    # 本包 deps.repos 锁定 apriltag_ros master/3.4.0+, 支持嵌套逐 tag 边长)。
+    apriltag_ids = [dock_tag_id]
+    apriltag_frames = [tag_frame]
+    apriltag_sizes = [wall_tag_size if dual_enabled else tag_size]
+    if dual_enabled:
+        apriltag_ids.append(pile_tag_id)
+        apriltag_frames.append(pile_frame)
+        apriltag_sizes.append(pile_tag_size)
     nodes.append(Node(
         package='apriltag_ros',
         executable='apriltag_node',
         name='apriltag_node',
         parameters=[{
             'family': family,
-            'size': tag_size,
-            'tag_ids': [dock_tag_id],
-            'tag_frames': [tag_frame],
+            'size': apriltag_sizes[0],
+            'tag_ids': apriltag_ids,
+            'tag_frames': apriltag_frames,
             # apriltag_ros 3.4.0+ (上游 ROS2 重写, 节点名 /apriltag) 只认嵌套
             # tag.ids/tag.frames/tag.sizes (且无 publish_tf/z_up, TF 无条件
             # 发布), 旧 fork 只认扁平 tag_ids/tag_frames。未识别的参数被静默
             # 忽略, 两套同传兼容两代版本 —— 只传扁平参数时 3.4.0 会"有检测、
             # 无 TF"(tag 不在配置里, 不解算位姿也不广播 TF)。
-            'tag.ids': [dock_tag_id],
-            'tag.frames': [tag_frame],
-            'tag.sizes': [tag_size],
+            'tag.ids': apriltag_ids,
+            'tag.frames': apriltag_frames,
+            'tag.sizes': apriltag_sizes,
             'publish_tf': True,
             'z_up': False,
             # 默认 decimate=2 会把桥输出的 ~640 宽图再降一半, 远距离小 tag
@@ -281,7 +402,7 @@ def launch_setup(context):
                 'tag.frame': tag_frame,
                 'tag.id': dock_tag_id,
                 'tag.family': family,
-                'tag.size': tag_size,
+                'tag.size': apriltag_sizes[0],
                 'camera_frame': camera_frame,
                 'base_frame': base_frame,
                 'base.cmd_vel_topic': cmd_vel_topic,
@@ -299,7 +420,38 @@ def launch_setup(context):
              if posture_enable else [])
           + ([{'posture.static_settle_sec': float(static_settle_sec)}]
              if static_settle_sec else [])
-          + ([{'stopgo.jog_max': float(jog_max)}] if jog_max else []),
+          + ([{'stopgo.jog_max': float(jog_max)}] if jog_max else [])
+          + ([{'final_straight.entry_lateral_m': float(entry_lateral_m)}]
+             if entry_lateral_m else [])
+          + ([{'camera.lateral_offset_m': float(camera_lateral_offset_m)}]
+             if camera_lateral_offset_m else [])
+          + ([{'final_straight.lateral_threshold_m': float(final_straight_lateral_threshold)}]
+             if final_straight_lateral_threshold else [])
+          + ([{'final_straight.normal_yaw_threshold_deg': float(final_straight_normal_yaw_deg)}]
+             if final_straight_normal_yaw_deg else [])
+          + ([{'final_straight.tighten_distance': float(final_straight_tighten_distance)}]
+             if final_straight_tighten_distance else [])
+          + ([{'final_straight.far_yaw_threshold_deg': float(final_straight_far_yaw_deg)}]
+             if final_straight_far_yaw_deg else [])
+          + ([{'final_straight.far_lateral_m': float(final_straight_far_lateral_m)}]
+             if final_straight_far_lateral_m else [])
+          + ([{'final_servo.yaw_tol_deg': float(final_servo_yaw_deg)}]
+             if final_servo_yaw_deg else [])
+          + ([{'charge.enable': charge_enable.lower() == 'true'}]
+             if charge_enable else [])
+          + ([{'charge.passive': charge_passive.lower() == 'true'}]
+             if charge_passive else [])
+          + ([{'charge.static_stand': charge_static_stand.lower() == 'true'}]
+             if charge_static_stand else [])
+          # 双码模式: launch 解析后的最终值显式覆盖 yaml —— 用户 launch
+          # 传参 (pile_tag_id:= 等) 必须同时作用于 apriltag 与 docking_node
+          # 两侧, 否则节点找的 TF frame 名与 apriltag 广播的对不上。
+          # dual_enable=false 时零改动 (yaml 权威, 节点全程旁路)。
+          + ([dual_tuning, {'dual.enable': dual_enabled,
+               'dual.wall_tag_size': wall_tag_size,
+               'dual.pile_tag_id': pile_tag_id,
+               'dual.pile_tag_size': pile_tag_size}]
+             ),
         output='screen',
     ))
 
@@ -308,6 +460,13 @@ def launch_setup(context):
 
 def generate_launch_description():
     return LaunchDescription([
+        DeclareLaunchArgument('dual_projection_mode', default_value='',
+            description='raw or rectified; empty uses YAML (known Odin undistorted source selects rectified)'),
+        DeclareLaunchArgument('dual_camera_info_topic', default_value='',
+            description='Exact detection-image CameraInfo; empty preserves YAML'),
+        *[DeclareLaunchArgument('dual_' + name, default_value='',
+            description='Override dual.' + name + '; empty preserves YAML')
+          for name in DUAL_TUNING_ARGS],
         DeclareLaunchArgument('image_topic', default_value='/image_raw',
                              description='Camera image topic for apriltag_ros'),
         DeclareLaunchArgument('camera_info_topic', default_value='/camera_info',
@@ -330,8 +489,40 @@ def generate_launch_description():
                              description='最终停泊距离 (m), 底盘距 tag'),
         DeclareLaunchArgument('final_straight_distance', default_value='0.85',
                              description='直行阶段起点距离 (m), 到此距离后纯直行不再调角 (须 > dock_distance)'),
-        DeclareLaunchArgument('final_straight_yaw_deg', default_value='5.0',
-                             description='进入直行阶段的航向门槛 (deg, 方阵误差)'),
+        DeclareLaunchArgument('final_straight_yaw_deg', default_value='3.0',
+                             description='直行入口方位门槛 (deg): 进入直行距离时方位误差超此值报导航失败; '
+                                         '近场(dist ≤ tighten_distance)的方位修正门槛同此值'),
+        DeclareLaunchArgument('entry_lateral_m', default_value='',
+                             description='直行入口横向门槛 (m): 进入直行距离时 |横向| 超此值报导航失败 '
+                                         '(空 = 使用 yaml 的 final_straight.entry_lateral_m)'),
+        DeclareLaunchArgument('camera_lateral_offset_m', default_value='',
+                             description='相机光学中心相对底盘中心线的横向偏移 (m, + = 相机偏左): '
+                                         '加回量测 lat 补偿安装误差, 直行前触发左移修正 '
+                                         '(空 = 使用 yaml 的 camera.lateral_offset_m; 本机实测 0.03)'),
+        DeclareLaunchArgument('final_straight_lateral_threshold', default_value='',
+                             description='近场横移修正/捷径横向门槛 (m, 比入口 entry_lateral_m 更紧): '
+                                         '量测补偿加回偏置后防止真实偏移被捷径放行直行 '
+                                         '(空 = 使用 yaml 的 final_straight.lateral_threshold_m)'),
+        DeclareLaunchArgument('final_straight_normal_yaw_deg', default_value='',
+                             description='近场法线(normal)对准门槛 (deg): 收紧到 ~2° 让先对齐法线再横移成立; '
+                                         '之前用 stopgo.yaw_threshold_deg(10°) 太松导致横移走错方向 '
+                                         '(空 = 使用 yaml 的 final_straight.normal_yaw_threshold_deg; 摆头可放宽 3~5°)'),
+        DeclareLaunchArgument('final_straight_tighten_distance', default_value='',
+                              description='远/近分界 (m): dist ≤ 此值进入近场精调(法线对准+横移+直行), '
+                                          '> 此值远场粗对准+纯前进 (1.5m 处 normal 噪声放大, 远场不横移) '
+                                          '(空 = 使用 yaml 的 final_straight.tighten_distance; 默认 1.3)'),
+        DeclareLaunchArgument('final_straight_far_yaw_deg', default_value='',
+                              description='远场粗对准方位门槛 (deg): dist > tighten_distance 时方位 ≤ 此值即前进, '
+                                          '不做微调/横移 (空 = 使用 yaml 的 final_straight.far_yaw_threshold_deg; '
+                                          '默认 15.0)'),
+        DeclareLaunchArgument('final_straight_far_lateral_m', default_value='',
+                              description='远场粗对准横向门槛 (m): dist > tighten_distance 时 |lat| ≤ 此值即前进, '
+                                          '横向偏走近场再修 (空 = 使用 yaml 的 final_straight.far_lateral_m; '
+                                          '默认 0.20)'),
+        DeclareLaunchArgument('final_servo_yaw_deg', default_value='',
+                              description='到位即 DOCKED 的方位门槛 (deg): 直行到位后方位偏差 '
+                                          '≤ 此值即判定成功, 不再累积稳定/追角 '
+                                          '(空 = 使用 yaml 的 final_servo.yaw_tol_deg)'),
         DeclareLaunchArgument('jog_max', default_value='',
                              description='走停单步最大 jog 距离 (m); 空 = 使用 config/docking.yaml 的 stopgo.jog_max'),
 
@@ -345,6 +536,32 @@ def generate_launch_description():
         DeclareLaunchArgument('static_settle_sec', default_value='',
                               description='停→量测最短间隔 (s, 空 = 使用 yaml 的 '
                                           'posture.static_settle_sec)'),
+        DeclareLaunchArgument('charge_enable', default_value='',
+                              description='充电收尾总开关 true/false '
+                                          '(空 = 使用 yaml 的 charge.enable)'),
+        DeclareLaunchArgument('charge_passive', default_value='',
+                              description='阻尼(泄力)步开关 true/false; false=仅锁定 '
+                                          '(空 = 使用 yaml 的 charge.passive)'),
+        DeclareLaunchArgument('charge_static_stand', default_value='',
+                              description='DOCKED 后先 static_stand 锁定再阻尼 true/false; '
+                                          'false=跳过锁定直接阻尼 '
+                                          '(空 = 使用 yaml 的 charge.static_stand)'),
+
+        # ── 双二维码模式 (dual.*) ────────────────────────────────
+        DeclareLaunchArgument('dual_enable', default_value='',
+                              description='双二维码对准总开关 true/false: 墙码(36h11:0)+桩码 '
+                                          '联合对准 → 纯直行 → 距墙码 0.50m 停泊 '
+                                          '(空 = 使用 yaml 的 dual.enable)'),
+        DeclareLaunchArgument('wall_tag_size', default_value='',
+                              description='墙码边长 (m, 36h11:0): dual 启用时 apriltag 按此解 PnP '
+                                          '(空 = 使用 yaml 的 dual.wall_tag_size, 默认 0.15)'),
+        DeclareLaunchArgument('pile_tag_id', default_value='',
+                              description='桩码 ID (贴充电桩底座, 现场已确认 51): '
+                                          '不得与 dock_tag_id 相同 '
+                                          '(空 = 使用 yaml 的 dual.pile_tag_id, 默认 51)'),
+        DeclareLaunchArgument('pile_tag_size', default_value='',
+                              description='桩码边长 (m): '
+                                          '(空 = 使用 yaml 的 dual.pile_tag_size, 默认 0.05)'),
 
         # ── RTSP 相机模式 (机器狗) ──────────────────────────────
         DeclareLaunchArgument('rtsp_url', default_value='',

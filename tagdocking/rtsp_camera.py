@@ -586,8 +586,10 @@ class RtspCameraNode(Node):
         info.p = [intr['fx'], 0.0, intr['cx'], 0.0,
                   0.0, intr['fy'], intr['cy'], 0.0,
                   0.0, 0.0, 1.0, 0.0]
-        info.binning_x = f
-        info.binning_y = f
+        # K/P and dimensions already describe the resized output image.
+        # Reporting f as sensor binning would apply that scale a second time.
+        info.binning_x = 1
+        info.binning_y = 1
 
         self._img_pub.publish(img)
         self._info_pub.publish(info)

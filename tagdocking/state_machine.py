@@ -181,6 +181,12 @@ class DockingStateMachine:
         self._docking_start_ns = self._state_start_ns
         return True
 
+    def finish_dual(self):
+        """Called only after controller-confirmed settled finish and zero/cancel."""
+        if self._state in (DockingState.ALIGN, DockingState.APPROACH,
+                           DockingState.FINAL_SERVO):
+            self._transition_to(DockingState.DOCKED)
+
     def finish_undock(self):
         """Node calls this when the undock maneuver completed → UNDOCKED."""
         self._transition_to(DockingState.UNDOCKED)
@@ -284,6 +290,20 @@ class DockingStateMachine:
                 self._node.get_logger().error(
                     f'整体超时（{overall_sec:.0f}s）')
                 self._transition_to(DockingState.TIMEOUT)
+                return self._state
+
+            # Dual controller owns optical stage/terminal predicates. In
+            # particular never use single-tag too-close success or retries.
+            if params.get('dual_enable') and state in (
+                    DockingState.ALIGN, DockingState.APPROACH, DockingState.FINAL_SERVO):
+                if maneuver_active:
+                    self._tag_lost_count = 0
+                elif not tag_visible:
+                    self._tag_lost_count += 1
+                else:
+                    self._tag_lost_count = 0
+                if self._tag_lost_count * 0.05 > params.get('tag', {}).get('tag_loss_timeout_sec', 2.5):
+                    self.abort_motion('dual wall stream lost; no search/reverse')
                 return self._state
 
             # Tag lost during a vision state → try to re-acquire rather than
@@ -442,13 +462,24 @@ class DockingStateMachine:
 
     def _eval_final_servo(self, tag_visible, tag_pose, now_ns,
                           cmd_vx, cmd_vy, cmd_wz, params):
-        """FINAL_SERVO: slow precise approach + multi-frame confirmation."""
+        """FINAL_SERVO: 到 dock_distance 即判定成功 (到位即 DOCKED)。
+
+        stop-and-go 下规划器已经把车停在目标距离附近 (plan_straight 距离
+        到位即 [done] 停车), 这里只做"离家门口一步之遥"的确认。直行阶段
+        不再追角度, 用户可接受到位时方位偏 15°(方位=atan2(横向,距离),
+        横向本就是它的投影, 15° 已隐含横向 ≤ dist·tan15° ≈ 14cm)。故判据
+        只保留: 距离在 pos_tol 内 + 方位 ≤ yaw_tol_deg, 单帧即判定 ——
+        不再要求横向 < pos_tol(过严) 也不再累积 1s 稳定(呼吸/平衡摆动会
+        让稳定永远凑不齐, 把已停好的泊位误判失败、连打十几秒日志后超时
+        重试)。
+        """
         tolerance_cfg = params.get('tolerance', {})
-        pos_tol = tolerance_cfg.get('position_m', 0.03)
-        yaw_tol_deg = tolerance_cfg.get('yaw_deg', 3.0)
+        pos_tol = tolerance_cfg.get('position_m', 0.05)
+        # 直行到位方位门槛: 用 final_servo.yaw_tol_deg (默认 15°), 而非
+        # tolerance.yaw_deg(10°, 那是阶段1 对准的宽门)。
+        final_servo_cfg = params.get('final_servo', {})
+        yaw_tol_deg = final_servo_cfg.get('yaw_tol_deg', 15.0)
         yaw_tol = math.radians(yaw_tol_deg)
-        stable_time = tolerance_cfg.get('stable_time_sec', 1.0)
-        stable_ns = int(stable_time * 1e9)
 
         dock_target = params.get('dock_target', {})
         target_distance = dock_target.get('distance', 0.30)
@@ -460,25 +491,14 @@ class DockingStateMachine:
             error_lat = abs(tag_pose.lat - lateral_offset)
             error_yaw = abs(normalize_angle(tag_pose.yaw - yaw_offset_rad))
 
-            # Check dock success conditions
-            at_position = error_dist < pos_tol and error_lat < pos_tol
-            at_yaw = error_yaw < yaw_tol
-
-            # Check robot stability (velocity near zero)
-            vel_mag = abs(cmd_vx) + abs(cmd_vy) + abs(cmd_wz)
-            is_stable = vel_mag < 0.01
-
-            if at_position and at_yaw and is_stable:
-                if self._stable_since_ns == 0:
-                    self._stable_since_ns = now_ns
-                elif (now_ns - self._stable_since_ns) >= stable_ns:
-                    self._node.get_logger().info(
-                        f'停靠成功：距离误差={error_dist:.3f}m '
-                        f'横向误差={error_lat:.3f}m 航向误差={error_yaw:.3f}rad')
-                    self._transition_to(DockingState.DOCKED)
-                    return
-            else:
-                self._stable_since_ns = 0
+            # 到位即成功: 距离在容差内 + 方位 ≤ 15° 单帧判定, 不等稳定。
+            if error_dist < pos_tol and error_yaw < yaw_tol:
+                self._node.get_logger().info(
+                    f'停靠成功：距离误差={error_dist:.3f}m '
+                    f'横向误差={error_lat:.3f}m '
+                    f'航向误差={math.degrees(error_yaw):.1f}°')
+                self._transition_to(DockingState.DOCKED)
+                return
 
         # Safety: minimum distance
         safety_cfg = params.get('safety', {})
@@ -489,18 +509,26 @@ class DockingStateMachine:
             self._transition_to(DockingState.DOCKED)
             return
 
-        # Timeout
+        # Timeout: 兜底 —— 距离始终到不了容差内(差太远/停下倒退)才走到这。
         final_timeout = params.get('final_servo_timeout_sec', 30.0)
         if self.state_elapsed_ns(now_ns) * 1e-9 > final_timeout:
             self._node.get_logger().error('FINAL_SERVO 超时')
-            # Best-effort: accept current pose if tag is visible and close
             if tag_visible and tag_pose is not None:
                 error_dist = abs(tag_pose.dist - target_distance)
-                if error_dist < pos_tol * 3:
+                error_lat = abs(tag_pose.lat - lateral_offset)
+                error_yaw = abs(normalize_angle(tag_pose.yaw - yaw_offset_rad))
+                if error_dist < pos_tol and error_yaw < yaw_tol:
                     self._node.get_logger().warn(
-                        f'超时但接受当前位姿（误差={error_dist:.3f}m）')
+                        f'超时但位姿合格, 接受当前位姿 (距离={error_dist:.3f}m '
+                        f'横向={error_lat:.3f}m 航向={math.degrees(error_yaw):.1f}°)')
                     self._transition_to(DockingState.DOCKED)
                     return
+                self._node.get_logger().error(
+                    f'超时且位姿超差 (距离={error_dist:.3f}m '
+                    f'横向={error_lat:.3f}m 航向={math.degrees(error_yaw):.1f}°) '
+                    f'→ 重试')
+                self.fail()
+                return
             self._transition_to(DockingState.TIMEOUT)
 
     # ── Internal ────────────────────────────────────────────────────

@@ -33,12 +33,31 @@ class ActionExecutor:
                  max_turn_step: float = 0.3,
                  small_turn_rad: float = 0.1,
                  final_approach_distance: float = 1.0,
-                 yaw_threshold: float = 0.05):
+                 yaw_threshold: float = 0.05,
+                 turn_lead_per_speed: float = 0.30,
+                 turn_slow_rad: float = 0.14):
         self._turn_settle_ns = int(turn_settle_sec * 1e9)
         self._turn_undershoot = turn_undershoot
         self._max_turn_step = max_turn_step
         self._small_turn_rad = small_turn_rad
         self._final_approach_distance = final_approach_distance
+        # 盲转停止滞后补偿 — 与 scripts/test_turn_angle 同款的两板斧。
+        # 判停依据是 /dog/odom 累计角, 但从"odom 判停"到"底盘真停"之间存在
+        # 控制周期(50ms)+里程计延迟+底盘减速惯性: 实测 0.3rad/s 全速盲转
+        # 每次多转 ~5-7°(对接日志: 目标 ±9.7° 实转 15-17°, 误差符号每步翻转,
+        # 法线对准 2° 门槛永远进不去 → 原地摆头极限环, 横移分支永远触发不了)。
+        #   1) 距目标 turn_slow_rad 内减速到半速 — 减小惯性冲量;
+        #   2) 提前量判停: 剩余角 ≤ turn_lead_per_speed×当前速率 时提前发零速,
+        #      让滞后滑行正好补足剩余角 (lead 与速率成线性, 同 test_turn_angle
+        #      的 _LEAD_PER_SPEED)。lead 默认 0.30 由对接日志反推: 全速 0.3rad/s
+        #      每次多转 5.2-7.8° → 实际滞后 0.30-0.43s; 半速 0.15rad/s 下残差
+        #      ≤ (0.43−0.30)×0.15 ≈ 1.1°, 落进 2° 法线门槛内。实测欠/过量恒定时
+        #      微调本值。
+        self._turn_lead_per_speed = turn_lead_per_speed
+        self._turn_slow_rad = turn_slow_rad
+        # 本步起始角速度(含 start_turn 的小角半速), 近目标减速段的基准,
+        # 保证只降一档、不会逐帧累乘到 0。
+        self._turn_base_angular = 0.0
         # Fixed bearing tolerance the PLANNER uses to decide a yaw is needed.
         # The turn's visual early-stop must be at least this tight, otherwise
         # the planner keeps demanding a turn (|bearing| > yaw_threshold) while
@@ -176,6 +195,7 @@ class ActionExecutor:
         self._action_angular = rate if damped >= 0 else -rate
         self._action_linear = 0.0
         self._action_target = abs(damped)
+        self._turn_base_angular = self._action_angular
         return True
 
     def start_jog_lateral(self, distance: float, lateral_rate: float,
@@ -339,6 +359,24 @@ class ActionExecutor:
             self._stop()
             return True
 
+        # ── 停止滞后补偿 (近目标减速 + 提前量判停) ─────────────────
+        # 顺序: 先减速档, 再按减速后的当前速率算提前量。
+        # 减速只降一档 (基准是本步起始速率), 不会逐帧累乘到 0。
+        remaining = target_now - turned
+        if (remaining < self._turn_slow_rad
+                and abs(self._action_angular)
+                > abs(self._turn_base_angular) * 0.5 + 1e-9):
+            self._action_angular = math.copysign(
+                abs(self._turn_base_angular) * 0.5, self._action_angular)
+        # 提前量按当前速率线性缩放; 钳到目标一半, 保证极小目标角至少执行
+        # 一半 —— 否则 1° 级微调会在起步前就被提前量整个吞掉, 规划器看到
+        # 误差不变, 无限重发同一小转。
+        lead = min(self._turn_lead_per_speed * abs(self._action_angular),
+                   0.5 * target_now)
+        if remaining <= lead:
+            self._stop()
+            return True
+
         # NO visual early-stop for turns.
         #
         # In stop-and-go the camera is not trusted mid-motion: docking_node
@@ -355,10 +393,10 @@ class ActionExecutor:
         # the planner re-demanded the same turn forever — an infinite no-progress
         # loop.
         #
-        # Turn completion is governed by ODOMETRY alone (turned >= target_now).
-        # Undershoot (turn_undershoot) and max_turn_step already prevent
-        # overshoot, and the planner re-measures + re-plans after every step, so
-        # there is no over-rotation risk without the visual gate.
+        # Turn completion is governed by ODOMETRY alone (turned >= target_now),
+        # plus the stop-latency compensation above (近目标减速 + 提前量判停) —
+        # full=True 路径没有 undershoot/max_turn_step 保护 (docking omni 走停
+        # 与泊出都走 full=True), 不补偿的话每次盲转实转比目标多 5-7°。
         return False
 
     # ── Visual settle after turn ────────────────────────────────────

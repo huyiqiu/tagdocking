@@ -60,6 +60,9 @@ class GeometryPlanner:
         self._target_dist = target_distance
         self._lateral_threshold = lateral_threshold
         self._yaw_threshold = yaw_threshold
+        # 方位(bearing)转向门独立于法线对准门: 节点近场只收紧前者
+        # (normal 近场抖动大, 跟着收紧会追噪声摆头), 见 set_tolerances。
+        self._bearing_yaw_threshold = yaw_threshold
         self._tune_angle = tune_angle
         self._jog_min = jog_min
         self._jog_max = jog_max
@@ -86,21 +89,33 @@ class GeometryPlanner:
             ActionPlan with the next discrete action.
 
         Strategy — omni (with ``normal``): align → slide → straight.
-            The lateral slide is docking-correct ONLY when the heading is
-            already parallel to the tag normal: sliding by ``lat`` then both
-            centres the bearing AND lands the robot ON the normal line.
-            Off-normal, a bearing-centring slide still centres the tag but
-            moves the robot AWAY from the normal line (perpendicular offset
-            grows), and the final straight-in would hit the dock skewed.
-            So the omni order per stop-and-go iteration is:
+            A lateral slide is docking-correct only when it moves the robot
+            ONTO the tag's normal line; the final straight-in then rides that
+            line into the dock.  The omni order per stop-and-go iteration is:
               1. heading error vs normal (normal + π) beyond threshold →
                  turn in place (node clamps to max_turn_step, re-measures);
-              2. |lat| beyond tolerance → slide by lat (side test = which
-                 side of the normal line we are on, since heading ∥ normal);
+              2. otherwise, perpendicular offset to the measured normal line,
+                 perp = dist·sin(normal) − lat·cos(normal), beyond tolerance →
+                 slide by perp.  Unlike a raw-lat slide this stays exact under
+                 residual heading error: lat conflates the true offset with
+                 dist·sin(heading_err) — at 1.1 m a 5° residual contributes
+                 ~10 cm of "phantom lateral" that can flip a few-cm true
+                 offset's SIGN (2026-09 log: robot 5.7 cm right of the line,
+                 tag right in frame → lat=−0.044 slid RIGHT, away from the
+                 line; perp=+0.057 slides LEFT onto it).  Reduces to lat
+                 exactly when normal = π (heading square).  Normal noise is
+                 amplified by dist (~1.3 cm at 1.1 m for the measured σ≈0.7°)
+                 — bounded by the alignment-turn gate, EMA, and per-stop
+                 re-measure feedback.  Skipped when |heading_err| > 90°
+                 (mirror-flipped / garbage normal): no perp slide there —
+                 falls through to the bearing aim-and-go below.
               3. otherwise straight in along the (now normal) line.
-            The slide magnitude ``lat`` is a direct, reliable measurement,
-            unlike the standoff-point construction of plan_sequence() which
-            amplifies normal noise — hence align-first, slide-second.
+            The perpendicular construction was once rejected as "±10°
+            far-field normal noise → ±0.3 m slide noise"; far-field slides no
+            longer happen (normal=None there), and near field the normal is
+            EMA-filtered and the residual heading error bounded by the
+            alignment-turn gate — the sign robustness it buys is worth the
+            noise it adds.
 
         Strategy — aim-and-go (pure pursuit, diff-drive):
             Driving straight forward preserves ``lat`` (the robot moves along
@@ -127,17 +142,40 @@ class GeometryPlanner:
         # this converges in clamped steps, re-measured at every stop.  Skipped
         # beyond ±90°: there the tag faces away (or the solvePnP flip leaked
         # through the EMA) and chasing it would spin the robot.
+        #
+        # ── 横移: 平移到「测得法线」上, 用垂直偏距而非画面横向 lat ──
+        # 只在「法线对准」模式下触发 (normal is not None)。normal=None 是
+        # pure-pursuit / 纯方位模式 (远场), 远场不横移 (法线噪声 ±10° 会被
+        # dist 放大成 ±0.3m 横移噪声)。
+        #
+        # 为什么不能按 lat 横移: lat = 真实垂直偏距 − dist·sin(残余航向误差)。
+        # 车头没完全转正时, 1.1m 处 5° 残余误差贡献 ~10cm "假横向", 能淹没并
+        # 反转真实 4-5cm 偏距的符号 (2026-09 实测: 狗在线右侧 5.7cm、车头左偏
+        # 5.3°、tag 在画面右侧 → lat=-0.044 按右横移, 离线更远; 正确动作是
+        # 左移 5.7cm = dist·sin(n)−lat·cos(n))。垂直偏距把航向误差项减掉,
+        # 车头未转正也移向正确的线; n=π (已转正) 时严格退化为 lat。
+        # 噪声 = dist×(normal 读数误差): 近场受转向门槛钳制 + 循环 EMA,
+        # 实测 σ≈0.7° → ~1.3cm; 且每个停看点重测, 有反馈兜底。
+        #
+        # 垂直偏距只在「法线可信」区间使用 (|heading_err| ≤ 90°): 转向分支
+        # 未触发的两种落法 —— 对准区 (|err| ≤ 门槛, perp 修正项有意义) 与
+        # 翻转/垃圾区 (|err| > 90°, normal 可能是镜像解)。垃圾区若仍按 perp
+        # 横移, 45° 垃圾法线会算出 dist·sin(45°)≈0.7m 幻影横移 (旧代码按 lat
+        # 横移虽无此放大但也无意义) —— 统一交给下方 aim-and-go 的 bearing
+        # 转向处理 (bearing 只依赖 tag 位置, 稳定可靠), 下一停重测。
         if self._is_omni and normal is not None:
             heading_err = normalize_angle(normal + math.pi)
             if self._yaw_threshold < abs(heading_err) <= math.pi / 2:
                 return ActionPlan(kind='yaw', turn_angle=heading_err)
-        if self._is_omni and abs(lat) > self._lateral_threshold:
-            return self._start_lateral(dist, lat, yaw)
+            if abs(heading_err) <= math.pi / 2:
+                perp = dist * math.sin(normal) - lat * math.cos(normal)
+                if abs(perp) > self._lateral_threshold:
+                    return self._start_lateral(perp)
 
         # ── Diff-drive (and omni once centred): aim-and-go ──
         # Turn only when a straight approach would miss the lateral tolerance
         # (|lat| too big) or we are pointed too far off the tag (|yaw| too big).
-        if abs(lat) > self._lateral_threshold or abs(yaw) > self._yaw_threshold:
+        if abs(lat) > self._lateral_threshold or abs(yaw) > self._bearing_yaw_threshold:
             return ActionPlan(kind='yaw', turn_angle=yaw)
 
         # ── Straight approach along the line of sight ──
@@ -163,6 +201,29 @@ class GeometryPlanner:
         nothing, but the method is kept so those call sites stay valid.
         """
         pass
+
+    def set_tolerances(self, lateral_threshold: float, yaw_threshold: float,
+                       bearing_yaw_threshold: float) -> None:
+        """运行期同步修正容差 (与 set_jog_limits 同款免重启机制)。
+
+        节点在近场把方位(bearing)/横向修正门槛收紧到直行入口包络, 让
+        阶段1 主动把 3~10°/3~5cm 的小偏差修掉, 而不是"入口判不合格、
+        规划器却认为无需修正"。法线(normal)对准门槛同样在近场收紧到
+        normal_yaw_threshold_deg —— 横移已改垂直距离补偿航向误差, 收紧后
+        "先对齐法线再横移"的次序成立, 直行入口才真正正对轴线。
+        """
+        self._lateral_threshold = lateral_threshold
+        self._yaw_threshold = yaw_threshold
+        self._bearing_yaw_threshold = bearing_yaw_threshold
+
+    def set_target_distance(self, target_distance: float) -> None:
+        """运行期同步停泊目标距离 (免重启, 同 set_jog_limits 机制)。
+
+        双码模式每个停看点把 dual.dock_distance + cam_dx (相机系→
+        base_link 系换算) 同步进来, plan()/plan_straight() 的剩余距离
+        与 done 判据随之切换; 单码模式不调用, 保持构造值不变。
+        """
+        self._target_dist = target_distance
 
     def set_jog_limits(self, jog_min: float, jog_max: float) -> None:
         """运行期更新走停步长上下限。
@@ -303,18 +364,21 @@ class GeometryPlanner:
 
     # ── Lateral correction helpers ──────────────────────────────────
 
-    def _start_lateral(self, dist: float, lat: float, yaw: float) -> ActionPlan:
-        """Omni / quadruped only: direct lateral slide perpendicular to the
-        line of sight.  Positive lat → tag is left → robot moves left
-        (positive lateral) to centre under the tag.  Diff-drive never calls
-        this — it corrects lateral error by aiming at the tag (see plan()).
+    def _start_lateral(self, perp: float) -> ActionPlan:
+        """Omni / quadruped only: direct lateral slide onto the normal line.
 
-        Precondition: plan() has already aligned the heading with the tag
-        normal (heading-err turn fires before this).  Heading ∥ normal makes
-        the slide axis perpendicular to the normal line, so sliding by ``lat``
-        lands the robot ON the normal line — "tag side" and "side of the
-        normal line" coincide only under that precondition.
+        Called by plan() step 2 with the PERPENDICULAR offset to the measured
+        normal line, ``dist·sin(normal) − lat·cos(normal)`` — not the raw
+        image-frame lat, which conflates the true offset with
+        dist·sin(heading_err) and reverses the slide direction when a ~5°
+        residual heading error dominates a few-cm true offset (2026-09 log:
+        robot 5.7 cm right of the line, tag right in frame → lat=−0.044 slid
+        RIGHT, away from the line; perp=+0.057 slides LEFT onto it).
+
+        Signed ``perp``: positive ⇒ robot right of the normal line (tag to
+        the left) ⇒ slide left (positive), matching
+        ActionExecutor.start_jog_lateral ("positive = move left").
         """
         return ActionPlan(kind='forward',
-                          jog_distance=abs(lat),
-                          lateral_distance=lat)
+                          jog_distance=abs(perp),
+                          lateral_distance=perp)

@@ -70,7 +70,8 @@ import time
 import numpy as np
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data, QoSProfile, ReliabilityPolicy
+from rclpy.qos import (qos_profile_sensor_data, QoSProfile,
+                       ReliabilityPolicy, DurabilityPolicy)
 from sensor_msgs.msg import Image, CameraInfo
 
 
@@ -155,7 +156,14 @@ class CameraInfoBridge(Node):
             self.create_subscription(CameraInfo, info_topic, self._on_info, in_qos)
 
         self._img_pub = self.create_publisher(Image, image_out, out_qos)
-        self._info_pub = self.create_publisher(CameraInfo, info_out, out_qos)
+        # camera_info 用 TRANSIENT_LOCAL 锁存 (ROS 相机约定): apriltag 的
+        # image_transport::CameraSubscriber 晚订阅时也能立刻拿到最新内参解位姿。
+        # 之前 VOLATILE 会在启动竞态下让 apriltag 卡在"能检测(detections 照发)
+        # 但解不出位姿(/tf 不发)" —— 表现为搜索停留"期内消息=28"却"未见 tag"。
+        info_qos = QoSProfile(depth=1,
+                              reliability=ReliabilityPolicy.RELIABLE,
+                              durability=DurabilityPolicy.TRANSIENT_LOCAL)
+        self._info_pub = self.create_publisher(CameraInfo, info_out, info_qos)
 
         if bool(self.get_parameter('publish_static_tf').value):
             self._publish_mount_tf()
@@ -283,8 +291,9 @@ class CameraInfoBridge(Node):
         info.p = [intr['fx'], 0.0, intr['cx'], 0.0,
                   0.0, intr['fy'], intr['cy'], 0.0,
                   0.0, 0.0, 1.0, 0.0]
-        info.binning_x = f
-        info.binning_y = f
+        # Synthesized K/P already use output pixels, not pre-binning pixels.
+        info.binning_x = 1
+        info.binning_y = 1
         return info
 
     # ── 静态 TF (与 rtsp_camera._publish_mount_tf 同一套约定) ─────

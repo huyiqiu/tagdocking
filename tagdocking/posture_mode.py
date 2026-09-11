@@ -67,9 +67,14 @@ class PostureMode:
         self._unlock_retries = int(node._p('posture.unlock_retries'))
         self._service_wait_ns = int(float(node._p('posture.service_wait_sec')) * 1e9)
 
+        if (bool(node._p('posture.enable')) and bool(node._p('dual.enable'))):
+            node.get_logger().warn(
+                '双码模式启用: 静止站立锁定 (posture) 强制旁路 —— 停看点'
+                ' static_stand 会把匍匐中的狗站起来, 桩码随即出视野; '
+                '匍匐停看由 dual.settle_sec + dual_posture 管理器保证')
         self._phase = self.IDLE if self._enabled() else self.DISABLED
         if self._phase == self.DISABLED:
-            node.get_logger().info('静止站立功能已停用 (posture.enable=false)')
+            node.get_logger().info('静止站立功能已停用 (posture.enable=false 或 dual.enable=true)')
 
         prefix = node._p('base.l1w_prefix')
         self._cli_lock = node.create_client(Trigger, f'{prefix}/static_stand')
@@ -124,7 +129,12 @@ class PostureMode:
         没有接口的狗随时 ``ros2 param set <节点> posture.enable false`` 即可
         整体关掉呼吸抑制, 免重启、免无桥宽限等待。每个停-看边界重新读一次,
         开关即时生效 (含中途切换的状态迁移, 见各入口的守卫)。
+
+        双码模式强制旁路: dual 流程全程匍匐 (桩码矮, 站立看不到), 停看点
+        static_stand 会把狗站起来毁掉对准; 停振由 dual.settle_sec 保证。
         """
+        if bool(self._node._p('dual.enable')):
+            return False
         return bool(self._node._p('posture.enable'))
 
     def on_stop(self, now_ns: int) -> None:
@@ -260,8 +270,11 @@ class PostureMode:
         if self._phase == self.DISABLED:
             return
         # 运行期关闭也不拦终态善后: 狗真锁着 (posture_state 残留 static_stand)
-        # 仍要尽力放出, 别把一只锁死的狗还给遥控。
-        if not self._enabled() and self._posture_state != 'static_stand':
+        # 仍要尽力放出, 别把一只锁死的狗还给遥控。dual 模式同理: 狗可能趴着
+        # (匍匐中取消/失败), 若桥锁了 cmd_vel, 趴着的狗遥控无法接管 → 尽力
+        # stand_up 爬起来还给遥控。
+        if (not self._enabled() and not bool(self._node._p('dual.enable'))
+                and self._posture_state != 'static_stand'):
             return
         if self._motion_enabled is True:
             return

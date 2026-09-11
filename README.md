@@ -36,7 +36,7 @@
                         | 距目标 ≤ 2×位置容差        | 直行入口对准过差
                         v                           v
                   [FINAL_SERVO]                 [RETRYING]
-              停稳确认 (误差在容差内持续1s)      盲退 0.5m 重新锁定 (≤2次)
+              到位确认 (距离±5cm+方位≤15° 单帧DOCKED)  盲退 0.5m 重新锁定 (≤2次)
                         |                           → 回 SEARCH_TAG
                         v
                       [DOCKED] ✓
@@ -90,8 +90,9 @@
 - **解锁确认以 `/l1w_control/motion_enabled` 为准**——它就是桥的 cmd_vel
   门控本身（`authority && motion_enabled_ && !static_stand`），固件退出 LOCK
   有滞后，只有 Bool 变 True 才真的能走
-- **DOCKED 保持静止站立**（不呼吸、姿态最稳）；泊出自动先 stand_up；取消/
-  超时/失败等错误终态自动恢复运动模式把狗还给遥控
+- **DOCKED 保持静止站立**（不呼吸、姿态最稳），随后进入充电收尾（见
+  §3.2）；泊出自动先 stand_up；取消/超时/失败等错误终态自动恢复运动模式
+  把狗还给遥控
 - **机动中被外部切入静止站立**（如网页台"静止站立"按钮）→ 立即
   MOTION_FAILED（cmd_vel 已死，不静默耗完超时）；判定要求 motion_enabled
   为 False，避免解锁瞬间 posture_state 滞后残留误判
@@ -129,7 +130,9 @@ tagdocking/
 │   ├── docking_node.py          # 主节点 — 20Hz 控制循环, 集成所有子系统
 │   ├── state_machine.py         # 状态机 + 超时/重试/泊出管理
 │   ├── posture_mode.py          # 静止站立(锁定)管理器 — 停看循环 停→锁→稳→规划→解锁→走
+│   ├── charge_mode.py           # 充电收尾管理器 — DOCKED 后 静止(锁定)→阻尼
 │   ├── geometry_planner.py      # 几何规划器 — 法线机动(turn-drive-turn)/两阶段直行
+│   ├── dual_docking.py          # 双二维码对准 — 墙码+桩码视差解算/对准保持/纯直行相位
 │   ├── action_executor.py       # 动作执行器 — 里程计航位推算闭环
 │   ├── camera_info_bridge.py    # 相机话题时间戳同步桥 (ROS 相机模式 + Odin1 内参合成模式)
 │   ├── rtsp_camera.py           # RTSP→ROS 相机桥 (机器狗模式: 拉流+内参+静态TF)
@@ -462,6 +465,37 @@ class MyDockingClient(Node):
         print(future.result().message)
 ```
 
+### 充电收尾 (charge.*) — DOCKED 后 静止(锁定)→阻尼
+
+停泊成功 (`DOCKED`) 时狗站在充电桩上方，`ChargeMode`
+（`tagdocking/charge_mode.py`）在 DOCKED 态以 20Hz 非阻塞轮询推进两步收尾：
+
+| 步骤 | 服务 | SDK 命令 | 完成确认 |
+|------|------|----------|----------|
+| 1. 静止锁定 | `~/static_stand` | CMD_LOCK_MODE | `posture_state==static_stand`（posture 开启时本就锁着，幂等直过） |
+| 2. 阻尼/泄力 | `~/passive` | CMD_EMERGENCY_STOP (0x5A，电机泄力保电) | 服务成功响应后等待 `passive_settle_sec`；非硬件/充电确认 |
+
+（服务前缀 `base.l1w_prefix`，默认 `/l1w_control`。）
+
+- **与 posture.enable 完全无关**：呼吸抑制只管停-看循环里的量测稳定；
+  即使中途的锁定/解锁全程关闭，DOCKED 后这两步照做。
+- **阻尼步可单独关掉**：`charge.passive=false`（运行期可调，锁定完成那一刻
+  读参）→ 收尾止于锁定，狗站立但不泄力。
+- **跳过锁定直接阻尼**：`charge.static_stand=false` → DOCKED 后直接切阻尼，
+  狗站立泄力，不做 static_stand。
+- **失败只告警不翻车**：对接已成功，收尾是"锦上添花"——重试
+  `charge.retries` 次耗尽、或无 l1w_control 桥（纯台架）超过
+  `service_wait_sec` 宽限 → 告警一次，DOCKED 仍是成功终态；STATIC 步
+  失败也会继续尝试阻尼（更接近目标）。
+- **泊出衔接**：锁定/阻尼后 cmd_vel 被桥门控（`motion_enabled=False`），
+  盲退发不出速度——`~/start_undock` 时先自动 stand_up 等恢复运动模式
+  再盲退；stand_up 恢复失败则落 MOTION_FAILED（狗已泄力，不干等超时）。
+  收尾进行中收到泊出请求 → 立即中断序列转 stand_up 恢复。
+- 台架验证：`scripts/mock_l1w_control` 已镜像 static_stand/passive（posture →
+  static_stand、门控关），日志可见 `STATIC → DAMPING`。
+
+---
+
 ### 泊出 (Undock)
 
 停泊完成后 (`DOCKED`)，调用 `~/start_undock` 把车退出停靠位：
@@ -479,6 +513,10 @@ ros2 service call /docking_node/start_undock std_srvs/srv/Trigger
 webapp 据此弹"泊出完成"提示。泊出可从任意非停泊态触发 (IDLE / DOCKED / 错误终态)，
 停泊进行中 (`SEARCH_TAG` / `APPROACH` …) 调用会被拒绝。
 
+从 `DOCKED` 泊出时狗往往已锁定/阻尼、电机泄力（充电收尾，§3.2）——盲退前
+自动先 stand_up 等 `motion_enabled==True` 恢复运动模式再动；恢复失败落
+`MOTION_FAILED`。
+
 > 泊出是盲动 (后退 + 转向)，**调用方需确保车后方无障碍**。
 
 ---
@@ -493,7 +531,7 @@ webapp 据此弹"泊出完成"提示。泊出可从任意非停泊态触发 (IDL
 | `SEARCH_TAG` | 2 | 角度步进扫描搜索 AprilTag | 60s (`search.timeout_sec`) |
 | `ALIGN` | 3 | 遗留态，现行流程直接跳过（已并入 APPROACH 走停式） | — |
 | `APPROACH` | 4 | 走停式两阶段逼近（法线机动对准 + 纯直行） | 60s (`approach_timeout_sec`) |
-| `FINAL_SERVO` | 5 | 停稳确认（位置/朝向在容差内且静止，持续 1s） | 30s (`final_servo_timeout_sec`) |
+| `FINAL_SERVO` | 5 | 到位确认（距离±5cm + 方位≤15° 单帧 DOCKED） | 30s (`final_servo_timeout_sec`) |
 | `DOCKED` | 6 | 停靠成功 | — |
 | `RETRYING` | 8 | 失败自动重试：盲退一段距离后回 SEARCH_TAG 重锁 | 15s (`retry.timeout_sec`) |
 | `UNDOCKING` | 9 | 泊出: 盲退 + 原地转 180° | 30s (`undock.timeout_sec`) |
@@ -538,41 +576,62 @@ pause_time_sec(1.5s) → 未见到 → 再转 30° → …  (12 步转满 360°)
   转②正对 tag（-法线方向）
 - 迭代精化：每轮最多走 `stopgo.jog_max`（0.15m）就停下重测；tag 法线
   （normal）远距时不可靠，靠近后逐渐收敛
-- **已对准直行捷径**：方位误差 ≤ 直行门槛且横偏 ≤ `stopgo.lateral_threshold`
-  时不再机动，直接直行（避免近场 normal 抖动引起的无谓摆头）
+- **已对准直行捷径（限近场）**：距 tag ≤ `final_straight.tighten_distance`
+  且方位误差 ≤ 入口门槛、横偏 ≤ `final_straight.lateral_threshold_m` 时不再机动，
+  直接直行（避免近场 normal 抖动引起的无谓摆头）
+- **远/近两级修正**：阶段 1 的修正门槛与动作集按 `final_straight.tighten_distance`
+  （1.3m）分两级（全向底盘逐帧规划 plan() 与差速底盘机动门槛共用此分界）：
+  - **远场**（dist > tighten_distance）：**粗对准 + 纯前进**。方位/横向修正
+    门槛放宽到 `far_yaw_threshold_deg`（15°）/ `far_lateral_m`（0.20m），且
+    **不做法线对准、不横移**（全向底盘 plan() 传 normal=None 走纯方位
+    aim-and-go：对准 bearing → 前进）。1.5m 处 AprilTag normal 噪声 ±10°
+    被 dist 放大成 ±0.3m 横移噪声，是远场反复/反向横移的根源——远场只进
+    不平移，先走近再精调
+  - **近场**（dist ≤ tighten_distance）：**收紧到入口包络**（方位 3° / 横向
+    `lateral_threshold_m`=2cm）才做"先对齐法线再横移"。否则"入口判不合格、
+    规划器却不修"（方位 3~10°/横向 3~5cm 区间）会把误差原样带进直行区再
+    被入口拒绝，陷入前进-重试乒乓。法线门槛不收紧（normal 近场抖动 4~5°，
+    收紧会摆头）；跨区前进步长钳到恰好停在区界，入口检查拿到最新鲜量测
 
 **阶段 2（纯直行，不修角）**：`final_straight` 启用时，距 tag ≤
 `final_straight.start_distance`（0.85m）即**无条件直行**，像停车入库一样
 不再调角——再往前已无空间调位姿，直行中横向误差保持到最终位姿。
 
-- **直行失败检查（一次性）**：首次进入直行距离时，方位误差 >
-  `final_straight.yaw_threshold_deg`（launch 默认 5°，docking.yaml 10°）
-  说明对准过差、入库会撞偏 → 报导航失败（进 RETRYING）。只判一次，防止
-  直行中方位自然漂动误触发
+- **直行失败检查（一次性，入口包络）**：首次进入直行距离时，方位误差 >
+  `final_straight.yaw_threshold_deg`（默认 3°）**或** |横偏| >
+  `final_straight.entry_lateral_m`（默认 5cm）说明对准过差、入库会撞偏 →
+  报导航失败（进 RETRYING）。只判一次，防止直行中方位自然漂动误触发
 - `final_straight.enable: false` 恢复单阶段（全程带角度修正）
 - `start_distance` ≤ `dock_target.distance` 视为误配置，静默回退单阶段
 - 兜底：走停迭代上限 40 次（正常收敛远在之前），单帧近场噪声一次超限
   往往是抖动，重试机制给重新靠近的机会
 
-**全向轮附加**：横偏超 `stopgo.lateral_threshold` 时直接**横移**消横偏
-（差速轮无此自由度，靠阶段 1 的转向机动消除）。
+**全向轮附加（限近场）**：航向已对齐 tag 法线且横偏超横向门槛时直接
+**横移**消横偏（差速轮无此自由度，靠阶段 1 的转向机动消除）。横移量 =
+可靠量测 `lat`——车轴 ∥ 法线时垂直偏距就是 lat，不再用
+`dist·sin(normal) − lat·cos(normal)` 的噪声放大式；航向未对齐时先原地转
+齐法线（每步 ≤ `stopgo.max_turn_step`，停稳重测）再横移——横移只在车轴
+∥ 法线时才等价于"平移上法线"，否则越移越偏（"先右转再左移"的次序）。
+远场（> `tighten_distance`）不横移，纯方位对准 + 前进。
 
-#### FINAL_SERVO — 停稳确认
+#### FINAL_SERVO — 到位即 DOCKED
 
-APPROACH 中距目标 ≤ 2×`tolerance.position_m`（0.10m）即转入。此阶段不再
-有独立控制律——走停循环在容差内即停，本状态只做**多帧稳定确认**。
+APPROACH 中距目标 ≤ 2×`tolerance.position_m`（0.10m）即转入。stop-and-go
+下规划器已把车停在目标距离（`plan_straight` 距离到位即 `[done]` 停车），
+本状态只做**到位确认**——距离在容差内 + 方位 ≤ `final_servo.yaw_tol_deg`
+即**单帧判定 DOCKED**，不再累积稳定、不追角度。
 
-**成功判定（三个条件同时满足，持续 `tolerance.stable_time_sec` 1s）**：
+**成功判定（距离 + 方位，单帧即判定）**：
 1. `|dist − dock_target.distance|` < `tolerance.position_m`（0.05m）
-2. `|lat − lateral_offset|` < `tolerance.position_m`
-3. 方位误差 < `tolerance.yaw_deg`（10°）且无运动指令（走停式下停稳即静止）
+2. 方位误差 < `final_servo.yaw_tol_deg`（15°）
 
-> 这里的 yaw 是**方位角**（bearing = atan2(lat, dist)，即机器人指向 tag 的
-> 方向偏差），不是 tag 自身朝向。
+> 不查横向：横向是方位角 bearing=atan2(横向,距离) 的投影，15° 已隐含
+> |横向| ≤ dist·tan15° ≈ 14cm。不累积 1s 稳定：呼吸/平衡摆动（posture 关闭时）
+> 会让刻把已停好的泊位误判失败、连打十几秒日志后超时重试。
 
 **安全保护**：
 - 距离 < `safety.minimum_distance_m`（0.15m）时强制判定 DOCKED，防止碰撞
-- 超时 30s 后若误差 < 3×容差则接受当前位姿（尽力而为），否则 TIMEOUT
+- 超时 30s 兜底：位姿合格则接受，超差则 fail() 走重试
 
 #### RETRYING — 失败自动重试
 
@@ -655,7 +714,8 @@ adapter = QuadrupedAdapter(
 一部分（`tag.*`、`base.*`、`odom_topic`、`dock_distance`→`dock_target.distance`、
 `final_straight_distance/start_distance`、`final_straight_yaw_deg`→
 `final_straight.yaw_threshold_deg` 等，launch 默认值见
-`ros2 launch tagdocking docking.launch.py --show-args`）。
+`ros2 launch tagdocking docking.launch.py --show-args`；
+`entry_lateral_m` 等空默认参数不传时以 yaml 为权威）。
 
 ### 6.1 Tag 与停靠目标
 
@@ -712,7 +772,7 @@ stopgo.drift_tol: 0.15                # rad — 前进中方位漂移上限 (走
 
 ```yaml
 base.l1w_prefix: "/l1w_control"       # 狗模式服务/状态话题前缀 (zsibot_l1_control)
-posture.enable: true                  # 总开关; 无桥时运行期自动降级停用
+posture.enable: false                 # 总开关 (默认关, launch posture_enable:=true 开启); 无桥时运行期自动降级停用
 posture.static_settle_sec: 1.2        # s — 停→量测最短间隔 (RTSP 延迟+锁定过渡+呼吸衰减)
 posture.lock_ack_timeout_sec: 2.0     # s — 等 posture_state==static_stand; 超时本次停降级
 posture.unlock_ack_timeout_sec: 2.0   # s — 等 motion_enabled==True (含固件退出 LOCK 滞后)
@@ -726,18 +786,161 @@ posture.service_wait_sec: 1.0         # s — 服务发现宽限, 超过判定�
 LOCK 慢），加大 `unlock_ack_timeout_sec`；若每停耗时可接受且想更快，把
 `min_stable_frames` 降到 2 或调小 `static_settle_sec`。
 
-### 6.4 两阶段停泊 (final_straight.*)
+### 6.4 充电收尾 (charge.*)
+
+```yaml
+charge.enable: true                   # 充电收尾总开关 (与 posture.enable 无关)
+charge.passive: true                  # 阻尼(泄力)步开关; false = 仅锁定 (运行期可调)
+charge.static_stand: false            # DOCKED 后先 static_stand 锁定再阻尼; false=跳过锁定, 直接阻尼
+charge.static_ack_timeout_sec: 3.0    # s — static_stand 等待确认
+charge.lie_down_settle_sec: 4.0       # s — (已弃用) 趴下动作时长, 当前流程不再使用 lie_down
+charge.passive_settle_sec: 2.0        # s — passive 受理后等待，非硬件确认
+charge.retries: 1                     # 次 — 每步服务重试
+charge.service_wait_sec: 1.0          # s — 无桥宽限, 超时降级告警 (DOCKED 仍成功)
+```
+
+行为细节见 §3.2 "充电收尾"。
+
+### 6.5 两阶段停泊 (final_straight.*)
 
 ```yaml
 final_straight.enable: true           # 两阶段开关; false 恢复单阶段
 final_straight.start_distance: 0.85   # m — 直行阶段起点 (须 > dock_target.distance, 否则回退单阶段)
-final_straight.yaw_threshold_deg: 10.0  # deg — 直行失败门槛 (launch 默认 5.0 会覆盖此值)
+final_straight.yaw_threshold_deg: 3.0   # deg — 入口方位门槛: 进入直行距离时超此值报导航失败;
+                                       #      近场方位修正门槛同此值 (launch 默认 3.0 会覆盖)
+final_straight.entry_lateral_m: 0.05  # m — 入口横向门槛: 进入直行距离时 |横向| 超此值报导航失败 (一次性入口检查)
+final_straight.lateral_threshold_m: 0.02  # m — 近场横移修正/捷径横向门槛 (比入口更紧, 须 < stopgo.lateral_threshold 保证规划器会滑)
+final_straight.tighten_distance: 1.3  # m — 远/近分界: dist ≤ 此值近场精调(法线对准+横移),
+                                       #      > 此值远场粗对准+纯前进不横移
+                                       #      (建议 ≥ start_distance + jog_max; 误配小于 start 时钳到 start)
+final_straight.far_yaw_threshold_deg: 15.0  # deg — 远场粗对准方位门槛 (dist > tighten_distance 时阶段1生效)
+final_straight.far_lateral_m: 0.20    # m — 远场粗对准横向门槛 (dist > tighten_distance 时阶段1生效)
 ```
 
-进入 `start_distance` 后无条件纯直行不调角；首次进入时方位误差超门槛报
-导航失败（自动重试）。见 §4.3 APPROACH。
+进入 `start_distance` 后无条件纯直行不调角；首次进入时方位或横向超入口
+包络报导航失败（自动重试）。阶段 1 按 `tighten_distance` 分两级：远场
+（> `tighten_distance`）**粗对准 + 纯前进**（方位/横向门槛放宽到 `far_*`，
+全向底盘不做法线对准、不横移——远场 normal 噪声被 dist 放大，横移只会
+反复）；近场（≤ `tighten_distance`）修正门槛收紧到 `lateral_threshold_m`
+（比入口更紧），保证"入口判不合格的误差一定先被修掉"。见 §4.3 APPROACH。
 
-### 6.5 搜索参数 (search.*)
+### 6.5a 相机安装横向偏移补偿 (camera.lateral_offset_m)
+
+```yaml
+camera.lateral_offset_m: 0.03         # m — 相机光学中心相对底盘中心线的横向偏移 (+ = 相机偏左)
+```
+
+相机光学中心若装在底盘中心线左/右某偏移处，而 base→camera 静态 TF 的
+`mount.y` 未含此偏移，量测 lat 会系统性偏小该值——节点认为"正对"时底盘
+中心实际偏到 tag 法线另一侧，停泊整体偏位、近侧腿撞充电桩。此值**加回**
+`raw_lat` 后，规划器在直行前自动左移修正到真实对准。
+
+- **必须量测驱动、每停重测**，不可一次性盲移该值——SEARCH 抖动重入直行
+  阶段时盲移会叠加成两倍；量测驱动则由里程计欠冲在下一停收敛。
+- 补偿后近场 bearing 会增大 ~2°（3cm/0.85m），直行入口方位门槛的余量
+  更真实。
+- 该值运行期可调：`ros2 param set <节点> camera.lateral_offset_m 0.05`。
+
+### 6.5b 双二维码光学走停 (dual.*)
+
+墙码 `36h11:0 / 0.15m`、桩码 `36h11:51 / 0.05m`。两码中心须处于同一
+进桩中心线竖直平面；不是两码左右位置平均居中，而是**每个码各自水平方向居中**。
+`dual.enable=false` 旁路此控制器；显式 launch `dual_enable:=false` 会覆盖 YAML true。
+
+1. **找双码**：无墙码执行有界原地搜索（最多一圈且受搜索总超时）；只有墙码先停看，
+   在持续新鲜墙码检测中确认缺小码后，每次退 0.05m。全轮后退最多 0.30m/6 次，
+   获取双码默认限时 45s，获取后 observe 独立限时 90s；仍受总体任务超时限制。
+   只有小码、无可信墙距或外参不许盲进。
+2. **观察位**：双码有效、先小转/横移使其居中，再在相机墙码深度 1.5m ±0.1m 附近
+   建立进桩阶段。太近仍受同一后退预算限制；预算不足报失败，需人工重新布置起点。
+3. **双码进桩**：每窗联合评估正负转向和正负横移，只发一个可见且显著改善的动作；
+   硬上限转 3°、横移 0.03m、前进 0.05m（配置不能放大硬上限）。
+   两码独立 bearing、航向 `min(tol,1°)`、横偏 2cm 均通过后才允许前进；
+   航向门不再禁止横移。每 jog 后重新双码纠偏，不在 1.5m 或 1m 直接关闭纠偏。
+4. **单向锁向末段**：本轮已经双码对齐并前进，最近合格观测未过资格时限，且墙距
+   ≤1.0m，在持续新鲜墙码帧中确认小码缺失 ≥1.5s 才锁向。远处/未对齐丢小码
+   停车等待后失败；不降级墙码纠角。锁向后小码再现也不转/横移，墙码丢失或流停就停。
+5. **到位**：合法进桩后的新鲜停稳墙距 0.50m ±0.02m 才先零速、cancel，再 DOCKED。
+   最后 jog 可小于通用 jog_min；严重越界失败，绝不自动倒退或回搜索。随后一次性
+   `ChargeMode.begin()` 请求 passive；请求被接受、实际阻尼、充电电流建立是三回事。
+
+**参考系与安装约束**：使用标定主点对应的光学 x/z 水平视线；距离是 optical z，
+不是欧氏距离、base x，也不叠加 `camera.lateral_offset_m`（已有 3cm 单码问题不改）。
+完整 `base_frame -> camera_frame` 外参将不同高度的码中心变换到机身地平面求进桩线。
+光轴水平投影须近似平行机身前进、roll 近零（默认 2°安装门），pitch 由完整旋转处理。
+最后一步用机身前向在光轴方向的投影换算；无可信外参、错误 ID 或不支持横移底盘会拒绝，
+**不再用 0 偏移/单码降级偷偷继续**。外参配置必须与真实安装一致，软件无法验证标定真实性。
+
+**候选与反馈**：完整 SE(2) 预测含相机绕机身转动的位移、pitch 与码高差。
+候选包括上限、半步、四分之一步、限幅残差和最小可执行量；3mm 横移仅是离线起点，
+不是已验证的硬件能力。评分为
+`J=0.5Σ(bearing/tol)²+(max|bearing|/tol)²+0.25(theta/3°)²+0.25(e/0.03m)²`，
+近同分选小步，固定次序决胜；不是全局路径规划或收敛证明。连续三个独立稳定窗无安全
+改善候选就失败，不把 timer 重试当新窗。动作成功启动才扣预算，完成合格前进才提交末段
+资格；明显反向/过期 odom/无响应/超时 stop-cancel-abort，停稳后核验实际 J 改善，连续
+三次无可分辨净改善或振荡失败。不会自动倒转命令符号。
+
+**真实相机视野**：`dual.camera_info_topic=/camera_sync/camera_info` 必须对应检测图像的
+原始 stamp、frame、输出分辨率与内参；缺失有限等待，非法模型明确失败。`dual.projection_mode`
+显式选择 `raw`（K + plumb_bob，D 为零个或五个系数）或 `rectified`（单目 P、单位 R）。
+已知 Odin `/odin1/image/undistorted` launch 默认选择 rectified，其余保留 YAML raw；
+自定义图像源须显式传 `dual_projection_mode`。把订阅 remap 为 image_rect **不会去畸变**。
+ROI/binning 非平凡值不支持，须供应已按输出图像归一化、缩放的 K/P；不能拿原分辨率标定
+配缩小图。标定光轴是 x/z=0，对应主点 cx，不一定是几何中线 width/2；本轮不补偿该差异。
+
+用码尺寸包围体和区间畸变检查四边余量，默认 12 段中间采样、8px 边距另加 2px 采样余量。
+采样仅为模型预测，不保证连续轨迹绝不丢码，不是避障、遮挡或制动净空验证。前后小步也检查；
+只有近距、已完成合格前进且当前仍对准的纯前进可允许小码垂直退出，墙码始终受保护。
+预测退出不锁向，仍须真实停稳持续缺码；转向/横移绝不借此甩掉小码。
+
+**日志**：双码发现/有效固定 key 默认每 2s 输出，首条及内部阶段变化立即输出，附 suppressed
+计数，不减少检测处理。动作启动记录双码 xyz、独立 bearing、theta/e、预测 J 和图像余量；
+完成记录 signed odom，停稳后记录实际 J。内部 observe 不等于外层 APPROACH 已对准。
+
+**时间与帧门**：每个动作停车至少 `max(1.5, dual.settle_sec, posture.static_settle_sec)` 秒，
+不依赖 posture.enable。清空旧观测后要求至少 `max(3, dual.min_frames)` 个不同时间戳新帧。
+双码使用同一检测 stamp 的非阻塞 TF 查询；TF stamp 差限 `dual.tf_skew_sec=0.02`，
+新鲜限 `dual.fresh_sec=0.6` 秒。重复、过期、运动期、停稳前或缺码帧不推进双码稳定；
+没有“等不够帧超时照走”。解锁期间待发计划过期会丢弃并停车重测。
+流整体中断不等于小码正常退出视野。真实相机/TF 必须同钟且发布采集时间。
+
+参数在 `config/docking.yaml` 的 dual 区集中维护；launch 可传 `dual_observation_distance:=1.5`、
+`dual_forward_step:=0.05`、`dual_settle_sec:=1.5`、`dual_dock_distance:=0.50` 等同名下划线参数
+（默认空值保留 YAML）；保留已验证的 stopgo 速度和里程计比例。
+`dual.straight_start_distance` **兼容旧名字但改变含义**：只作近距缺小码资格门，非距离锁向。
+`dual.pile_fresh_timeout_sec` 已弃用，统一改用 `dual.fresh_sec`。
+其它重点：`missing_confirm_sec=1.5`、`missing_timeout_sec=8`、`qualification_sec=8`、
+`max_actions=160`、`dock_tolerance=0.02`。这些阈值尤其小码退出距离必须实测，不能仅从
+两码前后 0.9m 间距推断。检测应使用全分辨率（`camera_downscale:=1`）与正确逐码尺寸。
+
+**无机器人自动化测试**（不启动 ROS 节点、服务或 launch）：
+
+```bash
+cd /home/nvidia/whale-nav/src/tagdocking
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest -q test
+python3 -m compileall -q tagdocking launch
+```
+
+BUILD_TESTING 通过 ament_cmake_pytest 注册此测试目录。禁用 pytest 插件自动加载用于避开
+系统 pytest 6.2 与用户 anyio 插件不兼容；不是跳过本项目测试。旧静态 TF/mock 教程只用于
+单码；双码测试输入必须有真实递增检测时间戳及匹配动态 TF，不能以 latest 静态假码验收。
+
+**已验证的离线包络**：独立固定世界传感器（不把规划器预测当实际反馈）测试了
+左右 ±0.12m、航向 ±0.12rad 的九种组合，1600×1296、fx=fy=700、水平相机、
+0.9m 前后码间距，计入动作/姿态等待/停稳/采帧后 90s 内开始合格前进且少于 30 动作。
+另有独立 0.6m 码间距、fx=400 的退出兼容布局，在 180s 内真实垂直失去小码、锁向并
+到达墙深度容差；这不是实际 0.9m 布局一定能完成末段的证明。pitch ±0.15/0.2rad
+由几何预测对照测试覆盖，不代表该 pitch 下全程闭环已验证。实际视场、标签大小、退出位置
+或执行死区不兼容时预期有限停车失败，不盲恢复。噪声/振荡/过冲反馈、反向/无响应 odom、
+虚假 odom 完成均有失败路径测试；它们不替代真实动力学验证。
+
+**实机验收需要另行授权**：先仅观察核验 ID/尺寸、完整外参、两个独立中心误差、光学距离；
+后方及桩内净空可控、有人持急停时分别验单步后退/横移/转向及 odom 比例；最后完整走停，
+记录正常小码退出深度、墙码新鲜度、0.50m 停车误差与独立阻尼/电流反馈。
+`docking.launch.py` 有清杀旧相机/检测进程的历史副作用，**不要为了测试参数而执行 launch_setup**。
+本自动化测试不证明实际制动距离、侧移死区、地面打滑或充电触点可靠性。
+
+### 6.6 搜索参数 (search.*)
 
 ```yaml
 search.angular_speed: 0.3             # rad/s — 每步旋转速度
@@ -749,12 +952,16 @@ search.timeout_sec: 60.0              # 整体搜索超时
 # search.rotate_time_sec 已弃用 (角度步进化后不再读取)
 ```
 
-### 6.6 容差 / 安全 / 超时
+### 6.7 容差 / 安全 / 超时
 
 ```yaml
 tolerance.position_m: 0.05            # m — 前后/横向 ±5cm 视为到位
 tolerance.yaw_deg: 10.0               # deg — 方位 ±10° 视为对准
-tolerance.stable_time_sec: 1.0        # s — 稳定持续此时长才判 DOCKED
+tolerance.stable_time_sec: 1.0        # s — 已弃用 (FINAL_SERVO 改为到位即 DOCKED, 不再累积稳定)
+# final_servo 到位确认: stop-and-go 把车停在目标距离后只判距离+方位,
+# 单帧就 DOCKED (见 §4.3 FINAL_SERVO)。
+final_servo.distance: 0.20            # m — 距目标此值内转入 FINAL_SERVO
+final_servo.yaw_tol_deg: 15.0         # deg — 到位即 DOCKED 的方位门槛 (直行到位后不再追角)
 
 safety.minimum_distance_m: 0.15       # m — 距 tag 更近直接判 DOCKED, 防碰撞
 timeout_sec: 180.0                    # 全局停泊超时 (静止站立每停 +1.5-2.5s, 120→180)
@@ -763,7 +970,7 @@ final_servo_timeout_sec: 30.0         # FINAL_SERVO 阶段超时
 # final_servo.max_linear_speed / max_yaw_speed: 遗留, 走停式下未使用
 ```
 
-### 6.7 重试与泊出 (retry.* / undock.*)
+### 6.8 重试与泊出 (retry.* / undock.*)
 
 ```yaml
 retry.max_retries: 2                  # 失败自动倒车重试次数 (仅直行对准失败会触发)
@@ -778,7 +985,7 @@ undock.angular_rate: 0.3              # rad/s — 泊出转向速度
 undock.timeout_sec: 30.0              # 泊出超时
 ```
 
-### 6.8 相机与话题
+### 6.9 相机与话题
 
 ```yaml
 camera.max_latency_ms: 150            # ms — 位姿时效窗口下限
@@ -877,10 +1084,10 @@ python3 scripts/calibrate_rtsp --url rtsp://...   # RTSP 模式 (纯 ssh 无 GUI
 | `TF lookup failed` / TF 查不到 | 坐标系链路断 | 检查 `base_link → 相机光学系 → tag` 链路；ROS 相机模式依赖机器人 URDF，RTSP 模式由 rtsp_camera 发静态 TF（`mount.*` 参数） |
 | 有检测但 TF 查询全失败（TF 树无 tag 帧） | apriltag_ros 3.4.0+（上游 ROS2 重写，节点名 `/apriltag`）参数为嵌套 `tag.ids`/`tag.frames`/`tag.sizes` 且无 `publish_tf`（TF 无条件发布），旧 fork 为扁平 `tag_ids`/`tag_frames`/`publish_tf`；传错的一套被静默忽略 → tag 不在配置里 → 不解算位姿、不广播 TF | launch/脚本已两套同传兼容两代版本；`ros2 param list /apriltag` 核对参数是否生效，`ros2 run tf2_ros tf2_echo camera_color_optical_frame tag36h11:0` 验证 TF |
 | 转向后丢 tag 回 SEARCH_TAG | 转太快出 FOV / settle 太短 | 减小 `stopgo.max_turn_step` 或 `jog_angular_rate`；加大 `stopgo.turn_settle_sec` |
-| 直行失败报导航失败（自动重试） | 进入直行距离时方位误差 > 门槛 | 看"直行失败"日志里的方位误差；阶段 1 对准不足可收紧 `stopgo.yaw_threshold_deg`，或放宽 `final_straight.yaw_threshold_deg` |
+| 直行失败报导航失败（自动重试） | 进入直行距离时方位 > `final_straight.yaw_threshold_deg` 或 \|横向\| > `final_straight.entry_lateral_m` | 看"直行失败"日志里的方位/横向误差；近场修正门槛已与入口包络同步（`tighten_distance`），仍不足可收紧 `entry_lateral_m`/`yaw_threshold_deg`，或放宽入口门槛 |
 | 重试耗尽落 MOTION_FAILED | 多次直行失败 / 倒车时里程计不走 | 看日志定位具体原因；检查底盘是否响应 `/cmd_vel`、里程计话题是否正确 |
 | 停泊位置系统性偏前/偏后 | `tag.size` 不对 / 相机内参不准 | `test_apriltag --known-distance` 验证实测距离，重标定 |
-| 停泊位置横向偏 | 相机安装 TF（`mount.*`/URDF）不准 | RTSP 模式校准 `camera_mount_y`；差速车检查 URDF 相机外参 |
+| 停泊位置横向偏 | 相机安装 TF（`mount.*`/URDF）不准 / 相机光学中心偏离底盘中心线 | RTSP 模式校准 `camera_mount_y`；若量测 lat 系统性偏小且近侧腿撞桩，设 `camera.lateral_offset_m` 补偿（+ = 相机偏左） |
 | 转角/直行不准（车没走够量） | 里程计漂移或打滑 | `test_turn_angle` / `test_jog_distance` 实测误差；降速率 |
 | 停靠后机器人"锁死"无法遥控 | 旧版本持续发布零速 | 已修复：静默态刹车 0.3s 后释放 `/cmd_vel`（底盘看门狗接管停止） |
 
@@ -1009,8 +1216,8 @@ odom → base_link → 相机光学系(image header.frame_id) → tag36h11:0
 ```
 
 - `apriltag_ros` 的 `publish_tf` 必须为 `true`（launch 已默认设置）
-- TF 父系取**图像 header 的 frame_id**（即相机光学系），与 `camera_frame`
-  参数无关（该参数仅信息用途）；关键是该光学系到 `base_link` 有静态 TF——
+- TF 父系取**图像 header 的 frame_id**（即相机光学系）；双码模式必须将
+  `camera_frame` 配为该标定光学系，并提供到 `base_frame` 的完整可信静态 TF。
   ROS 相机模式来自机器人 URDF/robot_state_publisher，RTSP 模式由
   `rtsp_camera` 按 `mount.*` 安装参数发布
 - `measure_frame` 为空（默认）时用 `base_frame`（REP-103，x=前 y=左）查询；
@@ -1018,7 +1225,10 @@ odom → base_link → 相机光学系(image header.frame_id) → tag36h11:0
 
 ### 9.3 视觉延迟与自适应时效窗口
 
-- 位姿时效窗口是**自适应**的：`max(camera.max_latency_ms=150ms, 实测检测
+- 双码模式不使用下述单码自适应时效放行：始终检查 `dual.fresh_sec`、检测/TF
+  时间一致性和停稳后至少三帧；锁向运动期间仍独立监视墙码。上游时间戳必须
+  真实代表采集时间，RTSP 到达时间戳无法证明画面年龄，需另行实测延迟。
+- 单码位姿时效窗口是**自适应**的：`max(camera.max_latency_ms=150ms, 实测检测
   间隔 × latency_interval_margin=3.0)`——按相机真实帧率自调（6Hz→约 500ms，
   30Hz→150ms 下限），容忍偶发丢帧
 - 走停式架构对**传输延迟**（如 RTSP 的 0.1~0.5s）天然容忍：机动后 settle
@@ -1054,7 +1264,8 @@ odom → base_link → 相机光学系(image header.frame_id) → tag36h11:0
 - 控制循环: **20 Hz** (50ms 周期)
 - 相机检测频率: **≥ 2 Hz 即可完成停泊**（走停式逐帧规划），建议 ≥ 6Hz；
   apriltag_ros 在 CPU 上约 6~30 Hz（取决于分辨率）
-- **视觉延迟无严格要求**：走停式在停稳后才测量，延迟被 settle 窗口吸收
+- **视觉延迟必须有界且可验证**：settle 不能修复旧画面伪装成新时间戳；双码
+  默认新鲜窗口 0.6s，过期帧不放行，TF 迟到则丢弃该帧并等下一帧。
 - 里程计质量比相机帧率更关键——所有盲动（含泊出/重试倒车）全靠它闭环
 
 ### 9.7 构建说明

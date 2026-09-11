@@ -8,10 +8,12 @@ docking.launch.py (camera_info_bridge 相机路径或回放 /detections) 时, �
 
 镜像真桥的契约 (zsibot_l1_control_node.cpp):
   ~/static_stand (Trigger)  → posture=static_stand, motion_enabled=false (锁定)
+  ~/lie_down    (Trigger)   → posture=not_standing, motion_enabled=false (趴下/匍匐, CMD_SIT_DOWN)
+  ~/passive     (Trigger)   → posture=not_standing, motion_enabled=false (阻尼泄力, CMD_EMERGENCY_STOP)
   ~/stand_up    (Trigger)   → posture=standing,     motion_enabled=true  (滞后 unlock_lag_sec)
   ~/posture_state (String, transient local)  → static_stand/standing/not_standing
   ~/motion_enabled (Bool,  transient local)  → cmd_vel 门控本身
-  /cmd_vel 门控: 锁定时拒绝非零指令 (零指令静默丢弃, 与真桥一致)
+  /cmd_vel 门控: 非站立态 (锁定/趴下/阻尼) 拒绝非零指令 (零指令静默丢弃, 与真桥一致)
 
 参数:
   ack_delay_sec    服务受理 → 状态翻转的延迟 (默认 0.15)
@@ -25,7 +27,8 @@ docking.launch.py (camera_info_bridge 相机路径或回放 /detections) 时, �
 用法:
   ros2 run tagdocking mock_l1w_control            # 或 python3 scripts/mock_l1w_control
   # 断言看日志: [MOCK] STATIC_STAND #N / STAND_UP #N 每停/每次起步恰一次;
-  # 锁定窗内出现非零 cmd_vel 会打 [MOCK] !!! VIOLATION。
+  # 停泊成功后 LI_DOWN #1 → PASSIVE #1 (充电收尾); 门控窗内出现非零
+  # cmd_vel 会打 [MOCK] !!! VIOLATION。
 """
 
 import math
@@ -61,12 +64,16 @@ class MockL1wControl(Node):
         self._odom_pub = self.create_publisher(Odometry, self._odom_topic, 10)
 
         self.create_service(Trigger, 'static_stand', self._on_static_stand)
+        self.create_service(Trigger, 'lie_down', self._on_lie_down)
+        self.create_service(Trigger, 'passive', self._on_passive)
         self.create_service(Trigger, 'stand_up', self._on_stand_up)
         self.create_subscription(Twist, '/cmd_vel', self._on_cmd_vel, 10)
 
         self._lock = threading.Lock()
         self._pending = None            # (apply_at_ns, target_state) 或 None
         self._static_stand_calls = 0
+        self._lie_down_calls = 0
+        self._passive_calls = 0
         self._stand_up_calls = 0
         self._last_cmd = None           # 上一帧 cmd_vel (零抑制判定)
         self._x = self._y = self._yaw = 0.0
@@ -93,6 +100,30 @@ class MockL1wControl(Node):
         with self._lock:
             self._pending = (self.now_ns() + int(self._ack_delay * 1e9),
                              'static_stand')
+        return response
+
+    def _on_lie_down(self, request, response):
+        """趴下/匍匐 (CMD_SIT_DOWN): 无正回传语义 — posture→not_standing,
+        cmd_vel 门控关。充电收尾第二步, 坐到桩上。"""
+        self._lie_down_calls += 1
+        self.get_logger().info(f'[MOCK] LIE_DOWN #{self._lie_down_calls}')
+        response.success = True
+        response.message = 'mock lie_down'
+        with self._lock:
+            self._pending = (self.now_ns() + int(self._ack_delay * 1e9),
+                             'not_standing')
+        return response
+
+    def _on_passive(self, request, response):
+        """阻尼泄力 (CMD_EMERGENCY_STOP): 无正回传语义 — posture→not_standing,
+        cmd_vel 门控关。充电收尾第三步, 电机泄力保电。"""
+        self._passive_calls += 1
+        self.get_logger().info(f'[MOCK] PASSIVE #{self._passive_calls}')
+        response.success = True
+        response.message = 'mock passive'
+        with self._lock:
+            self._pending = (self.now_ns() + int(self._ack_delay * 1e9),
+                             'not_standing')
         return response
 
     def _on_stand_up(self, request, response):
@@ -126,16 +157,18 @@ class MockL1wControl(Node):
     # ── 门控 + 里程计积分 ─────────────────────────────────────────
 
     def _on_cmd_vel(self, msg: Twist):
-        locked = (self._state == 'static_stand')
+        # 门控语义与真桥一致: 仅站立 (motion_enabled=True) 时放行,
+        # 锁定/趴下/阻尼态均拒绝。
+        gated = (self._state != 'standing')
         nonzero = (abs(msg.linear.x) > 1e-3 or abs(msg.linear.y) > 1e-3
                    or abs(msg.angular.z) > 1e-3)
-        if locked and nonzero:
+        if gated and nonzero:
             self.get_logger().error(
-                f'[MOCK] !!! VIOLATION: 锁定窗内收到非零 cmd_vel '
-                f'(vx={msg.linear.x:+.3f} vy={msg.linear.y:+.3f} '
-                f'wz={msg.angular.z:+.3f})')
+                f'[MOCK] !!! VIOLATION: 门控窗内收到非零 cmd_vel '
+                f'(posture={self._state} vx={msg.linear.x:+.3f} '
+                f'vy={msg.linear.y:+.3f} wz={msg.angular.z:+.3f})')
             return
-        if locked:
+        if gated:
             # 零指令: 真桥静默丢弃 (零+零抑制), 不打印避免刷屏
             self._last_cmd = msg
             return
@@ -151,7 +184,7 @@ class MockL1wControl(Node):
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = 'odom'
         msg.child_frame_id = 'base_link'
-        if self._last_cmd is not None and self._state != 'static_stand':
+        if self._last_cmd is not None and self._state == 'standing':
             dt = 1.0 / 30.0
             vx, vy, wz = (self._last_cmd.linear.x, self._last_cmd.linear.y,
                           self._last_cmd.angular.z)
@@ -188,6 +221,7 @@ def main(args=None):
     finally:
         node.get_logger().info(
             f'[MOCK] 统计: static_stand×{node._static_stand_calls} '
+            f'lie_down×{node._lie_down_calls} passive×{node._passive_calls} '
             f'stand_up×{node._stand_up_calls}')
         node.destroy_node()
         if rclpy.ok():

@@ -18,12 +18,14 @@ import signal
 import statistics
 import subprocess
 import sys
+import threading
 import time
 from collections import deque
 
 import rclpy
 from rclpy.node import Node
-from rclpy.executors import ExternalShutdownException
+from rclpy.executors import ExternalShutdownException, SingleThreadedExecutor
+from rclpy._rclpy_pybind11 import RCLError
 from apriltag_msgs.msg import AprilTagDetectionArray
 import tf2_ros
 
@@ -94,9 +96,18 @@ class TestApriltag(Node):
         self._tag_frame = f'tag{tag_family}:{self._tag_id}'
         src = self._measure_frame or self._base_frame
 
-        # TF2
+        # TF2 — 专用接收节点 + 独立线程, 与主执行器隔离。
+        # 原因: 机器上 Nav2/odin 栈在 /tf 有 ~800Hz 洪水, 监听器 depth-100
+        # 队列 0.12s 灌满。若 TF 接收与检测回调共用主执行器, 检测回调里的
+        # lookup 一旦忙等 (查不到就阻塞), 执行器被占满 → /tf 队列永远满溢 →
+        # tag TF 被 DDS 挡在门外 → lookup 继续失败 → 死锁。表现为
+        # "已检测到 Tag N 次, 但 TF 查询失败 N 次", 而 ros2 topic echo
+        # 却能看到 tag TF (echo 自成进程, 执行器不被占用)。
+        self._tf_node = Node('test_apriltag_tf_receiver')
         self._tf_buffer = tf2_ros.Buffer()
-        self._tf_listener = tf2_ros.TransformListener(self._tf_buffer, self)
+        self._tf_listener = tf2_ros.TransformListener(self._tf_buffer, self._tf_node)
+        self._tf_spin = threading.Thread(target=self._spin_tf, daemon=True)
+        self._tf_spin.start()
 
         # 订阅 /detections
         self._det_sub = self.create_subscription(
@@ -135,6 +146,20 @@ class TestApriltag(Node):
         print()
         print('  把 Tag 放到相机前即可。按 Ctrl+C 退出。')
         print()
+
+    def _spin_tf(self):
+        """TF 接收线程: 退出/关闭时的异常就地吞掉, 不刷线程回溯。
+
+        必须用专用执行器: Humble 的 rclpy.spin() 不传 executor 时用的是
+        全局单例, 与主线程的 rclpy.spin(node) 撞同一个执行器会报
+        "generator already executing"。
+        """
+        try:
+            executor = SingleThreadedExecutor()
+            executor.add_node(self._tf_node)
+            executor.spin()
+        except Exception:
+            pass
 
     def _p(self, name):
         return self.get_parameter(name).value
@@ -198,7 +223,10 @@ class TestApriltag(Node):
             t = self._tf_buffer.lookup_transform(
                 src_frame, self._tag_frame,
                 rclpy.time.Time(seconds=0),
-                rclpy.duration.Duration(seconds=0.1))
+                rclpy.duration.Duration(seconds=0))
+            # timeout=0 (非阻塞): 查不到立刻返回, 不在检测回调里忙等。
+            # 否则 15fps 检测 × 0.1s 忙等 = 执行器 150% 过载; TF 接收已在
+            # 专用线程, 这里无需等待, 启动头几拍的失败由下方 _tf_seen_ok 吸收。
         except (tf2_ros.LookupException, tf2_ros.ConnectivityException,
                 tf2_ros.ExtrapolationException):
             self._tf_fails += 1
@@ -518,7 +546,7 @@ def main(args=None):
 
     try:
         rclpy.spin(node)
-    except (KeyboardInterrupt, ExternalShutdownException):
+    except (KeyboardInterrupt, ExternalShutdownException, RCLError):
         pass
     finally:
         # 先杀 apriltag_node, 再收拾 rclpy:
@@ -527,6 +555,7 @@ def main(args=None):
         # 抛 RCLError —— 如果先调 shutdown, 异常会跳过子进程清理, 造成泄漏
         _kill_apriltag_node(apriltag_proc)
         node.destroy_node()
+        node._tf_node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
         print('  已退出。')
