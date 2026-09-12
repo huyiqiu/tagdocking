@@ -298,3 +298,60 @@ def test_wall_margin_report_is_wall_only_and_degrades_readably():
     assert c.wall_margin_report() == 'wall_margins=<无最后位姿>'
     c.camera = None
     assert c.wall_margin_report() == 'wall_margins=<无 CameraInfo>'
+
+
+# ── 桩码垂直离场放行: 横向容差与严格对准门解耦 ──────────────────────────
+# 现场 2026-09-12: e=-22mm 超严格门槛(0.02) 2mm → aligned 判 False → 每帧清零
+# 直行承诺 → 放行链断 → 桩码压到画面底边(4px)时 18 候选全灭、后退脱困。
+# 修复: 放行用专用容差 dual.exit_lateral_tolerance_m(默认 0.04, 只松横向)。
+
+def _exit_scene(pile_x=0.015, pile_y=1.35):
+    """现场形态的假相机标定位姿。y 与 px 各管一边, 互不干扰:
+    y=1.35 → 桩码底边 B=7px (<required 10px), 左右边 784px 宽裕;
+    px=0.015 → e=-30mm (严格门外, 放行容差内), bearing/theta 0.95° 均合格。
+    """
+    from tagdocking.geometry_planner import ActionPlan
+    c = controller()
+    c.stage = 'approach'
+    c.wall, c.pile = (0.0, -0.2, 1.8), (pile_x, pile_y, 0.9)
+    c.stamp = int(10e9)
+    c.committed_ns = c.stamp          # 航向证据来源②: 直行承诺已武装
+    return c, ActionPlan(kind='forward', jog_distance=0.10)
+
+
+def test_exit_waiver_uses_relaxed_lateral_tolerance():
+    c, forward = _exit_scene()
+    bearings, theta, e, _ = c.metrics(c.wall, c.pile)
+    assert 0.02 < abs(e) <= 0.04                      # 严格门外, 放行容差内
+    assert all(abs(b) <= c.tol for b in bearings) and abs(theta) <= c.tol
+    assert not c.aligned(c.wall, c.pile)              # 严格尺子: 不对准
+    assert c.aligned(c.wall, c.pile, c.p('exit_lateral_tolerance_m'))
+    ok, margins = c.visible(forward, full=True)
+    assert ok, margins                                # 底边破被宽恕, 左右边仍把关
+    report = c.exit_report()
+    assert '桩码垂直离场=放行' in report
+    # (缺项标签的如实性由下面 2(b) 钉: 只有缺项时报告才打印标签)
+
+
+def test_exit_waiver_still_demands_heading_and_tolerance():
+    # (a) 没有航向证据 → 即使 e 在放宽容差内也不放行 (绝不按未验证航向盲走)
+    c, forward = _exit_scene()
+    c.committed_ns = 0
+    ok, _ = c.visible(forward, full=True)
+    assert not ok
+    assert '缺 航向有证据' in c.exit_report()
+    # (b) e 超出放宽容差 (px=0.05 → e=-100mm) → 有航向证据也拦
+    c2, forward2 = _exit_scene(pile_x=0.05)
+    assert abs(c2.metrics(c2.wall, c2.pile)[2]) > 0.04
+    ok, _ = c2.visible(forward2, full=True)
+    assert not ok
+    assert '对准(横向≤4cm)' in c2.exit_report().split('缺 ')[1]
+
+
+def test_strict_alignment_gate_unchanged():
+    """observe→approach 的质量门没有被顺手放宽: e=-30mm 仍清零持住与承诺。"""
+    c, _ = _exit_scene()
+    assert not c.aligned(c.wall, c.pile)              # 无参默认仍是严格尺子
+    c.observe(int(11e9), int(11e9), c.wall, c.pile)
+    assert c.hold_ns == 0                             # 持住窗不攒
+    assert c.committed_ns == 0 and c.qualified_ns == 0  # 承诺照旧清零

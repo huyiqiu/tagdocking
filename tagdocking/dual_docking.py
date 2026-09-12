@@ -63,6 +63,11 @@ DEFAULTS = {
     'posture_retries': 2,
     'max_actions': 160, 'stable_position_m': 0.03,
     'min_lateral_m': 0.003, 'lateral_tolerance_m': 0.02,
+    # 桩码垂直离场放行专用的横向对准容差 (只松横向, bearing/theta 仍按严格门)。
+    # 现场教训: e=22mm 超严格门槛 2mm → aligned 判 False → 每帧清零直行承诺
+    # → 放行链断 → 桩码压到画面底边(4px)时 18 候选全灭、后退脱困。上限 0.04
+    # 不再宽: 直行段横偏按 0.38 收缩到接触点, 40mm×0.38≈15mm < dock_tolerance。
+    'exit_lateral_tolerance_m': 0.04,
     'observe_timeout_sec': 120.0, 'camera_wait_sec': 5.0,
     'visibility_margin_px': 8.0, 'visibility_sample_pad_px': 2.0,
     'visibility_samples': 12, 'score_improvement': 0.002,
@@ -435,7 +440,9 @@ class DualTagDocking:
         return geometry(self.wall if wall is None else wall,
                         self.pile if pile is None else pile, self.r, self.t, self.tol)
 
-    def aligned(self, wall, pile):
+    def aligned(self, wall, pile, lateral_tol=None):
+        """对准判据。lateral_tol=None 用严格门槛 dual.lateral_tolerance_m;
+        桩码垂直离场放行传 dual.exit_lateral_tolerance_m (稍宽, 只松横向)。"""
         if self.r is None or wall is None or pile is None:
             return False
         try:
@@ -450,7 +457,8 @@ class DualTagDocking:
             # 没有松成摆设; 平行横偏由 e 门独立把守。
             return (all(abs(b) <= self.tol for b in bearings)
                     and abs(theta) <= self.tol
-                    and abs(e) <= self.p('lateral_tolerance_m'))
+                    and abs(e) <= (self.p('lateral_tolerance_m') if lateral_tol is None
+                                   else lateral_tol))
         except ValueError:
             return False
 
@@ -626,7 +634,8 @@ class DualTagDocking:
                       and plan.jog_distance > 0
                       and not plan.lateral_distance and not plan.turn_angle
                       and (self.wall[2] <= self.steering_stop
-                           or self.aligned(self.wall, self.pile)))
+                           or self.aligned(self.wall, self.pile,
+                                           self.p('exit_lateral_tolerance_m'))))
         margins = [float('inf')]*4
         required = self.required_margin
         ok = True
@@ -709,13 +718,16 @@ class DualTagDocking:
         里余量一路掉到 +8px 然后三窗判死, 而当时缺的其实是放行 (bearing 1°、
         J 0.03, 直行就能成)。四条前提逐条打出来, 下一次一眼就能看到是哪条。
         """
+        exit_tol = self.p('exit_lateral_tolerance_m')
         checks = (('stage=approach', self.stage == 'approach'),
                   ('航向有证据', bool(self.heading_committed)),
                   (f'z<=直行包络{self.straight_envelope:.2f}m',
                    self.wall is not None and self.wall[2] <= self.straight_envelope),
                   # 纯直行区内这一条自动成立 (航向已被策略冻结, 见 visible)。
-                  (f'两码对准或z<=纯直行{self.steering_stop:.2f}m',
-                   self.aligned(self.wall, self.pile)
+                  # 标签里的容差必须与 allow_exit 真实用的那把尺子一字不差 ——
+                  # 本报告是现场"为什么前进被否"的唯一答案。
+                  (f'对准(横向≤{exit_tol*100:.0f}cm)或z<=纯直行{self.steering_stop:.2f}m',
+                   self.aligned(self.wall, self.pile, exit_tol)
                    or (self.wall is not None and self.wall[2] <= self.steering_stop)))
         bad = [name for name, ok in checks if not ok]
         return '桩码垂直离场=' + ('放行' if not bad else '不放行(缺 '+'/'.join(bad)+')')

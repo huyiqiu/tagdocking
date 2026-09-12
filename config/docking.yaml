@@ -363,6 +363,14 @@ docking_node:
     dual.projection_mode: "raw"              # explicit: raw K+D or rectified P; remapping does NOT rectify
     dual.min_lateral_m: 0.003
     dual.lateral_tolerance_m: 0.02
+    dual.exit_lateral_tolerance_m: 0.04
+    # 桩码垂直离场放行专用的横向对准容差 (独立于上面 aligned() 严格门槛 0.02,
+    # 只松横向; bearing/theta 仍按严格门)。现场教训: e=22mm 超严格门槛 2mm →
+    # aligned 判 False → 每帧清零直行承诺 → 放行链断 → 桩码压到画面底边(4px)
+    # 时 18 候选全灭、后退脱困。上限 0.04 不再宽: 直行段横偏按 0.38 收缩到接触
+    # 点, 40mm×0.38≈15mm < dock_tolerance 20mm。bearing/theta 不放宽 —— 航向是
+    # 放行的核心证据, 且直行区内航向被冻结不会自愈; 横向每停归零、几何上必然
+    # 收缩, 两者本质不同。
     dual.observe_timeout_sec: 120.0
     dual.camera_wait_sec: 5.0
     dual.visibility_margin_px: 8.0

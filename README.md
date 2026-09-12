@@ -1438,7 +1438,7 @@ python3 scripts/calibrate_rtsp --url rtsp://...   # RTSP 模式 (纯 ssh 无 GUI
 | 区内仍在 10cm 走停、拿不到一次停到位 | 整段连续直行被 `visible()` 否掉，静默退化成 `forward_step` 逐步走 | 看该窗口日志里的 `min_margin`：整段长跑会把墙码推到画面边缘，余量见底就会被否。抬 `observation_distance` 或相机下俯增加余量；`dual.visibility_margin_px` 只买到 ~2mm，是最后手段。退化路径本身是安全的（每停重测 + bearing 微调仍在工作），但拿不到 `continuous` 的航向保持 |
 | 双码近场摆头/角速度段数 >10 | 航向保持抖振（迟滞带偏窄或底盘报告滞后偏大） | `heading_hold_engage_deg`→2.5、`heading_hold_release_deg`→0.5 拉宽迟滞带，或 `heading_hold_cooldown_sec`→0.45 |
 | `dual visual correction no progress / oscillation` 中止 | 两条判据之一触发，失败串已写明是哪条 | **连败判据**（连续 N 步每步改善都 < 门槛）→ 指令根本没起作用：查 `/cmd_vel` 有没有发出去、底盘响不响应、里程计标定。**窗口判据**（N 步净改善 < 门槛，单步可以很好）→ 振荡，两个通道在互相破坏：读 `dual visual feedback` 那行的 theta/e 分解，看是哪一项与预测背离；若 e 与预测相符而 theta 大幅变差，再看那一步的 `Δyaw` —— 横移步打出 `(寄生!)` 就是底盘在横移中带出了转动，见下一行 |
-| `no visible translation candidate; independent stable-window budget exhausted` | 前进被 `visible()` 否掉，三个独立稳定窗口耗尽 | 先读同一行尾部的**两段**余量：`wall/pile L/R/T/B` 是**当前位姿**的，`被否的一步 … 预测路径最坏 L/R/T/B … 破的是 X 边` 才是**被否那一步**的 —— 前者宽裕后者破了是正常的，只看前者会以为自相矛盾。再看 `桩码垂直离场=不放行(缺 …)`：缺 `stage=approach`/`z<=直行包络` 且墙距只差几十 mm，就是"要进窗才能进窗"的死锁（见 §6.5b）；此时日志里应当先出现 `dual 前进收缩 …cm → …cm`，没出现说明阶梯没生效。若打的是 `前进收缩阶梯全否 … 不是步长的问题`，那就别再调 `dual.forward_step` —— 去查相机外参/`visibility_margin_px`/桩码是否真的该被免检 |
+| `no visible translation candidate; independent stable-window budget exhausted` | 前进被 `visible()` 否掉，三个独立稳定窗口耗尽 | 先读同一行尾部的**两段**余量：`wall/pile L/R/T/B` 是**当前位姿**的，`被否的一步 … 预测路径最坏 L/R/T/B … 破的是 X 边` 才是**被否那一步**的 —— 前者宽裕后者破了是正常的，只看前者会以为自相矛盾。再看 `桩码垂直离场=不放行(缺 …)`：缺 `stage=approach`/`z<=直行包络` 且墙距只差几十 mm，就是"要进窗才能进窗"的死锁（见 §6.5b）；缺 `对准(横向≤…cm)` 时先看括号里的容差是不是放行专用的 `dual.exit_lateral_tolerance_m`（0.04，比严格门槛 0.02 宽）——e 卡在 0.02~0.04 之间本应放行直行，还拦就是航向证据或 bearing 没过；此时日志里应当先出现 `dual 前进收缩 …cm → …cm`，没出现说明阶梯没生效。若打的是 `前进收缩阶梯全否 … 不是步长的问题`，那就别再调 `dual.forward_step` —— 去查相机外参/`visibility_margin_px`/桩码是否真的该被免检 |
 | 横移步 `Δyaw` 打出 `(寄生! 平移步不该转)` | 底盘执行横移时带出转动（步态耦合，omni 腿式常见） | 单次 >1° 就足以吃掉那一步的修正收益（0.5×sin1°=8.7mm，`dock_tolerance` 才 20mm），累起来会触发窗口判据。先用 `ros2 topic echo /cmd_vel --field angular.z` 确认这段 wz 确实是 0（是 0 = 底盘自己转的，不是我们发的）；再减小 `dual.lateral_step` —— 它按比例缩整个候选菜单（`cap / cap÷2 / cap÷4`），单步横移短了带出的寄生角也小。**注意 `dual.min_lateral_m` 不是这个旋钮**：它只是菜单下限，抬高它只删掉低于门槛的小候选，中段候选照选不误；yaw 与 lateral 是各自独立枚举、最后按 J 一起排序，没有"通道优先级"可调 |
 | 转角/直行不准（车没走够量） | 里程计漂移或打滑 | `test_turn_angle` / `test_jog_distance` 实测误差；降速率 |
 | 停靠后机器人"锁死"无法遥控 | 旧版本持续发布零速 | 已修复：静默态刹车 0.3s 后释放 `/cmd_vel`（底盘看门狗接管停止） |
@@ -1761,6 +1761,7 @@ ros2 param get  /docking_node stopgo.heading_hold_budget_deg
 | `dual.lateral_step` | 0.05 | 横移候选菜单的**刻度尺**（m）：菜单是 `cap / cap÷2 / cap÷4 / 残差 / 下限`，调它等于整体缩放。底盘横移带出寄生 yaw 时，调小的是这个 |
 | `dual.min_lateral_m` | 0.003 | 横移候选的**下限**（m）：比它短的候选直接删掉。⚠ 它不是"优先走 yaw 通道"的旋钮 —— 抬高只删小候选，中段照选不误 |
 | `dual.lateral_tolerance_m` | 0.02 | 横偏容差（m），进到此内就不再横移 |
+| `dual.exit_lateral_tolerance_m` | 0.04 | **桩码垂直离场放行专用**的横向对准容差（m），独立于上一行的严格门槛，只松横向（bearing/theta 仍按严格门）。现场教训：e=22mm 超严格门槛 2mm → aligned 判 False → 每帧清零直行承诺 → 放行链断 → 桩码压到画面底边时 18 候选全灭、后退脱困。上限 0.04 不再宽：直行段横偏按 0.38 收缩到接触点，40mm×0.38≈15mm < dock 容差 20mm |
 | `dual.yaw_step_deg` | 8.0 | 远场（z > 1.70）单步转向上限（°） |
 | `dual.yaw_fine_step_deg` | 3.0 | 近场（z ≤ 1.70）单步转向上限（°）。⚠ 3° 在远场是灾难：底盘停止滞后 ~2° 与命令同量级，提前量钳位会让每步只转一半 |
 | `dual.straight_yaw_tol_deg` | 1.5 | 区外 bearing 微调门槛（°），小于它只直行 |
