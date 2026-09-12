@@ -1189,9 +1189,22 @@ class DockingNode(Node):
                     hold_note = ''
                     if self._executor.jog_hold_spent:
                         hold_note = ' [预算耗尽/yaw 不可信 → 本程后段纯直行]'
+                    plan = self._dual_watch.plan
+                    dyaw = math.degrees(self._executor.jog_yaw_error)
+                    if plan.kind == 'yaw':
+                        # 实转 vs 指令: 盲转的欠转/过冲直接可读。
+                        yaw_note = (f'Δyaw={dyaw:+.2f}deg'
+                                    f'(指令{math.degrees(plan.turn_angle):+.2f}deg)')
+                    else:
+                        # 平移步没人命令它转 —— 这里量到的 yaw 全是寄生的。
+                        # 1° 起报: 0.5×sin(1°)=8.7mm 已是 dock_tolerance(20mm)
+                        # 的一半, 再大就足以单独把一步修正的收益吃光。
+                        yaw_note = f'Δyaw={dyaw:+.2f}deg'
+                        if abs(dyaw) >= 1.0:
+                            yaw_note += '(寄生! 平移步不该转, 下一轮 J 的 theta 项会变差)'
                     self.get_logger().info(
                         f'dual action COMPLETE signed_odom={self._dual_watch.signed:+.6f} '
-                        f'Δyaw={math.degrees(self._executor.jog_yaw_error):+.2f}deg '
+                        f'{yaw_note} '
                         f'航向保持已用={math.degrees(self._executor.jog_hold_used):.2f}deg'
                         f'{hold_note}; awaiting settled visual feedback')
 
@@ -2167,6 +2180,15 @@ class DockingNode(Node):
         或断开门槛比接通还松), 这里 warn 后关闭保持而不是 raise: 参数配错
         不该让一场本可成功的停泊崩掉 —— 同 _locked_bearing "把锦上添花的
         微调变成整场健康直行的中止是错的交易"。
+
+        budget < 一次最短接通 (rate × min_engage) 是另一种配错, 且是**最坏
+        的那种**: 接通门里那条 "used + rate×min_engage < budget" 在 used=0
+        时就不成立, 于是一次都接不通, used 恒为 0、jog_hold_spent 也永远
+        不会被置上 —— 完成日志打出的 "航向保持已用=0.00deg" 与"漂移没到
+        门槛、本就不需要纠"**逐字相同**, 静默关掉整个功能且无法从日志分辨。
+        所以这里必须显式拦下并说清楚, 而不是让它假装开着。
+        (用抬底后的 rate 比较: start_jog 会把 rate 抬到 min_angular_rate 之上,
+        拿配置原值算门槛会算小, 守卫本身就漏。)
         """
         if not bool(self._p('stopgo.heading_hold_enable')):
             return None
@@ -2178,12 +2200,24 @@ class DockingNode(Node):
                 f'< engage({math.degrees(engage):.2f}deg) —— 本趟关闭航向保持, '
                 f'退回纯直行')
             return None
+        rate = max(abs(float(self._p('stopgo.heading_hold_rate'))),
+                   float(self._p('stopgo.min_angular_rate')))
+        min_engage = float(self._p('stopgo.heading_hold_min_engage_sec'))
+        budget = math.radians(self._p('stopgo.heading_hold_budget_deg'))
+        if budget <= rate*min_engage:
+            self.get_logger().warn(
+                f'航向保持参数无效: budget({math.degrees(budget):.2f}deg) 不足一次'
+                f'最短接通 ({math.degrees(rate*min_engage):.2f}deg = rate {rate:.2f}'
+                f'rad/s × min_engage {min_engage:.2f}s) —— 这样配一次都接不通, '
+                f'且日志与"没漂够门槛"无法分辨。本趟关闭航向保持, 退回纯直行 '
+                f'(要真开就把 budget 调到 {math.degrees(rate*min_engage)*3:.0f}deg 以上)')
+            return None
         return HeadingHold(
             rate=float(self._p('stopgo.heading_hold_rate')),
             engage=engage, release=release,
-            min_engage_ns=int(self._p('stopgo.heading_hold_min_engage_sec')*1e9),
+            min_engage_ns=int(min_engage*1e9),
             cooldown_ns=int(self._p('stopgo.heading_hold_cooldown_sec')*1e9),
-            budget=math.radians(self._p('stopgo.heading_hold_budget_deg')))
+            budget=budget)
 
     @staticmethod
     def _is_omni(base_type: str) -> bool:

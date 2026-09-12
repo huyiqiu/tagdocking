@@ -142,7 +142,10 @@ docking_node:
     stopgo.heading_hold_cooldown_sec: 0.30    # 断开后冷却 — 让下一次决策基于已沉降的 odom
     # 不是安全边界 (那由"只降 |err|"的符号规则给, 与预算无关), 是"底盘不响应
     # wz / odom yaw 疯了"的诊断闸。正常一趟需 5-10°, 定低会静默把功能关掉 ——
-    # 那是最坏的失效形态 (看起来在跑, 其实早就退回纯直行)。
+    # 那是最坏的失效形态 (看起来在跑, 其实早就退回纯直行)。代码对此设了下限守卫:
+    # budget 必须 > rate×min_engage_sec (按抬底后的 rate 算, 默认 0.12×0.15 =
+    # 1.03°), 否则一次都接不通、used 恒 0, 日志与"没漂够门槛"逐字相同 —— 配低了
+    # 会被 warn 掉并本趟退回纯直行, 不会假装开着。要真开就给到 3° 以上。
     stopgo.heading_hold_budget_deg: 15.0      # 单程累计下发角上限, 耗尽后告警 + 纯直行
     stopgo.turn_creep_linear: 0.0            # m/s — 已弃用: "边走边转"叠加前进会驶出目标横向范围; 固定纯原地转, 角度靠里程计校准 (此参数不再被读取, 保留仅为兼容)
     # 必须 > l1w_control 的 min_linear_y 死区 (0.10): 低于死区的横移指令会被
@@ -280,7 +283,6 @@ docking_node:
     # **不要拿它当"关掉区内转向"的开关** —— 它同时管着上面那条"一次连续直行"
     # 与 visible() 的 allow_exit, 调低会把一次停到位一并关掉。要更保守地限制
     # 区内转向, 调 straight_yaw_lag_deg。
-    dual.steering_stop_distance: 1.0
     dual.steering_stop_distance: 1.0
     # 单步转向上限按距离分两档 (原先写死 min(3°, yaw_step_deg), 配置是装饰):
     #   远场 (墙码光学 z > straight_start_distance) → yaw_step_deg

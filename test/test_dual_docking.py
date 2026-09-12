@@ -226,3 +226,38 @@ def test_new_misaligned_pair_revokes_qualification():
 def test_single_tag_target_unchanged():
     c = DualTagDocking(Node(**{'dual.enable': False}))
     assert c.effective_dock_distance() == .55
+
+
+def feed_corrections(c, js):
+    """按顺序喂一串"修正步的实测 J", 返回中止时的失败串 (没中止则 '')。"""
+    for before, after in zip(js, js[1:]):
+        c.feedback_pending = dict(before=((0., 0.), 0., 0., before),
+                                  after=((0., 0.), 0., 0., after),
+                                  margins=(), correction=True)
+        if not c._check_feedback(((0., 0.), 0., 0., after)):
+            return c.failure
+    return ''
+
+
+def test_feedback_failure_names_which_criterion_fired_and_shows_the_trail():
+    """'no progress / oscillation' 这两个词互为反义, 合在一条串里等于没说。
+
+    "每一步都没用"要去查指令有没有真发出去 / 底盘响不响应; "单步有用但来回
+    抵消"要去查是哪两个通道在互相破坏 —— 处置完全不同。2026-09-12 现场那次
+    中止走的是窗口支路 (三步 J 0.527→0.478→1.670→0.615, 净 -0.088), 但日志
+    只有那一句话, 是哪条判据、窗口锚点是多少, 全靠人事后手算。
+    """
+    c = controller()
+    why = feed_corrections(c, [.52703, .47788, 1.66977, .61522])
+    assert '窗口判据' in why and '连败判据' not in why
+    assert '0.52703->0.61522' in why and '-0.08819' in why, '锚点与净值要在串里'
+    assert '0.52703→0.47788→1.66977→0.61522' in why, '轨迹要能看出是来回抵消'
+    assert 'dual.feedback_min_improvement' in why, '失败串要自带门槛出处'
+
+    # 每步都平: 两条判据同时成立, 必须报更具体的那条 (连败), 否则现场会去
+    # 查振荡 —— 而这里根本没有振荡, 是一步都没动。
+    flat = feed_corrections(controller(), [.5]*4)
+    assert '连败判据' in flat and '窗口判据' not in flat
+
+    # 一路在改善就不该中止 (判据本身仍有效, 少了这句就只是在测"什么都不发生")
+    assert feed_corrections(controller(), [.9, .6, .3, .1]) == ''

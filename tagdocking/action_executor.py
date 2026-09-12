@@ -272,6 +272,7 @@ class ActionExecutor:
         self._action_linear = 0.0
         self._action_target = abs(damped)
         self._turn_base_angular = self._action_angular
+        self._jog_yaw_error = 0.0
         return True
 
     def start_jog_lateral(self, distance: float, lateral_rate: float,
@@ -296,6 +297,9 @@ class ActionExecutor:
         self._action_linear = 0.0
         self._action_angular = 0.0
         self._action_target = abs(distance) / max(odom_scale, 0.05)
+        # 上一步的读数不能漏到这一步 (完成日志在 _stop() 之后才读, 所以三个
+        # 诊断量一律清在起步而不是收尾 —— 见 _stop 的注释)。
+        self._jog_yaw_error = 0.0
 
     # ── Set odometry reference ──────────────────────────────────────
 
@@ -347,7 +351,7 @@ class ActionExecutor:
                                     now_ns)
 
         if self._action == 'lateral':
-            return self._update_lateral(odom_x, odom_y,
+            return self._update_lateral(odom_x, odom_y, odom_yaw,
                                          tag_visible, raw_dist, target_distance)
 
         if self._action == 'turning':
@@ -421,6 +425,14 @@ class ActionExecutor:
         区内禁转向的理由; ③ bearing 把横偏和航向混在一起, 追它就是 pure
         pursuit (横向控制器); ④ 这个底盘只有 IMU yaw 可信 (见 start_jog)。
         """
+        # Δyaw 先测, 再决定要不要纠 —— 测量与控制分开。这一行原先排在
+        # `h is None` 之后, 于是所有不开保持的步 (横移、区外逐步走、泊出腿)
+        # 完成日志一律打 Δyaw=+0.00deg, 与"真的没漂"逐字相同。2026-09-12
+        # 现场就栽在这里: 一步 +12.5mm 的横移把两码 bearing 同向推了 2.3°
+        # (远近两码推的量还几乎相等 = 纯转动的签名), J 的 theta 项爆掉,
+        # 而日志上那一步写着 Δyaw=+0.00deg, 查无可查。
+        if math.isfinite(oyaw):
+            self._jog_yaw_error = normalize_angle(oyaw - self._jog_start_yaw)
         h = self._jog_hold
         if h is None:
             return
@@ -431,8 +443,7 @@ class ActionExecutor:
             self._jog_hold_engaged = self._action_angular = 0.0
             self._jog_hold_spent = True
             return
-        err = normalize_angle(oyaw - self._jog_start_yaw)
-        self._jog_yaw_error = err
+        err = self._jog_yaw_error
         if abs(err) > self._HOLD_SANITY_RAD:
             self._jog_hold_engaged = self._action_angular = 0.0
             self._jog_hold_spent = True
@@ -471,10 +482,18 @@ class ActionExecutor:
             self._jog_hold_engage_ns = now_ns
         self._action_angular = self._jog_hold_engaged
 
-    def _update_lateral(self, ox, oy, tag_visible, raw_dist, target_dist) -> bool:
-        """Check lateral odometry displacement against target."""
+    def _update_lateral(self, ox, oy, oyaw, tag_visible, raw_dist, target_dist) -> bool:
+        """Check lateral odometry displacement against target.
+
+        oyaw 只用来记 Δyaw, 不参与判停: 横移步没人命令它转, 所以这里量到的
+        任何 yaw 都是寄生的 (底盘/步态带出来的)。它不该被纠 —— 纠了就是在
+        横移里混进转向 —— 但必须被**看见**: 它是 J 的 theta 项突然变差时的
+        第一嫌疑人, 而在这之前横移步的 Δyaw 从来没有被测过。
+        """
         dx = ox - self._jog_start_x
         dy = oy - self._jog_start_y
+        if math.isfinite(oyaw):
+            self._jog_yaw_error = normalize_angle(oyaw - self._jog_start_yaw)
         # Project (dx, dy) onto the lateral axis at start of action.
         # Forward = (cos_yaw, sin_yaw), lateral = (-sin_yaw, cos_yaw).
         cos_yaw = math.cos(self._jog_start_yaw)
@@ -502,6 +521,9 @@ class ActionExecutor:
         d = math.atan2(math.sin(d), math.cos(d))   # wrap per-tick delta to [-π, π]
         self._turn_accumulated += d
         self._turn_prev_yaw = odom_yaw
+        # 转向步的 Δyaw = 真转了多少 (有符号、已解卷绕)。对照日志里的指令角
+        # 就能直接读出盲转的停止滞后/欠转, 不必再去反推 bearing。
+        self._jog_yaw_error = self._turn_accumulated
         turned = abs(self._turn_accumulated)
 
         # Determine completion target: use blind cap if tag not visible

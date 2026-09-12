@@ -1148,3 +1148,150 @@ def test_straight_consistency_veto_tolerates_the_heading_hold_arc():
     assert drift(15.) == '', '15deg 偏航 (预算全用光) 被误判'
     assert drift(30.) == '', '30deg 仍在 36.9deg 判据内'
     assert 'inconsistent' in drift(45.), '45deg 横向漂移必须照抓 —— 判据本身仍有效'
+
+
+def test_delta_yaw_is_measured_on_every_step_not_only_the_held_one():
+    """Δyaw 是测量, 不是保持的副产品 —— 原先它只在 hold 不为 None 时才赋值。
+
+    后果是所有不开保持的步 (横移、区外逐步走、泊出腿) 完成日志一律打
+    Δyaw=+0.00deg, 与"真的没漂"逐字相同。2026-09-12 现场: 一步 +12.5mm 的
+    横移把远近两码 bearing 同向推了 2.3° (远近推的量还几乎相等 = 纯转动的
+    签名), 下一轮 J 的 theta 项爆掉、整程被振荡判据掐掉 —— 而那一步的日志
+    写着 Δyaw=+0.00deg。测量与控制必须分开: 平移步的寄生 yaw 不该被纠
+    (纠了就是在横移里混进转向), 但必须被看见。
+    """
+    from tagdocking.action_executor import ActionExecutor
+    ex, step = jogger(None)                       # 不开保持的直行
+    done, wz = step(math.radians(2.4))
+    assert not done and wz == 0., 'hold=None 仍必须逐位不发角速度'
+    assert ex.jog_yaw_error == pytest.approx(math.radians(2.4))
+
+    lat = ActionExecutor(min_angular_rate=.12)
+    lat.start_jog_lateral(.0125, .12)
+    lat.set_odom_ref(0., 0., 0.)
+    lat.update(0., .004, math.radians(2.3), False, None,
+               lambda: 0., lambda d: (0., 0.), 0., .15, int(10e9))
+    assert lat.angular_cmd == 0., '横移步只许看见寄生 yaw, 不许纠'
+    assert lat.jog_yaw_error == pytest.approx(math.radians(2.3))
+
+    # 上一步的读数不许漏到下一步 —— 完成日志在 _stop() 之后才读 (读的就是这个
+    # 值), 所以清必须发生在起步侧; 漏一次就会把上一步的寄生 yaw 记到这一步。
+    lat._stop()
+    assert lat.jog_yaw_error == pytest.approx(math.radians(2.3)), \
+        '_stop() 之后仍要读得到 —— 完成日志排在它后面'
+    lat.start_jog_lateral(.0125, .12)
+    assert lat.jog_yaw_error == 0.
+
+    # 转向步的 Δyaw = 真转了多少 (有符号、已解卷绕), 对照指令角即可读出欠转。
+    turn = ActionExecutor(min_angular_rate=.12, small_turn_rad=.1, turn_slow_rad=.14)
+    assert turn.start_turn(-.0349, .3, full=True)
+    turn.set_odom_ref(0., 0., 0.)
+    turn.update(0., 0., -.01, False, None, lambda: 0., lambda d: (0., 0.),
+                0., .15, int(10e9))
+    assert turn.jog_yaw_error == pytest.approx(-.01)
+
+
+def test_rejected_plan_reports_its_own_predicted_margins_not_the_current_pose():
+    """被否的一步要自带预测余量, 否则日志自相矛盾。
+
+    `margin_report()` 报的是当前位姿。规划被否时那份余量常常条条宽裕
+    (2026-09-12 现场: 最小的 pile B 还有 26px, required 才 10px), 日志读起来
+    就是"每条边都够, 却一个候选都没有"—— 真正被否的是走过去之后的余量, 而它
+    在 visible() 里算出来就被丢掉了。
+    """
+    c = controller()
+    req = c.required_margin
+    line = c._rejected_report((ActionPlan(kind='forward', jog_distance=.1),
+                               (300., 4., 120., 90.)))
+    assert '前进+0.100m' in line, '要说清被否的是哪一步'
+    assert '300/4/120/90px' in line, '四条边的预测余量要都在'
+    assert f'破的是 R 边 (4 < {req:.0f})' in line, '要点名是哪条边破的'
+    assert '横移' not in line and '转' not in line, '纯前进步不该报不存在的分量'
+
+    assert c._rejected_report(None) == '', '别的失败原因不该被强加一段空话'
+    assert '无有限包围' in c._rejected_report(
+        (ActionPlan(kind='forward', jog_distance=.1), None)), '近平面要能区分'
+    wide = c._rejected_report((ActionPlan(kind='forward', jog_distance=.1),
+                               (300., 200., 120., 90.)))
+    assert '四边都够' in wide, '四条边都够却仍被否时, 不能装作找到了原因'
+
+    # 真正接上了没有: 走一遍 _emit 的否决路径, 这一段必须出现在日志里。
+    logged = []
+    c._node.get_logger = lambda: NS(info=logged.append, warn=logged.append,
+                                    error=logged.append)
+    c.camera = CameraModel(1600, 1296, 4e4, 4e4, 800., 648.)   # 焦距拉爆 → 必出画
+    frames(c, x=.1)
+    assert c._emit(ActionPlan(kind='forward', jog_distance=.1)) is None
+    assert any('被否的一步 前进+0.100m' in m and '预测路径最坏' in m
+               for m in logged), '否决日志必须带上被否那一步自己的余量'
+
+
+def forward_probe(c, visible_below):
+    """把 visible() 换成"只有不超过 X 的前进才可见", 并记下逐档试了什么。"""
+    tried = []
+    def probe(plan, full=False):
+        tried.append(plan.jog_distance)
+        return plan.jog_distance <= visible_below, (5., 5., 5., 5.)
+    c.visible = probe
+    return tried
+
+
+def test_forward_step_shrinks_before_burning_a_window():
+    """站位步被否不该等于判死 —— 2026-09-12 那个"要进窗才能进窗"的死锁。
+
+    墙码 z=1.923m, 离观察窗上沿 1.90m 只差 23mm。站位步 0.10m 被 visible()
+    否掉, 而放行需要 stage=approach 与 z≤包络, 这两条又都只有走完这一步才
+    拿得到。此前三个窗口全花在重发同一步上; 现在逐档减半先找一条走得通的。
+    """
+    c = controller()
+    frames(c, depth=1.923)
+    tried = forward_probe(c, .04)          # 只有 ≤4cm 的前进可见
+    out = c._emit_forward(ActionPlan(kind='forward', jog_distance=.10))
+    assert out and out[0].jog_distance == pytest.approx(.025), '要退到走得通的那一档'
+    assert tried[:3] == [pytest.approx(.10), pytest.approx(.05),
+                         pytest.approx(.025)], '阶梯口径与 _correction 一致: d/d÷2/d÷4'
+    assert c.no_candidates == 0, '收缩成功不消耗窗口'
+
+    # 逐档都否: 算一个窗口 (不是每档一个), 且失败串要报最短那一档。
+    dead = controller()
+    frames(dead, depth=1.923)
+    logged = []
+    dead._node.get_logger = lambda: NS(info=logged.append, warn=logged.append,
+                                       error=logged.append)
+    forward_probe(dead, -1.)
+    assert dead._emit_forward(ActionPlan(kind='forward', jog_distance=.10)) is None
+    assert dead.no_candidates == 1, '阶梯是一次决策, 不该把三个窗口一口气烧光'
+    assert any('收缩阶梯全否' in m for m in logged), '要说清已经试到最短'
+    assert any('被否的一步 前进+0.025m' in m for m in logged), '余量要报最短那一档的'
+
+    # 下限: 比 dock_tolerance 还短的前进在终点判定里本就算"已到位", 不值得发。
+    floored = controller()
+    frames(floored, depth=1.923)
+    small = forward_probe(floored, -1.)
+    floored._emit_forward(ActionPlan(kind='forward', jog_distance=.05))
+    assert min(small) >= floored.p('dock_tolerance'), '阶梯不能无限细下去'
+
+    # 回退修剪不进阶梯: 后退让两码退回画面中心, 余量单调变好, 缩短退距不治。
+    back = controller()
+    frames(back, depth=1.923)
+    steps = forward_probe(back, -1.)
+    back._emit_forward(ActionPlan(kind='forward', jog_distance=-.10), aligned=True)
+    assert steps == [pytest.approx(-.10)], '负向步只试一次, 原样交给 _emit'
+
+
+def test_the_standoff_and_step_forward_paths_actually_go_through_the_ladder():
+    """接线检查: 阶梯写了没接上等于没写。两条前进出口各钉一遍。"""
+    # ① observe 的站位步 (2026-09-12 死在这条上)。
+    c = controller()
+    seen = []
+    c._emit_forward = lambda p, **kw: seen.append(p.jog_distance) or None
+    plan(c, frames(c, depth=1.923))
+    assert seen and seen[0] > 0, 'observe 站位步没走 _emit_forward'
+
+    # ② acquire 桩码确认丢失后的匍匐逼近 (missing_confirm_sec=1.5s 之后; 丢失
+    #    计时在每个观察窗口重置, 所以要一串连续的缺帧, 不能分两批喂)。
+    a = controller()
+    grabbed = []
+    a._emit_forward = lambda p, **kw: grabbed.append(p.jog_distance) or None
+    plan(a, frames(a, depth=1.923, missing=True, count=12))
+    assert a.stage == 'acquire' and grabbed, 'acquire 匍匐逼近没走 _emit_forward'

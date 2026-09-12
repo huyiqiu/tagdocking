@@ -1,5 +1,6 @@
 """Integration of actual method bodies with fake ROS transport; no node startup."""
 import ast
+import math
 from pathlib import Path
 from types import SimpleNamespace as NS
 
@@ -642,7 +643,9 @@ HOLD_PARAMS = {'stopgo.heading_hold_enable': True, 'stopgo.heading_hold_rate': .
                'stopgo.heading_hold_release_deg': .7,
                'stopgo.heading_hold_min_engage_sec': .15,
                'stopgo.heading_hold_cooldown_sec': .30,
-               'stopgo.heading_hold_budget_deg': 15.0}
+               'stopgo.heading_hold_budget_deg': 15.0,
+               # start_jog 的 rate 抬底基准; budget 守卫要按抬底后的 rate 算门槛。
+               'stopgo.min_angular_rate': .12}
 
 
 def hold_node(**overrides):
@@ -736,6 +739,29 @@ def test_bad_hysteresis_config_disables_the_hold_instead_of_killing_the_dock():
     zone = RealActionPlan(kind='forward', jog_distance=.45, continuous=True)
     for release in (2.0, 3.0):
         assert launched(zone, **{'stopgo.heading_hold_release_deg': release}) is None
+
+
+def test_a_budget_below_one_minimum_engagement_is_refused_not_silently_dead():
+    """budget < rate×min_engage 是最坏的一种配错, 必须显式关闭而不是假装开着。
+
+    接通门里那条 `used + rate*min_engage < budget` 在 used=0 时就不成立 ——
+    一次都接不通, used 恒 0, jog_hold_spent 也永不置上, 于是完成日志打的
+    "航向保持已用=0.00deg" 与"漂移没到门槛、本就不需要纠"逐字相同。写这个
+    功能时正是先在单测里撞到它 (原用例配 budget=1° 结果继电从未接通), 当时
+    只改了测试值、没修代码, 坑留到现在。
+
+    第三个用例是守卫自己的陷阱: 配置 rate 0.02 会被 start_jog 抬到
+    min_angular_rate(0.12) —— 拿配置原值算门槛是 0.003deg, 5deg 的预算看着
+    绰绰有余, 实际门槛是 1.03deg。守卫必须用抬底后的 rate, 否则它本身就漏。"""
+    zone = RealActionPlan(kind='forward', jog_distance=.45, continuous=True)
+    # rate .12 × min_engage .15 = .018rad = 1.03deg
+    assert launched(zone, **{'stopgo.heading_hold_budget_deg': 1.0}) is None
+    assert launched(zone, **{'stopgo.heading_hold_budget_deg': 1.03}) is None, '相等也不行'
+    assert launched(zone, **{'stopgo.heading_hold_rate': .02,
+                             'stopgo.heading_hold_budget_deg': .5}) is None, \
+        '守卫必须按抬底后的 rate 算, 否则自己漏'
+    hold = launched(zone, **{'stopgo.heading_hold_budget_deg': 4.0})
+    assert hold is not None and hold.budget == pytest.approx(math.radians(4.0))
 
 
 def test_declared_defaults_match_the_shipped_yaml():

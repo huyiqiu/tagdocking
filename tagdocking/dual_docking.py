@@ -5,6 +5,7 @@ geometry uses the complete optical-to-base rigid transform, not tag normals.
 The historical parallax solver is retained below for offline compatibility.
 """
 import math
+from dataclasses import replace
 
 from .geometry_planner import ActionPlan
 
@@ -348,6 +349,10 @@ class DualTagDocking:
         self.feedback_bad = 0
         self.feedback_anchor = None
         self.feedback_count = 0
+        # 当前窗口的 J 轨迹, 只为失败串服务: 中止时唯一能回答"这三步各自
+        # 干了什么"的证据 —— 单看 anchor 与 after 两个端点区分不出"一直没
+        # 动"与"来回抵消", 而这两种的现场处置完全不同。
+        self.feedback_trail = []
         self.feedback_pending = None
         self.active_feedback = None
         self.pending_metrics = None
@@ -520,7 +525,8 @@ class DualTagDocking:
         if not safe and relaxed:
             safe, margins = self.improving(plan)
         if not safe:
-            return self._no_candidate('no visible translation candidate')
+            return self._no_candidate('no visible translation candidate',
+                                      rejected=(plan, margins))
         self.no_candidates = 0
         correction = bool(plan.turn_angle or plan.lateral_distance)
         try:
@@ -541,6 +547,55 @@ class DualTagDocking:
         # 与 pending_aligned 一样只由 action_started 消费一次。
         self.pending_reverse_kind = reverse_kind
         return [plan]
+
+    def _emit_forward(self, plan, **kw):
+        """纯前进步的收缩阶梯 —— 步子偏大不该等于"没有出路"。
+
+        `_correction` 的候选早就是一张菜单 (cap / cap÷2 / cap÷4 / 残差 / 下限),
+        前进却只发一个方案: 不可见就直接计窗口, 三窗判死。2026-09-12 现场死在
+        这个不对称上 —— 墙码 z=1.923m, 离观察窗上沿 (1.90m) 只差 23mm, 站位步
+        0.10m 被 visible() 否掉, 于是三个窗口全花在重发同一步上。而放行需要
+        stage=approach 与 z≤包络, 这两条又都只有走完这一步才拿得到: 要进窗才
+        能进窗。同一个死锁 2026-09-11 已经杀过一次 (见 straight_envelope),
+        那次的修法是把包络从 1.70 抬到 1.90 —— 把墙往外挪, 而不是给狗一条更
+        短的路, 所以它在 1.923m 又撞上了一次。抬墙治不了第三次。
+
+        逐档减半而不是二分/微调: 与 `_correction` 同一把刻度尺, 现场读日志的人
+        只需要记一套口径。下限取 `dock_tolerance` —— 比停泊容差还短的前进, 在
+        终点判定里本来就被当作"已到位", 发它不换回任何东西。
+
+        只管正向前进:
+        - 回退修剪 (`_advance` 的 remaining<0 分支) 不走这里 —— 后退让两码在
+          画面里退回中心, 余量单调变好, 它被否是另一种病 (近平面/丢码), 缩短
+          退距不治。
+        - `relaxed` 的脱困后退同理, 且那条路要的是 `improving` 那把宽松尺子,
+          在这里先缩一遍会把它的语义搅浑。
+        """
+        d = plan.jog_distance
+        if d <= 0 or kw.get('relaxed'):
+            return self._emit(plan, **kw)
+        floor = self.p('dock_tolerance')
+        tried = []
+        for step in (d, d/2., d/4.):
+            if step < floor:
+                break
+            trial = plan if step == d else replace(plan, jog_distance=step)
+            if self.visible(trial)[0]:
+                if tried:
+                    self._node.get_logger().info(
+                        f'dual 前进收缩 {d*100:.1f}cm → {step*100:.1f}cm '
+                        f'(原步不可见, 阶梯第 {len(tried)+1} 档)')
+                return self._emit(trial, **kw)
+            tried.append(step)
+        if not tried:
+            return self._emit(plan, **kw)
+        # 逐档都否 = 不是步长的问题 (最短一档的余量随后由 _rejected_report 打出),
+        # 别让读日志的人再去猜"是不是步子还不够小"。
+        self._node.get_logger().info(
+            f'dual 前进收缩阶梯全否: 试过 '
+            + '/'.join(f'{s*100:.1f}cm' for s in tried)
+            + f' (下限 dock_tolerance={floor*100:.1f}cm) —— 不是步长的问题')
+        return self._emit(replace(plan, jog_distance=tried[-1]), **kw)
 
     def predicted_pair(self, plan, fraction=1.):
         fwd = 0. if plan.lateral_distance else plan.jog_distance
@@ -684,15 +739,50 @@ class DualTagDocking:
         parts.append(self.exit_report())
         return ' '.join(parts)
 
-    def _no_candidate(self, reason):
+    def _no_candidate(self, reason, rejected=None):
         # Consume the window; timer retries cannot count the same observations.
         self.no_candidates += 1
         self._node.get_logger().info(
-            f'dual STOP: {reason}; window={self.no_candidates}; {self.margin_report()}')
+            f'dual STOP: {reason}; window={self.no_candidates}; '
+            f'{self.margin_report()}{self._rejected_report(rejected)}')
         self.reset_filter()
         if self.no_candidates >= int(self.p('no_candidate_windows')):
             return self._fail(reason + '; independent stable-window budget exhausted')
         return None
+
+    def _rejected_report(self, rejected):
+        """被否掉的那一步自己的预测余量 —— 否则日志自相矛盾。
+
+        `margin_report()` 报的是**当前位姿**的余量。规划被否时那份余量常常条条
+        宽裕 (2026-09-12 现场: 最小的 pile B 还有 26px, required 才 10px), 于是
+        日志读起来是"每条边都够, 却一个候选都没有", 查无可查 —— 真正被否的是
+        那一步**走过去之后**的余量, 而它在 `visible()` 里算出来就被丢了。
+
+        这里补的就是那份预测余量: 走的是哪一步、路径上最坏的四条边各剩几 px、
+        破的是哪一条。注意它可能被 allow_exit 的桩码免检改写含义, 所以离场判据
+        紧跟在后 (margin_report 尾部已带 exit_report)。
+        """
+        if not rejected:
+            return ''
+        plan, margins = rejected
+        move = []
+        if plan.jog_distance:
+            move.append(f'前进{plan.jog_distance:+.3f}m')
+        if plan.lateral_distance:
+            move.append(f'横移{plan.lateral_distance:+.3f}m')
+        if plan.turn_angle:
+            move.append(f'转{math.degrees(plan.turn_angle):+.2f}deg')
+        head = '; 被否的一步 ' + ('+'.join(move) if move else '原地')
+        if not margins:
+            return head + ' 预测余量=<近平面, 无有限包围>'
+        required = self.required_margin
+        names = ('L', 'R', 'T', 'B')
+        worst = min(range(4), key=lambda i: margins[i])
+        head += ' 预测路径最坏 L/R/T/B=' + '/'.join(f'{m:.0f}' for m in margins) + 'px'
+        if margins[worst] < required:
+            return head + f' → 破的是 {names[worst]} 边 ({margins[worst]:.0f} < {required:.0f})'
+        # 四条边都够却仍被否: 只可能是桩码免检之外的边、或采样点撞了近平面。
+        return head + ' (四边都够 → 否它的不是这四条, 查近平面/桩码免检口径)'
 
     def _correction(self, metrics):
         bearings, theta, e, score = metrics
@@ -763,24 +853,64 @@ class DualTagDocking:
         if not feedback or not feedback['before']:
             return True
         before, after = feedback['before'][-1], metrics[-1]
+        # 预测 vs 实测, 且按 theta / e 分开报。J 是个加权和, 只打总分时
+        # "变差了"指向不了任何一个可修的东西。2026-09-12 现场: 一步
+        # +12.5mm 横移后 J 0.478→1.670, 分解出来 e 实测 +15mm 比预测的
+        # +22mm 还好、整份劣化全在 theta (实测 -3.04° vs 预测 -1.39°) ——
+        # 那一步没人命令它转, 于是问题一步收敛到"横移带寄生 yaw", 而不是
+        # 去怀疑横偏模型。两个通道的残差必须能分开看。
+        pred = feedback.get('after')
+        detail = ''
+        if pred:
+            detail = (f' | 预测 J={pred[-1]:.5f} (实测−预测{after-pred[-1]:+.5f}) '
+                      f'theta 实测{math.degrees(metrics[1]):+.2f}deg '
+                      f'预测{math.degrees(pred[1]):+.2f}deg '
+                      f'(差{math.degrees(metrics[1]-pred[1]):+.2f}deg) | '
+                      f'e 实测{metrics[2]*1e3:+.0f}mm 预测{pred[2]*1e3:+.0f}mm '
+                      f'(差{(metrics[2]-pred[2])*1e3:+.0f}mm)')
         self._node.get_logger().info(f'dual visual feedback J={before:.5f}->{after:.5f} '
-                                    f'improvement={before-after:+.5f}')
+                                    f'improvement={before-after:+.5f}{detail}')
         if not feedback['correction']:
             self.feedback_anchor = None
             self.feedback_count = self.feedback_bad = 0
+            self.feedback_trail = []
             return True
-        self.feedback_bad = self.feedback_bad+1 if before-after < self.p('feedback_min_improvement') else 0
+        minimum = self.p('feedback_min_improvement')
+        self.feedback_bad = self.feedback_bad+1 if before-after < minimum else 0
         if self.feedback_anchor is None:
             self.feedback_anchor = before
+            self.feedback_trail = [before]
+        self.feedback_trail.append(after)
         self.feedback_count += 1
         limit = int(self.p('feedback_fail_windows'))
-        if self.feedback_bad >= limit or (self.feedback_count >= limit and
-                self.feedback_anchor-after < self.p('feedback_min_improvement')):
-            self._fail('dual visual correction no progress / oscillation')
-            return False
+        window = self.feedback_anchor-after
+        # 两条判据是两种病, 现场处置完全不同, 所以失败串必须自己说清是哪一条:
+        #   连败 = 每一步都没用   → 查指令是否真发出去了 / 底盘响应 / 标定;
+        #   窗口 = 单步有用但互相抵消 → 振荡, 查是哪两个通道在互相破坏。
+        # 旧串两条共用一句话, 现场只能看到"no progress / oscillation", 而这
+        # 两个词恰好互为反义 —— 等于什么都没说。
+        if self.feedback_bad >= limit:
+            return self._fail_feedback(
+                f'连败判据: 连续 {self.feedback_bad} 步修正, 每步改善都 < {minimum:.5f}',
+                limit, minimum)
+        if self.feedback_count >= limit and window < minimum:
+            return self._fail_feedback(
+                f'窗口判据: {self.feedback_count} 步修正的净改善 '
+                f'{self.feedback_anchor:.5f}->{after:.5f} = {window:+.5f} < {minimum:.5f} '
+                f'(单步可以是好的, 合起来白干)',
+                limit, minimum)
         if self.feedback_count >= limit:
             self.feedback_anchor, self.feedback_count = after, 0
+            self.feedback_trail = [after]
         return True
+
+    def _fail_feedback(self, why, limit, minimum):
+        trail = '→'.join(f'{j:.5f}' for j in self.feedback_trail)
+        self._fail('dual visual correction no progress / oscillation — ' + why
+                   + f'; 窗口 J 轨迹 {trail}; 连败计数 {self.feedback_bad}/{limit}'
+                   + f'; 门槛 dual.feedback_min_improvement={minimum}, '
+                     f'dual.feedback_fail_windows={limit}')
+        return False
 
     def _reverse(self, relaxed=False, why='acquisition'):
         # why 区分两种耗尽与两本账: 'acquisition' = 找桩码退不出来/脱困, 记主账
@@ -882,7 +1012,7 @@ class DualTagDocking:
                 # 已在观察距离内仍不可见 → 初始太近 (出视野), 后退找回。
                 obs = self.p('observation_distance')
                 if d > obs + self.p('observation_tolerance'):
-                    return self._emit(ActionPlan(kind='forward', jog_distance=min(
+                    return self._emit_forward(ActionPlan(kind='forward', jog_distance=min(
                         self.p('forward_step'), (d-obs)/self.r[0][2])))
                 return self._reverse()
             if self.window_ns and now-self.window_ns > self.p('missing_timeout_sec')*1e9:
@@ -978,7 +1108,10 @@ class DualTagDocking:
             # 每个 observe 窗口都已经过一遍同一门槛, 走到这里 d 必然 ≥ 下沿。
             # 在此重复一遍只会是永不执行的死代码, 误导下一个读代码的人。
             if d > obs+self.p('observation_tolerance'):
-                return self._emit(ActionPlan(kind='forward', jog_distance=min(self.p('forward_step'), (d-obs)/self.r[0][2])))
+                # 收缩阶梯: 站位步被否时逐档减半再试。这一步恰恰是解开
+                # "要进窗才能进窗"那个死锁的唯一钥匙 (见 _emit_forward)。
+                return self._emit_forward(ActionPlan(kind='forward', jog_distance=min(
+                    self.p('forward_step'), (d-obs)/self.r[0][2])))
             self.stage = 'approach'
             # 一次性: 提交直行那一刻的余量 —— 之后桩码将随接近离开视野,
             # 这是最后一次能看到两码逐边状态的点。
@@ -1163,12 +1296,13 @@ class DualTagDocking:
             # 机体下方, 见 visible): 墙码是修剪和终点判定唯一的依据, 它要在整段
             # 路径上都留在画里, 否则宁可逐步走、每停重测 —— 那是长期现场验证的
             # 老行为。这里多算一次 visible (十几个采样点, 可忽略), 换 _emit 的
-            # 记账与无候选语义完全不动。
+            # 记账与无候选语义完全不动。逐步走那一步再走一遍收缩阶梯
+            # (见 _emit_forward): 整段不可见时 forward_step 也未必可见。
             run = ActionPlan(kind='forward', jog_distance=remaining/self.r[0][2],
                              continuous=True)
             if self.visible(run)[0]:
                 return self._emit(run, aligned=True)
-        return self._emit(ActionPlan(kind='forward', jog_distance=min(
+        return self._emit_forward(ActionPlan(kind='forward', jog_distance=min(
             self.p('forward_step'), remaining/self.r[0][2])), aligned=True)
 
 

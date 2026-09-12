@@ -15,6 +15,7 @@
 7. [调试方法](#7-调试方法)
 8. [仿真测试](#8-仿真测试)
 9. [注意事项](#9-注意事项)
+10. [附录 A：全部可调参数速查表](#10-附录-a全部可调参数速查表)
 
 ---
 
@@ -784,6 +785,28 @@ stopgo.heading_hold_cooldown_sec: 0.30     # s — 断开后冷却, 覆盖命令
 stopgo.heading_hold_budget_deg: 15.0  # deg — 单程累计下发角上限 (诊断闸, 不是安全边界)
 ```
 
+**大白话对照表**（把它想成：狗直着走，你在旁边盯着它的头，歪了就伸手掰一下）
+
+| 参数 | 值 | 大白话 |
+|---|---|---|
+| `heading_hold_enable` | `true` | 总开关。要不要伸这只手 |
+| `heading_hold_rate` | `0.12` | 掰的力道。0.12 是刚好越过底盘死区 0.10 的最小值——够用就行，大了一按就过头 |
+| `heading_hold_engage_deg` | `2.0` | 歪到多少才管。歪 2° 以内不理会 |
+| `heading_hold_release_deg` | `0.7` | 掰回到多少就松手。注意**不是掰到 0 才松**——瞄 0 必过冲，过冲就来回抖 |
+| `heading_hold_min_engage_sec` | `0.15` | 一旦按下，至少按住 0.15 秒。按一下就松，腿还没反应过来 |
+| `heading_hold_cooldown_sec` | `0.30` | 松手后歇 0.3 秒再做下一次判断（等 odom 把刚才那下报上来） |
+| `heading_hold_budget_deg` | `15.0` | 一趟总共最多掰 15°。超了就报警 + 后半程纯直行 |
+
+> **`budget_deg` 有个下限，配低了会被拒绝**：一次最短接通就要花掉
+> `rate × min_engage_sec`，默认 `0.12 × 0.15 = 0.018 rad = 1.03°`。若
+> `budget_deg ≤` 这个值，一次都接不通、`used` 恒为 0，完成日志打的
+> "航向保持已用=0.00deg" 与"压根没漂够门槛"逐字相同——**最坏的失效形态是
+> 看着开着、其实关着**。所以 `_heading_hold_params()` 直接 `warn` + 返回
+> `None`（本趟退回纯直行），日志里会写清算出来的门槛和建议值。要真开，
+> `budget_deg` 至少给到门槛的 3 倍以上。校验按**抬底后**的 rate 算
+> （`max(abs(heading_hold_rate), min_angular_rate)`），否则把 `rate` 配成
+> 0.02 就能绕过守卫、而实际下发的仍是 0.12。
+
 > **为什么是"继电"(0 或 ±rate) 而不是比例律**：l1w_control 有
 > `min_angular_z = 0.10` 死区，`|wz| < 0.10` 被 clampAxis 直接截成 0。比例式
 > 命令在误差小的时候恰好落进死区，物理上发不出去——不是调参能救的。代码另有
@@ -934,6 +957,36 @@ exhausted` 停在原地。桩码底边余量已被吃到 <10px（`visibility_mar
 诊断补强：`margin_report()` 现在附带 `桩码垂直离场=放行 / 不放行(缺 …)`，逐条
 列出四个前提里缺哪个。余量表只说桩码底边剩几 px，不说那几 px 该不该拦人 ——
 现场日志里余量一路 61.6→49.3→39.0→25.8→+8px 然后三窗判死，缺的其实是放行。
+
+**同一死锁的复发与治本（2026-09-12 现场，已修）**：把包络从 1.70 抬到 1.90
+只是**把墙往外挪**，狗停在 **z=1.923m** 时它又撞上了一次 —— 离观察窗上沿只差
+**23mm**，站位步 0.10m 被 `visible()` 否掉，而放行需要 `stage=approach` 与
+`z ≤ 包络`，这两条又都只有走完这一步才拿得到（`stage` 在 observe 分支的
+`d ≤ obs+tol` 之后才置位）。要进窗才能进窗。当趟其余条件全是好的：bearing
++0.58°/+0.96°、J 已收到 0.227。
+
+真正的不对称在于：`_correction` 的纠偏候选早就是一张菜单（`cap / cap÷2 /
+cap÷4 / 残差 / 下限`），**前进却只发一个方案**，不可见就直接计窗口，三窗判死。
+修法是给纯前进步同一把刻度尺 —— `_emit_forward()` 的**收缩阶梯**：
+
+| | |
+|---|---|
+| 档位 | `d / d÷2 / d÷4`，与 `_correction` 同一口径，现场只需记一套 |
+| 下限 | `dual.dock_tolerance`(20mm) —— 比停泊容差还短的前进在终点判定里本就算"已到位"，发它换不回任何东西 |
+| 窗口 | **整条阶梯算一次决策**，逐档都否才消耗一个窗口（不是每档一个） |
+| 不适用 | 回退修剪与 `relaxed` 脱困后退：后退让两码退回画面中心、余量单调变好，它被否是另一种病（近平面/丢码），缩短退距不治；且脱困要的是 `improving` 那把宽松尺子 |
+| 接线 | observe 站位步、acquire 匍匐逼近、`_advance` 的逐步走三处；纯直行区"一次走完"整段不可见时落回的也是这条 |
+
+日志：收缩成功打 `dual 前进收缩 10.0cm → 2.5cm (原步不可见, 阶梯第 3 档)`；
+逐档都否打 `dual 前进收缩阶梯全否: 试过 10.0cm/5.0cm/2.5cm (下限
+dock_tolerance=2.0cm) —— 不是步长的问题`。
+
+配套的另一处诊断缺口也补了：`no visible translation candidate` 那行原先只带
+`margin_report()`，报的是**当前位姿**的余量，规划被否时它常常条条宽裕
+（2026-09-12 现场最小的 pile B 还有 26px、required 才 10px），读起来就是
+"每条边都够却一个候选都没有"，查无可查 —— 真正被否的是那一步**走过去之后**
+的余量，而它在 `visible()` 里算出来就被丢了。现在 `_rejected_report()` 把它
+接回日志尾部：被否的是哪一步、预测路径上最坏的四条边各剩几 px、破的是哪一条。
 
 1. **找双码**：无墙码执行有界原地搜索（最多一圈且受搜索总超时）；只有墙码先停看，
    在持续新鲜墙码检测中确认缺小码后，每次退 0.05m。全轮后退最多 0.30m/6 次，
@@ -1380,9 +1433,12 @@ python3 scripts/calibrate_rtsp --url rtsp://...   # RTSP 模式 (纯 ssh 无 GUI
 | 停泊位置系统性偏前/偏后 | `tag.size` 不对 / 相机内参不准 | `test_apriltag --known-distance` 验证实测距离，重标定 |
 | 停泊位置横向偏 | 相机安装 TF（`mount.*`/URDF）不准 / 相机光学中心偏离底盘中心线 | RTSP 模式校准 `camera_mount_y`；若量测 lat 系统性偏小且近侧腿撞桩，设 `camera.lateral_offset_m` 补偿（+ = 相机偏左） |
 | 双码停泊终点系统性偏左/右 | 纯直行区行进中 yaw 漂移，或航向保持没生效 | 读 `dual action COMPLETE` 日志的 `Δyaw`：持续 > 2° 说明保持没起作用——查 `stopgo.heading_hold_enable`，再 `ros2 topic echo /cmd_vel --field angular.z` 看 wz 是否被 clampAxis 截零（截零就调大 `heading_hold_rate` 到 0.15~0.18）。`航向保持已用` 打印 0° = 从未接通；打印"预算耗尽"= 底盘不响应 wz 或 odom yaw 异常。若 `Δyaw≈0` 却仍偏，那是**横向平移**不是航向漂移，本参数组管不了（看上一行） |
-| 区内 `wall_bearing` 一路变大却没人纠 | bearing 没超 `_bearing_tol` 的收紧门槛，或转向候选全被 `visible()` 否掉 | 看 `纯直行区 … bearing=X ≤ 收紧门槛 Y` 这行：X<Y 是设计行为（纠它不划算）；要更早介入就调小 `dual.straight_yaw_lag_deg`。若打的是 `无可行转向候选` 则是墙码要被转出画面——那是余量问题，抬 `observation_distance` 或相机下俯，不要动门槛。**注意区内 `Δyaw` 只在 `continuous=True` 那一步才有读数**，走停退化路径打印的 `Δyaw=+0.00` 是"未测量"不是"没漂" |
+| 区内 `wall_bearing` 一路变大却没人纠 | bearing 没超 `_bearing_tol` 的收紧门槛，或转向候选全被 `visible()` 否掉 | 看 `纯直行区 … bearing=X ≤ 收紧门槛 Y` 这行：X<Y 是设计行为（纠它不划算）；要更早介入就调小 `dual.straight_yaw_lag_deg`。若打的是 `无可行转向候选` 则是墙码要被转出画面——那是余量问题，抬 `observation_distance` 或相机下俯，不要动门槛。**注意 `Δyaw` 现在每一步都有真实读数**（含横移步与走停退化路径；转向步额外附指令角以便读欠转），不再是"只有 `continuous=True` 那一步才测" |
 | 区内仍在 10cm 走停、拿不到一次停到位 | 整段连续直行被 `visible()` 否掉，静默退化成 `forward_step` 逐步走 | 看该窗口日志里的 `min_margin`：整段长跑会把墙码推到画面边缘，余量见底就会被否。抬 `observation_distance` 或相机下俯增加余量；`dual.visibility_margin_px` 只买到 ~2mm，是最后手段。退化路径本身是安全的（每停重测 + bearing 微调仍在工作），但拿不到 `continuous` 的航向保持 |
 | 双码近场摆头/角速度段数 >10 | 航向保持抖振（迟滞带偏窄或底盘报告滞后偏大） | `heading_hold_engage_deg`→2.5、`heading_hold_release_deg`→0.5 拉宽迟滞带，或 `heading_hold_cooldown_sec`→0.45 |
+| `dual visual correction no progress / oscillation` 中止 | 两条判据之一触发，失败串已写明是哪条 | **连败判据**（连续 N 步每步改善都 < 门槛）→ 指令根本没起作用：查 `/cmd_vel` 有没有发出去、底盘响不响应、里程计标定。**窗口判据**（N 步净改善 < 门槛，单步可以很好）→ 振荡，两个通道在互相破坏：读 `dual visual feedback` 那行的 theta/e 分解，看是哪一项与预测背离；若 e 与预测相符而 theta 大幅变差，再看那一步的 `Δyaw` —— 横移步打出 `(寄生!)` 就是底盘在横移中带出了转动，见下一行 |
+| `no visible translation candidate; independent stable-window budget exhausted` | 前进被 `visible()` 否掉，三个独立稳定窗口耗尽 | 先读同一行尾部的**两段**余量：`wall/pile L/R/T/B` 是**当前位姿**的，`被否的一步 … 预测路径最坏 L/R/T/B … 破的是 X 边` 才是**被否那一步**的 —— 前者宽裕后者破了是正常的，只看前者会以为自相矛盾。再看 `桩码垂直离场=不放行(缺 …)`：缺 `stage=approach`/`z<=直行包络` 且墙距只差几十 mm，就是"要进窗才能进窗"的死锁（见 §6.5b）；此时日志里应当先出现 `dual 前进收缩 …cm → …cm`，没出现说明阶梯没生效。若打的是 `前进收缩阶梯全否 … 不是步长的问题`，那就别再调 `dual.forward_step` —— 去查相机外参/`visibility_margin_px`/桩码是否真的该被免检 |
+| 横移步 `Δyaw` 打出 `(寄生! 平移步不该转)` | 底盘执行横移时带出转动（步态耦合，omni 腿式常见） | 单次 >1° 就足以吃掉那一步的修正收益（0.5×sin1°=8.7mm，`dock_tolerance` 才 20mm），累起来会触发窗口判据。先用 `ros2 topic echo /cmd_vel --field angular.z` 确认这段 wz 确实是 0（是 0 = 底盘自己转的，不是我们发的）；再减小 `dual.lateral_step` —— 它按比例缩整个候选菜单（`cap / cap÷2 / cap÷4`），单步横移短了带出的寄生角也小。**注意 `dual.min_lateral_m` 不是这个旋钮**：它只是菜单下限，抬高它只删掉低于门槛的小候选，中段候选照选不误；yaw 与 lateral 是各自独立枚举、最后按 J 一起排序，没有"通道优先级"可调 |
 | 转角/直行不准（车没走够量） | 里程计漂移或打滑 | `test_turn_angle` / `test_jog_distance` 实测误差；降速率 |
 | 停靠后机器人"锁死"无法遥控 | 旧版本持续发布零速 | 已修复：静默态刹车 0.3s 后释放 `/cmd_vel`（底盘看门狗接管停止） |
 
@@ -1569,6 +1625,211 @@ odom → base_link → 相机光学系(image header.frame_id) → tag36h11:0
 - `Dock.action` 由 `rosidl_generate_interfaces` 编译生成 Python 模块
 - Python 代码通过 CMake 的 `install(DIRECTORY ...)` 安装到 `dist-packages`
 - 入口脚本 (`docking_node` 等) 通过 CMake 的 `install(PROGRAMS ...)` 安装到 `lib/tagdocking/`
+
+---
+
+## 10. 附录 A：全部可调参数速查表
+
+**170 个参数，一张表。** 值取自 `config/docking.yaml`（那是实际跑的值）；
+`retry.*` 四项 yaml 里没写，列的是代码默认值，标 `°`。全部参数运行期可改：
+
+```bash
+ros2 param set /docking_node dual.forward_step 0.08     # 下一次规划即生效
+ros2 param list /docking_node                           # 看全部
+ros2 param get  /docking_node stopgo.heading_hold_budget_deg
+```
+
+> **读表的三条前提**
+> 1. **`stopgo.*` 是底盘控制律，`dual.*` 是双码几何与策略**，两套命名空间不是
+>    随意分的：`ActionExecutor` 的构造参数全部来自 `stopgo.*`；而 `dual.*` 全要
+>    过正性 + 有限性校验循环（布尔过不了，所以 `dual.crouch_enable` 被单独
+>    declare）。加新参数时按这条归位。
+> 2. **标 ⚠ 的行是"改了会连带改掉别的东西"**，别当单一开关用。
+> 3. **标 ✗ 的行是弃用参数**，代码已不读取，保留只为兼容旧 yaml —— 改它没有
+>    任何效果。
+
+| 参数 | 当前值 | 大白话释义 |
+|---|---|---|
+| **— 相机与话题 —** | | |
+| `camera.max_latency_ms` | 150 | 位姿时效窗口的下限（ms）。高帧率时它说了算：比这更旧的位姿不许拿来规划 |
+| `camera.latency_interval_margin` | 3.0 | 时效窗口 = 实测检测间隔 × 此值。3 = 容忍丢两帧还不算过期 |
+| `camera.expected_fps` | 30 | 相机标称帧率，只用来算窗口初值；实测间隔一出来就以实测为准 |
+| `camera.lateral_offset_m` | 0.0 | 相机光心相对底盘中心线的横向偏移（+ = 相机偏左）。**只作用于单码路径**，双码完全不经过它。当前相机齐平，故为 0；换装偏心相机时按实测填 |
+| `camera_frame` | `camera_color_optical_frame` | 相机光学坐标系名（x 右 / y 下 / z 前） |
+| `base_frame` | `base_link` | 底盘坐标系名，所有"距离/横偏"都是相对它说的 |
+| `measure_frame` | `""` | 量测参考系覆盖；空 = 用 `base_frame`。给"以充电口而非底盘中心对准"这类需求留的口子 |
+| `detection_topic` | `/detections` | AprilTag 检测结果话题 |
+| `odom_topic` | `/dog/odom` | 里程计话题。走停的每一步都靠它闭环掐断，配错等于全盲 |
+| `pose_buffer.size` | 30 | 时间戳位姿环形缓冲长度（帧） |
+| **— 墙码与停泊目标 —** | | |
+| `tag.family` | `36h11` | AprilTag 家族 |
+| `tag.size` | 0.15 | 墙码物理边长（m）。填错 → 距离整体按比例错 |
+| `tag.frame` | `tag36h11:0` | 墙码 TF frame 名，须与 apriltag_ros 的输出一致 |
+| `tag.id` | 0 | 墙码 ID |
+| `tag.fresh_timeout_sec` | 2.0 | 超过此时长没有新检测就算"陈旧"。6fps + 转向盲区下 1.0 会误判 TAG_LOST，故放宽 |
+| `tag.tag_loss_timeout_sec` | 2.5 | 接近途中连续丢码超此时长才退回 SEARCH_TAG。检测流实测有 1.6~3s 空档，填 1s 必抖动 |
+| `tag.ema_alpha` | 0.5 | 位姿 EMA 平滑系数（0 = 重平滑，1 = 原始）。法线方向走圆周 EMA，不会在 ±180° 处炸 |
+| `tag.max_pose_jump_m` | 0.3 | 单帧跳变超过此距离直接丢弃，挡运动模糊坏帧 |
+| `dock_target.distance` | 0.55 | 单码路径的停泊距离（m，底盘到码）。**双码路径用 `dual.dock_distance`**，两者互不相干 |
+| `dock_target.lateral_offset` | 0.0 | 停泊点相对码中心的横向偏置（m），0 = 正对 |
+| `dock_target.yaw_offset_deg` | 0.0 | 停泊时相对"正对码"的朝向偏置（°） |
+| **— 底盘 —** | | |
+| `base.type` | `omni` | 底盘类型：`diff_drive` / `omni` / `quadruped`。决定有没有横移能力，进而决定规划器选哪套动作 |
+| `base.cmd_vel_topic` | `cmd_vel` | 速度指令话题 |
+| `base.l1w_prefix` | `/l1w_control` | 狗的模式服务前缀（静止站立 / 起立 / 阻尼都挂在它下面） |
+| **— 走停控制律 `stopgo.*` —** | | |
+| `stopgo.lateral_threshold` | 0.05 | 横偏容许带（m）。超出才值得动手去修，否则直行 |
+| `stopgo.yaw_threshold_deg` | 10.0 | 方位容许带（°），同上 |
+| `stopgo.tune_angle` | 0.0 | 差速车的斜向修正角（rad），0 = 关 |
+| `stopgo.jog_min` | 0.05 | 单步前进下限（m）。比这更短的步不值得起停一次 |
+| `stopgo.jog_max` | 0.20 | 单步前进上限（m）。⚠ **只钳制单码 GeometryPlanner，双码完全不受它管**（双码的上限是 `dual.forward_step` 与纯直行区的"一次走完"） |
+| `stopgo.jog_linear_rate` | 0.08 | 前进恒速（m/s）。走停不做加减速曲线，就是这个常速 |
+| `stopgo.jog_angular_rate` | 0.3 | 转向恒速（rad/s） |
+| `stopgo.min_angular_rate` | 0.12 | 下发角速度的**下限**（rad/s）。l1w_control 有 `min_angular_z = 0.10` 死区，低于它的命令被整条截成 0 —— 这个参数是结构性抬底，让死区不可达 |
+| `stopgo.lateral_rate` | 0.12 | 横移恒速（m/s，仅 omni / 四足） |
+| `stopgo.jog_odom_scale` | 1.0 | 前进里程计尺度标定。里程计说走了 1m 实际走了 0.95m 就填 0.95 |
+| `stopgo.jog_backward_odom_scale` | 1.0 | 后退的尺度，单列是因为狗前后步态不对称 |
+| `stopgo.lateral_odom_scale` | 1.0 | 横移的尺度 |
+| `stopgo.turn_settle_sec` | 1.5 | 转完停稳后等图像清晰的时长（s）。加长是为了避免模糊帧被跳变拒绝误杀 |
+| `stopgo.turn_undershoot` | 0.75 | 只转命令角的百分之多少。✗ 仅 legacy `full=False` 路径读；走停/泊出盲转走 `full=True`，不经过此值 |
+| `stopgo.turn_lead_per_speed` | 0.30 | 转向提前量（rad per rad/s）：剩余角 ≤ 此值 × 当前角速率就提前发零速，靠滑行补足。由对接日志反推滞后 0.30-0.43s。欠转/过转量恒定时微调这里 |
+| `stopgo.turn_slow_rad` | 0.14 | 距目标角此值以内减速到半速，减小惯性冲量 |
+| `stopgo.max_turn_step` | 0.17 | 单次转向硬上限（rad ≈ 10°）。小步转 + 每步重看，低帧率下码不易转出视野 |
+| `stopgo.small_turn_rad` | 0.1 | 小于此角度的转向全程半速 |
+| `stopgo.theta_shrink_ratio` | 2.0 | 动态方位容差 = `max(yaw_threshold, 距离/此值)`：远处松、近处紧 |
+| `stopgo.drift_tol` | 0.15 | 前进途中允许的方位漂移上限（rad） |
+| `stopgo.turn_creep_linear` | 0.0 | ✗ 已弃用。"边走边转"叠加前进会驶出目标横向范围，现固定纯原地转 |
+| **— 行进中航向保持 `stopgo.heading_hold_*`（双码纯直行区）—** | | |
+| `stopgo.heading_hold_enable` | true | 总开关。现场一键回滚：`ros2 param set` 后下一趟即生效 |
+| `stopgo.heading_hold_rate` | 0.12 | 接通时下发的角速度幅值（rad/s）。⚠ 代码用 `max(abs(此值), min_angular_rate)` 抬底，配进死区也不会静默失效；调大会恶化单周期粒度（0.3 → 0.86°/周期，一周期跨掉 2/3 迟滞带） |
+| `stopgo.heading_hold_engage_deg` | 2.0 | 歪到多少度开始掰（°）。由来：`0.5×sin(2°) = 17.5mm < dock_tolerance(20mm)` —— 门槛就该定在"残余误差代价 < 停泊容差"这点上 |
+| `stopgo.heading_hold_release_deg` | 0.7 | 掰回到多少度松手（°）。⚠ **绝不取 0**：瞄 0 断开必过冲换符号，直接抖振。迟滞带 1.3° > 最短接通粒度 1.03° |
+| `stopgo.heading_hold_min_engage_sec` | 0.15 | 最短接通时长（s，3 个控制周期 ≈ 一个步态相位）。单周期脉冲底盘不一定响应 |
+| `stopgo.heading_hold_cooldown_sec` | 0.30 | 断开后的冷却（s），让下一次决策基于已沉降的里程计读数 |
+| `stopgo.heading_hold_budget_deg` | 15.0 | 单程累计下发角上限（°），耗尽后告警并退回纯直行。⚠ 这**不是**安全边界（那由符号规则给），是"底盘不响应 / 里程计疯了"的诊断闸。**有下限守卫**：必须 > `rate × min_engage_sec`（按抬底后的 rate 算，默认 1.03°），配低了会被 warn 掉并本趟退回纯直行 —— 不会假装开着 |
+| **— 静止站立（呼吸抑制）`posture.*` —** | | |
+| `posture.enable` | false | 总开关。狗站着会"呼吸"，位姿一直在抖；开了就每个停看点先锁定再量测。无桥时自动降级停用 |
+| `posture.static_settle_sec` | 1.2 | 停 → 量测的最短间隔（s）：RTSP 延迟 + 锁定过渡 + 呼吸衰减。与 `turn_settle_sec` 同起点取 max |
+| `posture.lock_ack_timeout_sec` | 2.0 | 等锁定确认的超时（s）；超时则本次停降级为"未锁定继续"，不判失败 |
+| `posture.unlock_ack_timeout_sec` | 2.0 | 等 `motion_enabled==True` 的超时（s）。固件退出锁定有滞后，只有这个 Bool 变 True 才真的能走 |
+| `posture.unlock_retries` | 2 | 起立命令重发上限。⚠ 耗尽 → MOTION_FAILED（狗还锁着，这一条不可降级） |
+| `posture.min_stable_frames` | 3 | 规划前要求的连续新鲜帧数（1 = 关闭） |
+| `posture.stable_frame_timeout_sec` | 2.5 | 等不满上面那 N 帧就带当前位姿硬规划（s），防闪烁卡死 |
+| `posture.service_wait_sec` | 1.0 | 服务发现宽限（s），超过即判定无桥、停用并告警一次 |
+| **— 充电收尾 `charge.*` —** | | |
+| `charge.enable` | true | DOCKED 之后的收尾总开关 |
+| `charge.passive` | true | 阻尼（泄力）步开关；false 时收尾止于锁定站立 |
+| `charge.static_stand` | false | 先锁定再阻尼；false = 跳过锁定直接阻尼 |
+| `charge.static_ack_timeout_sec` | 3.0 | 等锁定确认的超时（s） |
+| `charge.lie_down_settle_sec` | 4.0 | ✗ 已弃用，当前收尾流程不再使用趴下动作 |
+| `charge.passive_settle_sec` | 2.0 | 阻尼服务受理后的等待（s）。注意这是等时间，不是等硬件反馈 |
+| `charge.retries` | 1 | 每步服务的重试次数 |
+| `charge.service_wait_sec` | 1.0 | 无桥宽限（s）。超时只降级告警，**DOCKED 仍算成功** |
+| **— 单码两阶段直行 `final_straight.*` —** | | |
+| `final_straight.enable` | true | 两阶段停泊开关；false 恢复单阶段 |
+| `final_straight.start_distance` | 0.85 | 直行阶段起点（m），须 > `dock_target.distance` |
+| `final_straight.yaw_threshold_deg` | 3.0 | 入口方位门槛（°）：进入直行距离时超此值报导航失败。近场方位修正也用同一值 |
+| `final_straight.normal_yaw_threshold_deg` | 2.0 | 近场法线对准门槛下限（°）。它低于噪声，实际生效的是下面那条 |
+| `final_straight.normal_turn_min_deg` | 6.0 | 近场法线对准的**实际**最小出手角（°）：小于它转了也是白转 |
+| `final_straight.entry_lateral_m` | 0.07 | 入口横向门槛（m），一次性检查，超了报导航失败 |
+| `final_straight.lateral_threshold_m` | 0.02 | 近场横移修正 / 捷径的横向门槛（m），比入口更紧。⚠ 须 < `stopgo.lateral_threshold`，否则规划器不会滑 |
+| `final_straight.tighten_distance` | 1.3 | 远/近分界（m）：≤ 它进近场精调（法线对准 + 横移 + 直行），> 它只做远场粗对准 + 纯前进。建议 ≥ `start_distance + jog_max` |
+| `final_straight.far_yaw_threshold_deg` | 15.0 | 远场粗对准的方位门槛（°）。远场法线不可靠，不宜微调 |
+| `final_straight.far_lateral_m` | 0.20 | 远场粗对准的横向门槛（m）。远场只要求大方向对，横偏走到近场再说 |
+| `final_servo.distance` | 0.20 | 进入 FINAL_SERVO 的距离（m） |
+| `final_servo.yaw_tol_deg` | 15.0 | 到达停泊距离即判定的方位门槛（°）。直行阶段不再追角度，15° 内都接受 |
+| `final_servo.max_linear_speed` | 0.05 | ✗ legacy 伺服速度，走停流程不读 |
+| `final_servo.max_yaw_speed` | 0.2 | ✗ 同上 |
+| **— 双码几何与策略 `dual.*` —** | | |
+| `dual.enable` | false | 双码路径总开关。开了才走墙码 + 桩码那一整套，否则是单码流程 |
+| `dual.crouch_enable` | false | 靠近时趴下再起立的开关 |
+| `dual.camera_info_topic` | `/camera_sync/camera_info` | 内参话题。双码的可见性预测全靠它，没有就不动 |
+| `dual.projection_mode` | `raw` | 用原始 K+D 还是去畸变后的 P。⚠ 显式配置：话题重映射**不等于**已去畸变 |
+| `dual.wall_tag_size` | 0.15 | 墙码边长（m） |
+| `dual.pile_tag_id` | 51 | 桩码 ID，必须与 `tag.id` 不同 |
+| `dual.pile_tag_size` | 0.05 | 桩码边长（m）。5cm 决定了它的可见半径只有 ~0.9m，也就决定了站位必须在 1.8m |
+| `dual.dock_distance` | 0.50 | 双码停泊距离（m，墙码光学 z） |
+| `dual.dock_tolerance` | 0.02 | 停泊容差（m）。差在此内就算到位；不足由收缩步补，冲过由回退修剪。也是前进收缩阶梯的下限 |
+| `dual.mount_tolerance_deg` | 2.0 | 外参安装角容差（°），超了启动就报，不让带着错外参上场 |
+| `dual.observation_distance` | 1.8 | 观察站位（m）。由来：站立视角下 5cm 桩码在 ~0.9m 处仍清晰可见，而角度必须在桩码可见的最后窗口一次对准完毕 |
+| `dual.observation_tolerance` | 0.1 | 站位容差（m）。⚠ 它和上面那条一起构成**直行包络** 1.90m —— 桩码垂直离场放行与丢失闭锁都用这个和 |
+| `dual.straight_start_distance` | 1.70 | = obs − tol。现只剩两处用法（排序校验、转向步长远近分档）。⚠ 放行与闭锁已改用直行包络，别混 |
+| `dual.steering_stop_distance` | 1.0 | 纯直行区入口（m）。⚠ **不要拿它当"关掉区内转向"的开关** —— 它同时管着"一次连续直行"与 `visible()` 的放行，调低会把一次停到位一并关掉。要更保守地限制区内转向请调 `straight_yaw_lag_deg` |
+| `dual.forward_step` | 0.10 | 区外单步前进上限（m）。被否时按 `d / d÷2 / d÷4` 逐档收缩再试（见 §6.5b 的收缩阶梯） |
+| `dual.reverse_step` | 0.10 | 单步后退上限（m），也是冲过停泊点后回退修剪的单步封顶 |
+| `dual.lateral_step` | 0.05 | 横移候选菜单的**刻度尺**（m）：菜单是 `cap / cap÷2 / cap÷4 / 残差 / 下限`，调它等于整体缩放。底盘横移带出寄生 yaw 时，调小的是这个 |
+| `dual.min_lateral_m` | 0.003 | 横移候选的**下限**（m）：比它短的候选直接删掉。⚠ 它不是"优先走 yaw 通道"的旋钮 —— 抬高只删小候选，中段照选不误 |
+| `dual.lateral_tolerance_m` | 0.02 | 横偏容差（m），进到此内就不再横移 |
+| `dual.yaw_step_deg` | 8.0 | 远场（z > 1.70）单步转向上限（°） |
+| `dual.yaw_fine_step_deg` | 3.0 | 近场（z ≤ 1.70）单步转向上限（°）。⚠ 3° 在远场是灾难：底盘停止滞后 ~2° 与命令同量级，提前量钳位会让每步只转一半 |
+| `dual.straight_yaw_tol_deg` | 1.5 | 区外 bearing 微调门槛（°），小于它只直行 |
+| `dual.straight_yaw_max_turns` | 3 | 连续转向次数上限，前进一步即清零。防"光转不走" |
+| `dual.straight_yaw_lag_deg` | 2.0 | 底盘单步转向的停止滞后（°）。它是纯直行区内那条盈亏平衡门槛的**代价项** —— 要更保守地禁区内转向就调大它 |
+| `dual.align_tolerance_deg` | 3.0 | 两码对准门槛（°）。⚠ 是**各自**的光学 bearing，不是两者平均 |
+| `dual.align_hold_sec` | 0.5 | 对准要持住多久才算数（s），同一个沉降窗口内的不重复帧 |
+| `dual.prealign_tolerance_deg` | 5.0 | 趴下前单码粗对准的收敛门槛（°）。双码是**精调器不是收敛器**：锁定时残留 20° 它得一步几度啃 30 步 ≈ 70s，必然超时 |
+| `dual.prealign_step_deg` | 8.0 | 粗对准单步转向上限（°） |
+| `dual.prealign_max_steps` | 12 | 粗对准步数预算，耗尽后告警并移交双码（不判失败） |
+| `dual.settle_sec` | 1.5 | 双码停稳等待（s） |
+| `dual.min_frames` | 3 | 规划前所需的最少稳定帧 |
+| `dual.fresh_sec` | 0.6 | 两码共用的新鲜度窗口（s） |
+| `dual.tf_skew_sec` | 0.02 | 两码时间戳允许的错开（s）。超了就不是"同一时刻的两码"，视差解算无意义 |
+| `dual.stable_position_m` | 0.03 | 相邻帧光心位移上限（m），用来判"真的停稳了" |
+| `dual.missing_confirm_sec` | 1.5 | 桩码连续不可见多久才确认丢失（s） |
+| `dual.missing_timeout_sec` | 8.0 | 确认丢失后多久判失败（s） |
+| `dual.pile_fresh_timeout_sec` | 2.0 | ✗ 已弃用，现在两码统一由 `dual.fresh_sec` 管 |
+| `dual.qualification_sec` | 12.0 | 航向证据的保鲜期（s）。超过就不算"持住对准"，放行作废 |
+| `dual.pile_lock_distance` | 0.30 | 桩码光学 z 到此值切回站立（m）。再近桩码就离开趴姿视野了；⚠ 要求先对准好航向 |
+| `dual.crouch_settle_sec` | 3.0 | 趴下动作的等待（s）。没有专门的趴姿状态量，只能靠"服务成功 + 计时" |
+| `dual.posture_retries` | 2 | 趴下/起立的服务重试次数，耗尽则双码中止 |
+| `dual.reverse_limit` | 0.8 | 获取阶段后退的累计上限（m） |
+| `dual.reverse_count` | 16 | 获取阶段后退的步数上限 |
+| `dual.standoff_reverse_limit` | 1.0 | 站位调整后退的累计上限（m），与上面分开记账 |
+| `dual.standoff_reverse_count` | 20 | 站位调整后退的步数上限 |
+| `dual.visibility_margin_px` | 8.0 | 码的包围框离画面边缘至少要留几个像素 |
+| `dual.visibility_sample_pad_px` | 2.0 | 在上面基础上再加的安全垫。两者之和（10px）才是实际门槛，日志里打的 `required` 就是它 |
+| `dual.visibility_samples` | 12 | 沿整条预测轨迹采样几个点做可见性检查。⚠ 检查的是**整条路径**，不只终点 —— 这就是大步长不牺牲可见性的原因 |
+| `dual.score_improvement` | 0.002 | 一个候选至少要把代价 J 改善这么多才配被采纳 |
+| `dual.feedback_min_improvement` | 0.01 | 视觉反馈窗口的净改善门槛。⚠ 达不到就判"原地踏步"中止 —— 别拿它当报警器的关闭开关 |
+| `dual.feedback_fail_windows` | 3 | 连续多少步修正没改善就中止（连败判据），同时也是净改善窗口的长度 |
+| `dual.no_candidate_windows` | 3 | 连续多少个**独立稳定窗口**一个候选都发不出就判失败。定时器重试不计数 |
+| `dual.max_actions` | 160 | 整趟动作数硬上限，兜住病态振荡 |
+| `dual.acquire_timeout_sec` | 60.0 | 获取双码的超时（s） |
+| `dual.observe_timeout_sec` | 120.0 | 获取之后 observe 阶段的独立超时（s） |
+| `dual.camera_wait_sec` | 5.0 | 等 CameraInfo 的宽限（s），等不到就不上场 |
+| `dual.action_timeout_sec` | 6.0 | 单个动作的超时（s）。⚠ 纯直行区"一次走完"会按实际行程放宽，否则 6s 掐死 6.3s 的长直行 |
+| `dual.response_timeout_sec` | 2.0 | 发了命令多久里程计还没动就算底盘没响应（s） |
+| `dual.action_startup_sec` | 0.6 | 起步瞬态宽限（s），期间不判反向 —— 四足换步时先退一点是正常的 |
+| `dual.odom_fresh_sec` | 0.5 | 起步前与行程中要求的里程计新鲜度（s） |
+| `dual.odom_noise_m` | 0.001 | 里程计位移噪声地板（m），门槛推导的基准 |
+| `dual.odom_noise_rad` | 0.002 | 里程计角度噪声地板（rad ≈ 0.11°），同上 |
+| `dual.log_period_sec` | 2.0 | 双码状态日志的打印周期（s） |
+| **— 搜索 / 重试 / 泊出 / 超时 / 安全 —** | | |
+| `search.angular_speed` | 0.3 | 搜索旋转速度（rad/s） |
+| `search.step_angle_deg` | 30.0 | 每步旋转角度（°），建议 ≥ 10°（太小会被半速逻辑拖慢） |
+| `search.pause_time_sec` | 3.0 | 每步之间的检测停留（s）。⚠ 检测流有 1.6~3s 空档，填 1.5s 会整个错过 |
+| `search.initial_look_sec` | 4.0 | 第 0 步的停留（s），开局要多等 RTSP / 检测流冷启动 |
+| `search.hold_time_sec` | 0.5 | 码持续可见多久才算锁定（s） |
+| `search.search_direction` | 1 | 从没见过码时的起始转向：+1 = 逆时针，−1 = 顺时针 |
+| `search.timeout_sec` | 120.0 | 搜索整体超时（s） |
+| `search.rotate_time_sec` | 0.8 | ✗ 已弃用，角度步进化之后不再读取 |
+| `retry.max_retries` | 2 ° | 失败后盲退重锁的次数上限 |
+| `retry.backup_distance` | 0.5 ° | 每次重试盲退的距离（m） |
+| `retry.linear_rate` | 0.08 ° | 重试盲退的速率（m/s） |
+| `retry.timeout_sec` | 15.0 ° | 单次重试的超时（s） |
+| `undock.backup_distance` | 0.8 | 泊出盲退距离（m，正值表示后退） |
+| `undock.linear_rate` | 0.2 | 泊出后退速率（m/s） |
+| `undock.turn_angle_deg` | 90.0 | 泊出转向角（°，正 = 逆时针） |
+| `undock.angular_rate` | 0.3 | 泊出转向速率（rad/s） |
+| `undock.timeout_sec` | 30.0 | 泊出整体超时（s），里程计不走时靠它兜底落 MOTION_FAILED |
+| `tolerance.position_m` | 0.05 | 单码路径判到位的前后容差（m） |
+| `tolerance.yaw_deg` | 10.0 | 单码路径判对准的角度容差（°） |
+| `tolerance.stable_time_sec` | 1.0 | 到位状态要保持多久才算数（s） |
+| `safety.minimum_distance_m` | 0.15 | 安全下限（m）：比这更近就停 |
+| `timeout_sec` | 300.0 | 整趟停泊的总超时（s） |
+| `align_timeout_sec` | 15.0 | ALIGN 阶段超时（s，遗留态，当前流程跳过） |
+| `approach_timeout_sec` | 180.0 | APPROACH 阶段超时（s）。⚠ 静止站立每停 +1.5-2.5s，双码 APPROACH 要跨 1.8→0.6m 约 24 步且纠偏全程同钟，所以从 90 抬到 180 |
+| `final_servo_timeout_sec` | 30.0 | FINAL_SERVO 阶段超时（s） |
 
 ---
 
