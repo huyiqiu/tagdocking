@@ -261,3 +261,40 @@ def test_feedback_failure_names_which_criterion_fired_and_shows_the_trail():
 
     # 一路在改善就不该中止 (判据本身仍有效, 少了这句就只是在测"什么都不发生")
     assert feed_corrections(controller(), [.9, .6, .3, .1]) == ''
+
+
+# ── 墙码丢失取证 ─────────────────────────────────────────────────────
+
+def test_wall_loss_evidence_does_not_confuse_pair_frames_with_wall_frames():
+    """frames 是"成对"计数器, 桩码一缺就被归零(observe 里 pile is None →
+    frames = 0); wall_frames 才是墙码的。我自己就曾把 frames=0 误读成墙码流
+    衰减, 排查方向整条歪掉 —— 串里必须标明 frames=0 只表示桩码缺失。
+    """
+    c = controller()
+    n = int(10e9)
+    c.stopped(0)
+    for i in range(4):
+        c.observe(n + i * int(.1e9), n + i * int(.1e9), (0, 0, 1.5), (0, 0, .6))
+    c.observe(n + int(.5e9), n + int(.5e9), (0, 0, 1.5), None, True)
+    assert c.frames == 0 and c.wall_frames > 0      # 桩码缺失, 墙码仍在
+    ev = c.wall_loss_evidence()
+    assert f'wall_frames={c.wall_frames}' in ev
+    assert '为 0 只表示桩码缺失' in ev
+    assert '上次可用墙码深度=1.500m' in ev
+
+
+def test_wall_margin_report_is_wall_only_and_degrades_readably():
+    """墙码丢失的串里不能用 margin_report(): 它还带桩码余量与 exit_report()
+    ("前进为何被否"), 在"墙码不见了"这句话里读着像自相矛盾。
+    """
+    c = controller()
+    n = int(10e9)
+    c.stopped(0)
+    c.observe(n, n, (0, 0, 1.5), (0, 0, .6))
+    report = c.wall_margin_report()
+    assert report.startswith('wall_margins L/R/T/B=') and 'required=' in report
+    assert 'pile' not in report
+    c.invalidate()
+    assert c.wall_margin_report() == 'wall_margins=<无最后位姿>'
+    c.camera = None
+    assert c.wall_margin_report() == 'wall_margins=<无 CameraInfo>'

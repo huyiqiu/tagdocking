@@ -739,6 +739,43 @@ class DualTagDocking:
         parts.append(self.exit_report())
         return ' '.join(parts)
 
+    def wall_margin_report(self):
+        """只报墙码四边余量。
+
+        墙码丢失的串里不能用 margin_report(): 它还会带上桩码余量与
+        exit_report()("前进为何被否"), 在"墙码不见了"这句话里读着像自相矛盾。
+        """
+        if self.camera is None:
+            return 'wall_margins=<无 CameraInfo>'
+        if self.wall is None:
+            return 'wall_margins=<无最后位姿>'
+        try:
+            b = self.camera.bounds(self.wall, float(self._node._p('dual.wall_tag_size')))
+        except ValueError as exc:
+            return f'wall_margins=<{exc}>'
+        return (f'wall_margins L/R/T/B={b[0]:.0f}/{b[1]:.0f}/{b[2]:.0f}/{b[3]:.0f}px'
+                f' (required={self.required_margin:.0f}px)')
+
+    def wall_loss_evidence(self):
+        """墙码丢失现场取证 — 纯只读, 不改任何状态。
+
+        必须在 invalidate()/reset_filter() 之前调用: 那两个会把 wall/pile/
+        stamp/frames/wall_frames 全部清零, 之后再取证只能拿到 <none>, 日志
+        看着有证据其实全是空值 —— 最坏的失效形态。
+        """
+        parts = [f'stage={self.stage}']
+        if self.wall is None:
+            parts.append('上次可用墙码=<从未取得>')
+        else:
+            parts.append(f'上次可用墙码深度={self.wall[2]:.3f}m')
+        # wall_frames 才是墙码计数; frames 是"成对"计数, 桩码一缺就被归零
+        # (observe() 里 `if pile is None: self.frames = 0`), 读成墙码流衰减
+        # 会把排查带向完全错误的方向。
+        parts.append(f'墙码帧数 wall_frames={self.wall_frames} '
+                     f'(成对帧数 frames={self.frames}, 为 0 只表示桩码缺失)')
+        parts.append(self.wall_margin_report())
+        return ' '.join(parts)
+
     def _no_candidate(self, reason, rejected=None):
         # Consume the window; timer retries cannot count the same observations.
         self.no_candidates += 1

@@ -782,3 +782,139 @@ def test_declared_defaults_match_the_shipped_yaml():
     shipped = next(iter(shipped.values()))['ros__parameters']
     for name, default in declared.items():
         assert shipped[name] == default, f'{name}: yaml={shipped[name]} declare={default}'
+
+
+# ── 墙码丢失族: 中止串必须自己答得出"为什么失败" ────────────────────
+# 现场连续三次停泊失败是同一个物理现象(检测器某帧不含墙码), 操作员却看到三条
+# 互不相干的英文串, 其中一条还在说谎。以下用例钉住"可读"本身, 全部只断言文案
+# 与归因, 不含任何行为断言 —— 行为一字未改。
+
+def _locked_wall_loss(frozen=True, active=True, ids=(51,)):
+    """把节点开到 locked 段再丢墙码, 返回 (节点, abort 理由)。"""
+    n = intake.__wrapped__()
+    n._dual.stage = 'locked'
+    n._frozen, n._executor.is_active = frozen, active
+    stamp = n.now
+    n.detect()
+    n.supply(stamp)
+    n._retry_dual_detections(n.now)         # 先拿到一帧可用墙码当证据
+    n.now += 200_000_000
+    n.detect(ids=ids)
+    return n, n.events[-1]
+
+
+def test_wall_loss_abort_says_wall_tag_lost_in_plain_chinese():
+    """开头四个字就得是"墙码丢失", 且不再出现操作员看不懂的英文 jargon。"""
+    _, reason = _locked_wall_loss()
+    assert reason.startswith('墙码丢失')
+    for jargon in ('wall detection lost', 'wall stream stale',
+                   'wall stream lost', 'no search/reverse'):
+        assert jargon not in reason
+
+
+def test_wall_loss_reason_reports_what_the_detector_actually_saw():
+    """{51} 与空集是两个完全不同的根因, 必须给出不同的排查指向。
+
+    桩码还在 → 相机与检测流没断, 是墙码这一个没解出来;
+    整帧零检测 → 查检测链路/图像流, 与墙码无关。旧串对两者一字不差。
+    """
+    _, pile_only = _locked_wall_loss(ids=(51,))
+    _, nothing = _locked_wall_loss(ids=())
+    assert '检测器可见={51}' in pile_only and '查墙码本身' in pile_only
+    assert '整帧一个码都没有' in nothing and '查检测链路/图像流' in nothing
+    assert pile_only != nothing
+
+
+def test_wall_loss_reason_distinguishes_mid_move_from_after_stop():
+    """现场失败 A(盲走 1.00s 时被杀) 与 C(机动结束后 1.1ms) 旧串逐字相同,
+    我只能靠手工对时间戳把它们分开。三种相位必须各自可读。
+
+    这同时钉住"取证早于 _executor.cancel()": cancel() 把 is_active 翻成
+    False, 取晚一行, 三种相位就全都读成"已停稳"。
+    """
+    _, moving = _locked_wall_loss(frozen=True, active=True)
+    _, unsettled = _locked_wall_loss(frozen=True, active=False)
+    _, stopped = _locked_wall_loss(frozen=False, active=False)
+    assert '丢失时=盲走执行中' in moving
+    assert '丢失时=冻结未收口' in unsettled
+    assert '丢失时=已停稳' in stopped
+    assert len({moving, unsettled, stopped}) == 3
+
+
+def test_wall_loss_evidence_survives_the_invalidation_that_precedes_the_abort():
+    """最关键的一条: 抹除发生在中止之前。
+
+    _invalidate_dual_pose / observe(..., None) 都会 reset_filter(), 把
+    wall/stamp/帧数清零。取证若退回原位, 串里就是"从未取得"与空余量 ——
+    看着有证据其实全是空值, 最坏的失效形态。
+    """
+    n, reason = _locked_wall_loss(frozen=False, active=False)
+    assert n._dual.wall is None and n._dual.stamp == 0   # 证据确实已被抹掉
+    assert '上次可用墙码深度=1.500m' in reason            # 但串里留住了
+    assert 'wall_frames=1' in reason
+    assert 'required=' in reason and '<无最后位姿>' not in reason
+
+
+def test_stale_locked_watchdog_reason_names_fresh_sec():
+    n = intake.__wrapped__()
+    n._dual.stage = 'locked'
+    stamp = n.now
+    n.detect()
+    n.supply(stamp)
+    n._retry_dual_detections(n.now)
+    n.now += 900_000_000
+    reason = n._wall_stale_reason(n.now, n._motion_phase())
+    assert reason.startswith('墙码丢失')
+    assert 'dual.fresh_sec' in reason and 'ms' in reason
+
+
+def _outer_budget_reason(**extra):
+    sm = DockingStateMachine(clock_node())
+    sm._tag_lost_count = 51
+    params = {'dual_enable': True, 'tag': {'tag_loss_timeout_sec': 2.5}}
+    params.update(extra)
+    return sm._wall_loss_reason(params)
+
+
+def test_outer_wall_loss_blames_the_settle_window_when_it_is_to_blame():
+    """旧串 'dual wall stream lost' 在说谎: 现场失败 B 里墙码一直看得见,
+    2.5s 预算有 1.6s 花在 dual.settle_sec 停稳窗的按设计拒收上。操作员照串
+    去查相机, 方向完全错。新串必须把这笔账算出来并点名 dual.settle_sec。
+    """
+    now = int(100e9)
+    reason = _outer_budget_reason(
+        dual_now_ns=now, dual_settle_until_ns=now - int(0.93e9),
+        dual_settle_sec=1.5, dual_wall_loss='检测器最近给出墙码=60ms 前')
+    assert reason.startswith('墙码丢失')
+    assert 'dual.settle_sec' in reason and '真正的丢码宽限只有 0.93s' in reason
+    assert '不退回 SEARCH_TAG' in reason      # 双码路径不搜索不重试, 文档曾写错
+    # 停稳窗早已过期时不得再拿它当借口
+    clean = _outer_budget_reason(dual_now_ns=now,
+                                 dual_settle_until_ns=now - int(9e9),
+                                 dual_settle_sec=1.5)
+    assert '停稳静止窗' not in clean
+
+
+def test_outer_wall_loss_resolves_lazy_evidence():
+    """取证按闭包下发(20Hz 不白算), 串里必须是取证结果而不是 <function ...>。"""
+    reason = _outer_budget_reason(dual_wall_loss=lambda: '检测器本轮从未给出墙码')
+    assert '检测器本轮从未给出墙码' in reason and 'function' not in reason
+
+
+def test_outer_wall_loss_stays_readable_without_any_node_evidence():
+    """假 params(单测/无取证接口)下仍须给出可读中文串: 不 KeyError、不空串。"""
+    reason = _outer_budget_reason()
+    assert reason.startswith('墙码丢失') and '证据不可得' in reason
+    bare = DockingStateMachine(clock_node())._wall_loss_reason({})
+    assert bare.startswith('墙码丢失')
+
+
+def test_abort_reason_is_kept_for_the_action_result():
+    """理由过去只活在一行日志里, action 客户端只拿到 'motion_failed'。"""
+    sm = DockingStateMachine(clock_node())
+    assert sm.failure_reason == ''
+    sm.abort_motion('墙码丢失 — 测试')
+    assert sm.state == DockingState.MOTION_FAILED
+    assert sm.failure_reason == '墙码丢失 — 测试'
+    sm.reset()
+    assert sm.failure_reason == ''

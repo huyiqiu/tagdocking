@@ -102,6 +102,10 @@ class DockingNode(Node):
         self._dual_received_ns = 0
         self._dual_window_ns = 0
         self._dual_diag_ns = {}
+        # 最后一次拒收的原因与时刻 + 各原因计数: 落点 3 的子因归因 (真丢 /
+        # 帧到了被否 / 停稳窗按设计丢) 全靠这两个, 只写不读判据。
+        self._dual_reject_last = None
+        self._dual_reject_count = {}
         self._dual_info = {}
         self._dual_watch = None
         # 连续"过期"帧的起点与最大观测延迟: 双码用固定 dual.fresh_sec 时效窗
@@ -786,8 +790,99 @@ class DockingNode(Node):
         else:
             self._dual_diag_ns[key] = (previous[0], previous[1]+1, stage)
 
+    def _detector_saw(self, ids):
+        """检测器这一帧到底看见了什么 —— 区分两个完全不同的根因。
+
+        墙码单独没检出 (桩码还在) = 墙码自身问题 (光照/反光/运动模糊/污损);
+        整帧一个码都没有 = 检测链路或图像流的问题, 与墙码无关。不分开报,
+        操作员只能两边都猜。
+        """
+        wall_id, pile_id = int(self._p('tag.id')), self._dual.pile_tag_id
+        seen = '{' + ','.join(str(i) for i in sorted(ids)) + '}' if ids else '{}(空)'
+        if not ids:
+            hint = '整帧一个码都没有 → 查检测链路/图像流, 不是墙码本身的问题'
+        elif pile_id in ids:
+            hint = f'桩码 {pile_id} 检出了、墙码 {wall_id} 单独没检出 → 查墙码本身: 光照/反光/运动模糊/污损'
+        else:
+            hint = f'墙码 {wall_id} 未检出 → 查墙码本身: 光照/反光/运动模糊/污损'
+        return f'检测器可见={seen} ({hint})'
+
+    def _motion_phase(self):
+        """丢失发生在盲走途中 / 冻结未收口 / 已停稳 —— 三者排查方向完全不同。
+
+        必须在 _executor.cancel() 之前调用: cancel() 把 _action 置 idle,
+        is_active 随即转 False, 之后取相位只会得到"已停稳" —— 现场失败 A
+        (盲走 1.00s 时被杀) 与 C (机动结束后 1.1ms 被杀) 就此再也分不开,
+        而这正是本批要给出的那个区分。
+        """
+        confirm = self._dual.p('missing_confirm_sec')
+        blind = ('locked 阶段故意绕过冻结门, 运动期的帧也能进来; 墙码无确认窗, '
+                 f'一帧即杀 —— 桩码有 dual.missing_confirm_sec={confirm:.1f}s')
+        if self._executor.is_active:
+            return f'丢失时=盲走执行中 ({blind}) → 首先怀疑运动模糊'
+        if self._frozen:
+            # 帧能走到这里说明 settle 窗还没武装 (stamp < settle_until_ns 会被
+            # :872 拦掉), 所以这是"机动已停、_mark_stopped 还没跑"的那一个 tick。
+            return (f'丢失时=冻结未收口 (机动已结束但 _mark_stopped 尚未执行, '
+                    f'停稳窗还没武装; {blind}) → 仍属运动尾段, 先查运动模糊')
+        return '丢失时=已停稳 → 静止下都检不出, 查检测器/曝光/相机对焦'
+
+    def _wall_lost_reason(self, ids, evidence, phase):
+        """落点 1: locked 末段检测器确证缺墙码。ids/evidence/phase 均为抹除前快照。"""
+        return ('墙码丢失 — locked 末段检测器确证这一帧里没有墙码, 立即中止; '
+                + self._detector_saw(ids) + '; ' + phase
+                + ('; ' + evidence if evidence else '')
+                + '; 排查: 四边余量若远大于 required 就不是几何/出画问题, 是检测掉帧')
+
+    def _wall_stale_reason(self, now_ns, phase):
+        """落点 2: locked 行进中墙码流断供 (dual.fresh_sec 内无可用帧)。"""
+        window = self._dual.p('fresh_sec')
+        live = getattr(self, '_dual_live_wall_ns', 0) or self._dual.stamp
+        age = f'{(now_ns-live)/1e6:.0f}ms' if live else '<本段从未取得墙码>'
+        return (f'墙码丢失 — locked 行进中连续 {window:.2f}s (dual.fresh_sec) '
+                f'内没有一帧可用墙码, 距上次可用墙码 {age}; ' + phase + '; '
+                + self._dual.wall_loss_evidence()
+                + '; 排查: 检测流实测有 1.6~3s 空档, 若余量宽裕则是掉帧而非几何; '
+                f'必要时上调 dual.fresh_sec (当前 {window:.2f}s)')
+
+    def _wall_loss_outer_evidence(self, now_ns):
+        """落点 3 的证据 + 子因归因。
+
+        tag_visible 为假有三个完全不同的原因, 旧串 ('dual wall stream lost')
+        只说了第一个, 于是把操作员送去查相机 —— 现场失败 B 就是这么查错方向的:
+          (a) 真丢     检测器从未/很久没给出墙码;
+          (b) 帧到了被否 墙码一直看得见, 是采纳前的判据拒掉的;
+          (c) 停稳窗   settle 窗内每帧按设计丢弃, 计数器却照涨。
+        (c) 的重叠时长由状态机侧算 (它才知道丢码窗起点), 这里只给事实。
+        """
+        seen = getattr(self, '_dual_wall_seen_ns', 0)
+        absent = getattr(self, '_dual_wall_absent_ns', 0)
+        last = getattr(self, '_dual_reject_last', None)
+        parts = []
+        if not seen:
+            parts.append('检测器本轮从未给出墙码 → (a) 真丢: 查相机/检测节点是否还在出帧')
+        else:
+            parts.append(f'检测器最近给出墙码={(now_ns - seen) / 1e6:.0f}ms 前')
+        if absent:
+            parts.append(f'最近一次"帧里确无墙码"={(now_ns - absent) / 1e6:.0f}ms 前')
+        if last:
+            parts.append(f'末次拒收={last[0]} ({(now_ns - last[1]) / 1e6:.0f}ms 前)')
+            if seen and 'wall missing' not in last[0]:
+                parts.append('→ (b) 墙码一直看得见, 帧是被采纳前的判据否掉的: '
+                             '照这条拒收原因查, 别去查相机')
+        parts.append(self._dual.wall_loss_evidence())
+        return '; '.join(parts)
+
     def _dual_diagnostic(self, reason, stamp, now):
         """Per-reason throttle on the docking logger, never the video logger."""
+        # 每条拒收路径都会走到这里, 所以顺手记账: 落点 3 的子因归因全靠它,
+        # 不需要新增任何判断分支。getattr 兜底是因为单测的假节点是
+        # cls.__new__(cls) 造的, 不跑 __init__。
+        self._dual_reject_last = (reason, now)
+        counts = getattr(self, '_dual_reject_count', None)
+        if counts is None:
+            counts = self._dual_reject_count = {}
+        counts[reason] = counts.get(reason, 0) + 1
         previous = self._dual_diag_ns.get(reason)
         if previous is None or now < previous or now - previous >= 2_000_000_000:
             self._dual_diag_ns[reason] = now
@@ -858,6 +953,13 @@ class DockingNode(Node):
         stamp = msg.header.stamp.sec * 1000000000 + msg.header.stamp.nanosec
         ids = {d.id for d in msg.detections}
         wall_id, pile_id = int(self._p('tag.id')), self._dual.pile_tag_id
+        # 纯记账, 无判据: 检测器到底有没有出过墙码, 是"真丢"与"帧到了但被采纳
+        # 前的判据否掉"的唯一分辨依据。放在状态门之前, 冻结期与终态的帧也如实
+        # 计入 —— 问的是检测器出没出, 不是我们用没用。
+        if wall_id in ids:
+            self._dual_wall_seen_ns = stamp
+        else:
+            self._dual_wall_absent_ns = stamp
         # "双码发现" 已移除: 它只报告"检测器看见了", 与能否使用无关, 每 2s 一条
         # 却把真正的决策日志冲散。检测是否被采纳由 "双码有效" / dual detection
         # <reason> 两路如实反映, 信息不丢。
@@ -888,6 +990,15 @@ class DockingNode(Node):
         self._clear_dual_expiry()
         self._dual_received_ns = stamp
         if wall_id not in ids:
+            # 取证必须先于下面的抹除, 有两道抹除, 少躲一道证据就是空的:
+            #   _invalidate_dual_pose / observe(..., None) → reset_filter(),
+            #       把 wall/stamp/帧数清零 (margin_report 于是只剩 <none>);
+            #   _executor.cancel() → _action='idle', is_active 转 False,
+            #       "盲走中还是已停稳" 于是恒读成已停稳。
+            if self._dual.stage == 'locked':
+                evidence, phase = self._dual.wall_loss_evidence(), self._motion_phase()
+            else:
+                evidence = phase = ''
             # Confirmed absence supersedes older pending observations: none may
             # resurrect wall visibility after this negative observation.
             self._dual_pending.clear()
@@ -898,7 +1009,8 @@ class DockingNode(Node):
                 self._dual_live_wall_ns = 0
                 self._adapter.publish_stop()
                 self._executor.cancel()
-                self._sm.abort_motion('locked final: wall detection lost')
+                self._sm.abort_motion(
+                    self._wall_lost_reason(ids, evidence, phase))
             return
         # Drop NEW arrivals when full, never evict a waiting head for new frames.
         if len(self._dual_pending) >= 64:
@@ -1025,9 +1137,11 @@ class DockingNode(Node):
                 and self._executor.is_active
                 and now_ns > self._dual_stand_grace_ns
                 and not self._dual.fresh(now_ns, getattr(self, '_dual_live_wall_ns', self._dual.stamp))):
+            # 同样必须在 cancel() 之前取相位, 否则恒读"已停稳"。
+            reason = self._wall_stale_reason(now_ns, self._motion_phase())
             self._adapter.publish_stop()
             self._executor.cancel()
-            self._sm.abort_motion('locked final: wall stream stale')
+            self._sm.abort_motion(reason)
         if self._dual.enabled and self._sm.state == DockingState.SEARCH_TAG:
             self._lookup_camera_offset()
             if self._dual.failure:
@@ -1038,6 +1152,15 @@ class DockingNode(Node):
         # State machine evaluation
         params = self._build_params_dict()
         params['dual_enable'] = self._dual.enabled
+        if self._dual.enabled:
+            # 墙码丢失取证经 params 下发: state_machine 对节点内部只用
+            # get_logger(), 不许伸手进来, params 是既有且唯一的数据通道。
+            # 传的是闭包而不是字符串: 取证要做四角投影与一串格式化, 而它每
+            # 2000 个 tick 才用得上一次, 20Hz 白算是纯浪费。
+            params['dual_wall_loss'] = lambda: self._wall_loss_outer_evidence(now_ns)
+            params['dual_settle_until_ns'] = self._dual.settle_until_ns
+            params['dual_settle_sec'] = self._dual.p('settle_sec')
+            params['dual_now_ns'] = now_ns
         self._sm.evaluate(
             tag_pose=tag_pose,
             tag_visible=tag_visible,
@@ -2117,6 +2240,8 @@ class DockingNode(Node):
         self._dual_posture.reset()          # 姿态序列回 IDLE (新轮 dock 重新趴下)
         self._dual_stand_grace_ns = 0
         self._dual_diag_ns.clear()
+        self._dual_reject_last = None
+        self._dual_reject_count.clear()
         self._clear_dual_expiry()          # 新一轮从零计延迟, 不继承上轮
         # 新一轮 dock 重做粗对准: 上一轮结束时的朝向与本轮无关 (中间可能
         # 搜索转了一圈、也可能倒车重锁), 预算同样从零。
@@ -2359,7 +2484,12 @@ class DockingNode(Node):
             return Dock.Result(success=True, message='docked')
         else:
             goal_handle.abort()
-            return Dock.Result(success=False, message=self._sm.state_name.lower())
+            # 保留 state_name 前缀 (可能有 startswith/in 的消费者), 只追加理由:
+            # 光一个 'motion_failed' 让调用方对失败原因一无所知。
+            reason = self._sm.failure_reason
+            state = self._sm.state_name.lower()
+            return Dock.Result(success=False,
+                               message=f'{state}: {reason}' if reason else state)
 
     def _dock_cancel_cb(self, cancel_request):
         self._sm.cancel()

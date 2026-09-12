@@ -1430,6 +1430,7 @@ python3 scripts/calibrate_rtsp --url rtsp://...   # RTSP 模式 (纯 ssh 无 GUI
 | 转向后丢 tag 回 SEARCH_TAG | 转太快出 FOV / settle 太短 | 减小 `stopgo.max_turn_step` 或 `jog_angular_rate`；加大 `stopgo.turn_settle_sec` |
 | 直行失败报导航失败（自动重试） | 进入直行距离时方位 > `final_straight.yaw_threshold_deg` 或 \|横向\| > `final_straight.entry_lateral_m` | 看"直行失败"日志里的方位/横向误差；近场修正门槛已与入口包络同步（`tighten_distance`），仍不足可收紧 `entry_lateral_m`/`yaw_threshold_deg`，或放宽入口门槛 |
 | 重试耗尽落 MOTION_FAILED | 多次直行失败 / 倒车时里程计不走 | 看日志定位具体原因；检查底盘是否响应 `/cmd_vel`、里程计话题是否正确 |
+| `墙码丢失 …` 中止 | 墙码族三个看门狗之一触发，失败串已自述是哪一个 | **按串里的字段顺序读，四个问题它自己都答得出**。①`检测器可见=`：`{51}` = 桩码在、相机与检测流没断，是墙码这一个没解出来（查光照/反光/运动模糊/污损）；`{}(空)` = 整帧零检测，查检测链路/图像流，**与墙码无关**。②`丢失时=`：`盲走执行中`/`冻结未收口` 都属运动尾段，先查运动模糊；`已停稳` = 静止下都检不出，查检测器/曝光/对焦。③`wall_margins L/R/T/B` 比 `required`：余量远大于 required 就**不是**出画/几何问题，是检测掉帧，别去调 `observation_distance`。④串里若出现 `(c) 真正的丢码宽限只有 X.XXs`：这一条几乎从不是「检测流断了」，而是 `tag.tag_loss_timeout_sec` 预算被 `dual.settle_sec` 停稳窗吃掉，调这两个参数，**不要去查相机**。另注：`wall_frames` 才是墙码计数，`frames` 是成对计数器、桩码一缺就归零，`frames=0` **不**代表墙码在衰减 |
 | 停泊位置系统性偏前/偏后 | `tag.size` 不对 / 相机内参不准 | `test_apriltag --known-distance` 验证实测距离，重标定 |
 | 停泊位置横向偏 | 相机安装 TF（`mount.*`/URDF）不准 / 相机光学中心偏离底盘中心线 | RTSP 模式校准 `camera_mount_y`；若量测 lat 系统性偏小且近侧腿撞桩，设 `camera.lateral_offset_m` 补偿（+ = 相机偏左） |
 | 双码停泊终点系统性偏左/右 | 纯直行区行进中 yaw 漂移，或航向保持没生效 | 读 `dual action COMPLETE` 日志的 `Δyaw`：持续 > 2° 说明保持没起作用——查 `stopgo.heading_hold_enable`，再 `ros2 topic echo /cmd_vel --field angular.z` 看 wz 是否被 clampAxis 截零（截零就调大 `heading_hold_rate` 到 0.15~0.18）。`航向保持已用` 打印 0° = 从未接通；打印"预算耗尽"= 底盘不响应 wz 或 odom yaw 异常。若 `Δyaw≈0` 却仍偏，那是**横向平移**不是航向漂移，本参数组管不了（看上一行） |
@@ -1667,7 +1668,7 @@ ros2 param get  /docking_node stopgo.heading_hold_budget_deg
 | `tag.frame` | `tag36h11:0` | 墙码 TF frame 名，须与 apriltag_ros 的输出一致 |
 | `tag.id` | 0 | 墙码 ID |
 | `tag.fresh_timeout_sec` | 2.0 | 超过此时长没有新检测就算"陈旧"。6fps + 转向盲区下 1.0 会误判 TAG_LOST，故放宽 |
-| `tag.tag_loss_timeout_sec` | 2.5 | 接近途中连续丢码超此时长才退回 SEARCH_TAG。检测流实测有 1.6~3s 空档，填 1s 必抖动 |
+| `tag.tag_loss_timeout_sec` | 2.5 | 接近途中连续丢码超此时长。检测流实测有 1.6~3s 空档，填 1s 必抖动。**仅单码路径退回 SEARCH_TAG；双码路径直落 MOTION_FAILED，不搜索、不重试**（此处曾误写为「退回 SEARCH_TAG」——双码下那个恢复根本不会发生）。预算还会被 `dual.settle_sec` 停稳窗吃掉一截：窗内每帧按设计拒收而计数器照涨，2.5s 实测只剩 ~0.93s 真实宽限 |
 | `tag.ema_alpha` | 0.5 | 位姿 EMA 平滑系数（0 = 重平滑，1 = 原始）。法线方向走圆周 EMA，不会在 ±180° 处炸 |
 | `tag.max_pose_jump_m` | 0.3 | 单帧跳变超过此距离直接丢弃，挡运动模糊坏帧 |
 | `dock_target.distance` | 0.55 | 单码路径的停泊距离（m，底盘到码）。**双码路径用 `dual.dock_distance`**，两者互不相干 |

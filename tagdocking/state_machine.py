@@ -86,6 +86,10 @@ class DockingStateMachine:
         self._search_tag_hold_start_ns = 0
         self._align_hold_count = 0
         self._tag_lost_count = 0
+        # 失败理由留档: 过去它只活在一行 error 日志里, 之后无处可取, 通过
+        # action 调用的客户端连一个字都拿不到 (只有 'motion_failed')。纯诊断,
+        # 没有任何判据读它。
+        self._abort_reason = ''
 
         # Final servo stability
         self._stable_since_ns = 0
@@ -217,6 +221,47 @@ class DockingStateMachine:
                 f'停靠失败且已达最大重试次数({self._max_retries})')
             self._transition_to(DockingState.MOTION_FAILED)
 
+    @property
+    def failure_reason(self) -> str:
+        """最后一次 abort_motion 的理由, 供 action 结果回传。"""
+        return getattr(self, '_abort_reason', '')
+
+    def _wall_loss_reason(self, params) -> str:
+        """双码外层丢码看门狗的失败串 —— 开头四个字必须是"墙码丢失"。
+
+        旧串 'dual wall stream lost; no search/reverse' 有两处误导:
+        它断言"流断了"(而多数情况下墙码一直看得见, 只是被采纳前的判据否掉),
+        且完全不提预算被 dual.settle_sec 停稳窗结构性吃掉一截。现场 2.5s 预算
+        里有 1.57s 花在按设计拒收上, 真实宽限只剩 0.93s —— 而 yaml 自己写着
+        检测流实测有 1.6~3s 空档。这里把这笔账算给操作员看。
+
+        证据经 params 下发 (字符串或惰性闭包皆可); 没有节点喂证据时 (单测假
+        params) 仍须给出可读中文串, 绝不 KeyError、绝不空串。
+        """
+        budget = params.get('tag', {}).get('tag_loss_timeout_sec', 2.5)
+        lost = self._tag_lost_count * 0.05
+        head = (f'墙码丢失 — 外层丢码看门狗预算耗尽: 连续 {lost:.2f}s 没有一帧墙码被采纳 '
+                f'(> tag.tag_loss_timeout_sec {budget:.2f}s, 20Hz 累计 '
+                f'{self._tag_lost_count} tick); 双码路径到此直落 MOTION_FAILED '
+                '—— 不退回 SEARCH_TAG、不搜索、不后退 (单码路径才会退回搜索)')
+        now_ns = params.get('dual_now_ns') or 0
+        settle_until = params.get('dual_settle_until_ns') or 0
+        if now_ns and settle_until:
+            # 丢码计数只会在 maneuver_active 转假后才开始涨, 而停稳窗正是在
+            # 那一 tick 武装的, 所以窗起点 = now - lost 这个估计对现场是准的。
+            overlap = max(0.0, (min(now_ns, settle_until) - (now_ns - lost * 1e9)) / 1e9)
+            if overlap > 0.05:
+                head += (f'; 其中 {overlap:.2f}s 落在停稳静止窗内 '
+                         f'(dual.settle_sec {params.get("dual_settle_sec", 1.5):.2f}s, '
+                         f'窗内每一帧按设计丢弃) → (c) 真正的丢码宽限只有 '
+                         f'{max(0.0, lost - overlap):.2f}s; 先调 tag.tag_loss_timeout_sec '
+                         '或缩短 dual.settle_sec, 这一条几乎从不是"检测流断了"')
+        evidence = params.get('dual_wall_loss')
+        if callable(evidence):
+            evidence = evidence()
+        return head + '; ' + (evidence
+                              or '证据不可得 (节点未提供取证, 只能翻 dual detection <reason> 日志)')
+
     def abort_motion(self, reason: str = ''):
         """系统级失败 — 直接落 MOTION_FAILED, 不再重试。
 
@@ -226,6 +271,7 @@ class DockingStateMachine:
         失败, 倒车重试毫无意义且同样发不出 cmd_vel, 必须直落终态。
         """
         if reason:
+            self._abort_reason = reason
             self._node.get_logger().error(f'运动中止：{reason}')
         self._transition_to(DockingState.MOTION_FAILED)
 
@@ -246,6 +292,7 @@ class DockingStateMachine:
         self._search_tag_hold_start_ns = 0
         self._align_hold_count = 0
         self._tag_lost_count = 0
+        self._abort_reason = ''
         self._stable_since_ns = 0
         self._retry_count = 0
 
@@ -303,7 +350,7 @@ class DockingStateMachine:
                 else:
                     self._tag_lost_count = 0
                 if self._tag_lost_count * 0.05 > params.get('tag', {}).get('tag_loss_timeout_sec', 2.5):
-                    self.abort_motion('dual wall stream lost; no search/reverse')
+                    self.abort_motion(self._wall_loss_reason(params))
                 return self._state
 
             # Tag lost during a vision state → try to re-acquire rather than

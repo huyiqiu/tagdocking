@@ -28,6 +28,10 @@ docking_node:
     tag.id: 0                                 # tag ID to dock to
     tag.fresh_timeout_sec: 2.0                # tag considered stale after N seconds (6fps + 转向盲区, 放宽避免误判 TAG_LOST)
     tag.tag_loss_timeout_sec: 2.5             # s — 接近中连续丢 tag 超此时长才回 SEARCH_TAG (检测流实测有 1.6~3s 空档, 1s 必抖动)
+                                              #   仅单码路径退回 SEARCH_TAG; 双码路径到此直落 MOTION_FAILED, 不搜索不重试。
+                                              #   且预算会被 dual.settle_sec(1.5s) 停稳窗结构性吃掉一截 (窗内每帧按设计拒收,
+                                              #   计数器却照涨), 2.5s 实测只剩 ~0.93s 真实宽限 —— 比上面那个 1.6~3s 空档还短。
+                                              #   失败串会把这笔账算出来 (见「墙码丢失 — 外层丢码看门狗预算耗尽」)。
     tag.ema_alpha: 0.5                        # EMA smoothing factor (0=heavier, 1=raw)
     tag.max_pose_jump_m: 0.3                  # reject single-frame jumps > N meters
 
