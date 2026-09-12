@@ -53,7 +53,7 @@ import tf2_ros
 from .utils import TagPose, yaw_from_quat, normalize_angle, tag_normal_angle
 from .pose_buffer import PoseBuffer
 from .geometry_planner import GeometryPlanner, ActionPlan
-from .action_executor import ActionExecutor
+from .action_executor import ActionExecutor, HeadingHold
 from .state_machine import DockingStateMachine, DockingState
 from .posture_mode import PostureMode
 from .charge_mode import ChargeMode
@@ -460,6 +460,31 @@ class DockingNode(Node):
         self.declare_parameter('stopgo.small_turn_rad', 0.1)
         self.declare_parameter('stopgo.theta_shrink_ratio', 2.0)
         self.declare_parameter('stopgo.drift_tol', 0.15)
+
+        # ── 行进中航向保持 (双码纯直行区专用) ─────────────────────────
+        # 区内一次走完剩余距离不再走停, 于是行程中新产生的 yaw 漂移没有
+        # 任何停看点能纠 —— 只能边走边守。参考量取 odom/IMU yaw 相对起步
+        # 的增量 (不取墙码 bearing: 盲动期没有 bearing, 且近场 bearing 的
+        # 横向力臂增益正是区内禁转向的理由)。
+        # 形态是**带迟滞的继电**而非比例律: l1w_control 有 min_angular_z
+        # 死区 0.10, |wz|<0.10 被 clampAxis 截成 0, 比例式命令根本发不出去。
+        self.declare_parameter('stopgo.heading_hold_enable', True)
+        # 唯一约束: > 死区 0.10。代码另有 max(rate, min_angular_rate) 结构
+        # 性抬底, 配进死区也不会静默失效。调大恶化单周期粒度。
+        self.declare_parameter('stopgo.heading_hold_rate', 0.12)
+        # 接通门槛: 0.5m·sin(2°)=17.5mm < dual.dock_tolerance(20mm), 即
+        # "残余航向的终点横向代价刚好小于停泊容差"这一点。
+        self.declare_parameter('stopgo.heading_hold_engage_deg', 2.0)
+        # 断开门槛**绝不取 0**: 命令→odom 报告有 0.1-0.15s 滞后, 瞄 0 必
+        # 过冲换符号 → 抖振。1.3° 迟滞带 > 最短接通粒度 1.03°。
+        self.declare_parameter('stopgo.heading_hold_release_deg', 0.7)
+        # 单周期 wz 脉冲底盘/步态规划器不一定响应; 3 周期 ≈ 一个步态相位。
+        self.declare_parameter('stopgo.heading_hold_min_engage_sec', 0.15)
+        # 覆盖命令→odom 滞后, 让下一次接通决策基于已沉降的读数。
+        self.declare_parameter('stopgo.heading_hold_cooldown_sec', 0.30)
+        # 不是安全边界 (那由"只降 |err|"的符号规则给), 是"底盘不响应 wz /
+        # odom yaw 疯了"的诊断闸。正常一趟需 5-10°, 定低会静默关掉功能。
+        self.declare_parameter('stopgo.heading_hold_budget_deg', 15.0)
 
         # ── 静止站立 (posture) — 走停 × 呼吸抑制 ──────────────────────
         # 每个停看点的"停"升级为: static_stand 锁定(不喘) → 等稳定帧 →
@@ -1158,7 +1183,18 @@ class DockingNode(Node):
             )
             if done:
                 if self._dual.enabled:
-                    self.get_logger().info(f'dual action COMPLETE signed_odom={self._dual_watch.signed:+.6f}; awaiting settled visual feedback')
+                    # Δyaw / 航向保持已用 是第 0 步就要的现场观测量: 前者是
+                    # "这一程到底歪了多少"的唯一读数 (定 engage/budget 靠它),
+                    # 后者区分"没漂移"与"保持压根没接通"。
+                    hold_note = ''
+                    if self._executor.jog_hold_spent:
+                        hold_note = ' [预算耗尽/yaw 不可信 → 本程后段纯直行]'
+                    self.get_logger().info(
+                        f'dual action COMPLETE signed_odom={self._dual_watch.signed:+.6f} '
+                        f'Δyaw={math.degrees(self._executor.jog_yaw_error):+.2f}deg '
+                        f'航向保持已用={math.degrees(self._executor.jog_hold_used):.2f}deg'
+                        f'{hold_note}; awaiting settled visual feedback')
+
                     # 粗对准步不进双码的视觉反馈账: 它没有 active_feedback
                     # (未走 action_started), 记进去只会污染 feedback 判据。
                     # 清标志统一在 _mark_stopped —— 那是本 tick 之后、且能同时
@@ -1921,9 +1957,21 @@ class DockingNode(Node):
                 scale = (self._p('stopgo.jog_odom_scale')
                          if plan.jog_distance >= 0
                          else self._p('stopgo.jog_backward_odom_scale'))
+                # 航向保持只给双码纯直行区那一步"一次走完"的长直行。复用
+                # plan.continuous 而不新增字段: 它的产出点只有一处
+                # (dual_docking._advance 区内分支), 语义恰好是"区内禁转向、
+                # 一步走完剩余距离", 与要保持航向的区间完全同一。
+                # 排除项都是有意的: 回退修剪 (continuous=False, ≤10cm/1.25s,
+                # 短到攒不出 engage 门槛的漂移, 且倒走叠 wz 的运动学未验证)、
+                # 区外 forward_step 逐步走 (那里墙码 bearing 微调活着, 每停
+                # 都在纠方向)、泊出/重试盲腿 (根本不经过这里)、单码通道
+                # (另有 final_straight 一套)。
+                hold = self._heading_hold_params() if (
+                    self._dual.enabled and plan.continuous
+                    and plan.jog_distance > 0) else None
                 self._executor.start_jog(
                     plan.jog_distance, self._p('stopgo.jog_linear_rate'),
-                    blind=True, odom_scale=scale)
+                    blind=True, odom_scale=scale, hold=hold)
                 if not self._executor.is_active:
                     return False
                 self._executor.set_odom_ref(
@@ -1976,12 +2024,24 @@ class DockingNode(Node):
         """Publish the current action's velocity command via the adapter."""
         kind = self._executor.action_kind
         if kind == 'jogging':
-            self._adapter.publish_jog(self._executor.linear_cmd)
+            angular = self._executor.angular_cmd
+            # angular == 0 时**必须**走 publish_jog: BaseAdapter.publish_arc 的
+            # 默认实现回落成纯原地转, 会把前进速度整个丢掉。三个具体 adapter
+            # 都覆写了 publish_arc, 但默认实现是个陷阱 —— 这道分支让"未接通"
+            # 这条常态路径在任何 adapter 上都与航向保持上线前逐位相同, arc
+            # 只出现在真正接通的那零点几秒。
+            if angular:
+                self._adapter.publish_arc(self._executor.linear_cmd, angular)
+            else:
+                self._adapter.publish_jog(self._executor.linear_cmd)
         elif kind == 'turning':
-            # 纯原地转弯。之前的"边走边转"(arc)方案会叠加前进速度，可能让小车
-            # 驶出目标的横向范围——已弃用。转向精度靠里程计校准（full=True 全量
-            # 盲转），转得慢一点没关系；若差速轮原地转需克服静摩擦，宁可加大
-            # jog_angular_rate，也不叠加前向速度。
+            # 纯原地转弯。"转向时叠加前进速度"(arc) 已弃用: 规划器要的是原地
+            # 转 θ 度, 叠上 vx 会让车沿弧驶出目标横向范围。转向精度靠里程计
+            # 校准 (full=True 全量盲转), 转得慢没关系; 差速轮原地转若需克服
+            # 静摩擦, 宁可加大 jog_angular_rate, 也不叠前向速度。
+            # 注意与上面 jogging 分支的 arc 区分, 那是方向相反的另一件事:
+            # 这条禁的是"本该只转、却混进了走", 那条是"本该只走、要守住不歪"
+            # (行进中航向保持, 见 HeadingHold)。
             self._adapter.publish_turn(self._executor.angular_cmd)
         elif kind == 'lateral':
             if hasattr(self._adapter, 'publish_lateral'):
@@ -2095,6 +2155,35 @@ class DockingNode(Node):
             self._p('stopgo.max_turn_step'),
             2.0 * self._theta_bounds_fn(),
         )
+
+    def _heading_hold_params(self) -> HeadingHold | None:
+        """行进中航向保持的继电参数; None = 关闭 (等价于 wz≡0 的老行为)。
+
+        每次起步现读 (_p 是 get_parameter().value), 所以现场
+        `ros2 param set /docking_node stopgo.heading_hold_engage_deg 3.0`
+        下一趟就生效, 不必重启 —— 这几个值正是最需要在现场边跑边调的。
+
+        release >= engage 是唯一会让状态机行为失去意义的配法 (接通即断开,
+        或断开门槛比接通还松), 这里 warn 后关闭保持而不是 raise: 参数配错
+        不该让一场本可成功的停泊崩掉 —— 同 _locked_bearing "把锦上添花的
+        微调变成整场健康直行的中止是错的交易"。
+        """
+        if not bool(self._p('stopgo.heading_hold_enable')):
+            return None
+        engage = math.radians(self._p('stopgo.heading_hold_engage_deg'))
+        release = math.radians(self._p('stopgo.heading_hold_release_deg'))
+        if not release < engage:
+            self.get_logger().warn(
+                f'航向保持参数无效: release({math.degrees(release):.2f}deg) 必须 '
+                f'< engage({math.degrees(engage):.2f}deg) —— 本趟关闭航向保持, '
+                f'退回纯直行')
+            return None
+        return HeadingHold(
+            rate=float(self._p('stopgo.heading_hold_rate')),
+            engage=engage, release=release,
+            min_engage_ns=int(self._p('stopgo.heading_hold_min_engage_sec')*1e9),
+            cooldown_ns=int(self._p('stopgo.heading_hold_cooldown_sec')*1e9),
+            budget=math.radians(self._p('stopgo.heading_hold_budget_deg')))
 
     @staticmethod
     def _is_omni(base_type: str) -> bool:

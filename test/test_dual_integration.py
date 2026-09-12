@@ -7,6 +7,8 @@ import pytest
 
 from tagdocking.state_machine import DockingStateMachine, DockingState
 from tagdocking.utils import TagPose
+from tagdocking.action_executor import HeadingHold
+from tagdocking.geometry_planner import ActionPlan as RealActionPlan
 from test_dual_docking import Node, controller, frames, plan
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -17,9 +19,13 @@ def method_class(file, name, env):
     tree = ast.parse((ROOT / 'tagdocking' / file).read_text())
     cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == name)
     cls.bases = []
+    # HeadingHold 出现在 _heading_hold_params 的返回标注里, 而标注在 def 求值
+    # 时就要解析 (本仓库没开 from __future__ import annotations), 所以它必须
+    # 进 env —— 不是只在调用时才需要。
     env.update({'__name__': 'test_transport', 'AprilTagDetectionArray': object,
                 'Odometry': object, 'Trigger': NS(Request=lambda: None),
                 'String': object, 'Bool': object, 'ActionPlan': object,
+                'HeadingHold': HeadingHold,
                 'DockingState': DockingState})
     exec(compile(ast.Module(body=[cls], type_ignores=[]), file, 'exec'), env)
     return env[name]
@@ -627,3 +633,126 @@ def test_prealign_flag_is_cleared_at_every_stop_boundary():
     n._mark_stopped(int(21e9))
     assert not n._dual_prealign_active
     assert n._dual.settle_until_ns > int(21e9)   # 双码 settle 照常武装
+
+
+# ── 行进中航向保持: 节点侧的两道门 ─────────────────────────────────────
+
+HOLD_PARAMS = {'stopgo.heading_hold_enable': True, 'stopgo.heading_hold_rate': .12,
+               'stopgo.heading_hold_engage_deg': 2.0,
+               'stopgo.heading_hold_release_deg': .7,
+               'stopgo.heading_hold_min_engage_sec': .15,
+               'stopgo.heading_hold_cooldown_sec': .30,
+               'stopgo.heading_hold_budget_deg': 15.0}
+
+
+def hold_node(**overrides):
+    """DockingNode 的真实方法体 + 假参数表, 不启 ROS。"""
+    import math as _math
+    from tagdocking.dual_feedback import ActionWatch
+    cls = method_class('docking_node.py', 'DockingNode',
+                       {'math': _math, 'ActionWatch': ActionWatch})
+    node = cls.__new__(cls)
+    params = dict(HOLD_PARAMS)
+    params.update(overrides)
+    node._p = lambda name: params[name]
+    node.get_logger = Node().get_logger
+    return node
+
+
+def test_jogging_publishes_an_arc_only_while_the_hold_is_engaged():
+    """BaseAdapter.publish_arc 的默认实现回落成**纯原地转**, 会把前进速度整个
+    丢掉。所以未接通 (常态, 占整程 95%+) 必须一次都不碰 publish_arc; 接通时
+    发出去的第一个实参必须还是那 0.08m/s 前进速度, 不是 0。"""
+    node = hold_node()
+    calls = []
+    node._adapter = NS(publish_jog=lambda v: calls.append(('jog', v)),
+                       publish_arc=lambda v, w: calls.append(('arc', v, w)),
+                       publish_turn=lambda w: calls.append(('turn', w)),
+                       publish_stop=lambda: calls.append(('stop',)))
+    node._executor = NS(action_kind='jogging', linear_cmd=.08,
+                        angular_cmd=0., lateral_cmd=0.)
+    for _ in range(5):
+        node._publish_action_cmd('omni')
+    assert calls == [('jog', .08)]*5, '未接通却走了 arc —— 默认实现会丢掉前进速度'
+    node._executor.angular_cmd = -.12
+    node._publish_action_cmd('omni')
+    assert calls[-1] == ('arc', .08, -.12), '接通时前进速度必须原样带上'
+    # turning 分支方向相反: "本该只转、却混进了走"仍然禁止
+    node._executor = NS(action_kind='turning', linear_cmd=.08,
+                        angular_cmd=.3, lateral_cmd=0.)
+    node._publish_action_cmd('omni')
+    assert calls[-1] == ('turn', .3), 'turning 仍须纯原地转'
+
+
+def launched(plan_step, dual_enabled=True, **overrides):
+    """跑真实的 _launch_step, 返回传给 start_jog 的 hold 实参。"""
+    node = hold_node(**{'stopgo.jog_linear_rate': .08, 'stopgo.jog_odom_scale': 1.,
+                        'stopgo.jog_backward_odom_scale': 1.,
+                        'stopgo.lateral_rate': .12, 'stopgo.lateral_odom_scale': 1.,
+                        **overrides})
+    seen = {}
+    node._dual = NS(enabled=dual_enabled, p=lambda k: 0.5,
+                    action_started=lambda plan, now: None)
+    node._odom_x = node._odom_y = node._odom_yaw = 0.
+    node._odom_stamp_ns = int(10e9)
+    node.get_clock = lambda: NS(now=lambda: NS(nanoseconds=int(10e9)))
+    node._is_omni = lambda t: True
+    node._adapter = NS(publish_stop=lambda: None, publish_jog=lambda v: None,
+                       publish_arc=lambda v, w: None)
+    node._sm = NS(abort_motion=lambda m: None)
+    node._dual_prealign_active = False
+    node._dual_watch = None
+    node._executor = NS(
+        is_active=False,
+        start_jog=lambda d, r, blind=False, odom_scale=1., hold=None: (
+            seen.update(hold=hold, distance=d), setattr(node._executor, 'is_active', True)),
+        set_odom_ref=lambda *a, **kw: None, action_kind='jogging',
+        _action_target=.45, angular_cmd=0., linear_cmd=.08, lateral_cmd=0.)
+    node._launch_step(plan_step, 'omni')
+    return seen.get('hold', 'not-called')
+
+
+def test_heading_hold_arms_only_for_the_continuous_zone_run():
+    """保持渗漏到别的行程就是在没有闭环依据的地方发角速度。区内一次走完那一步
+    之外, 每一种形态都必须拿到 None —— 那正好等于航向保持上线前的行为。"""
+    from tagdocking.action_executor import HeadingHold as HH
+    zone = RealActionPlan(kind='forward', jog_distance=.45, continuous=True)
+    assert isinstance(launched(zone), HH), '区内连续直行没拿到保持'
+    # 回退修剪: continuous=False 且是倒走, 两道门各自都该挡住
+    assert launched(RealActionPlan(kind='forward', jog_distance=-.03)) is None
+    assert launched(RealActionPlan(kind='forward', jog_distance=-.03,
+                               continuous=True)) is None, '倒走必须被 jog_distance>0 挡住'
+    # 区外 forward_step 逐步走: 那里墙码 bearing 微调活着, 每停都在纠方向
+    assert launched(RealActionPlan(kind='forward', jog_distance=.10)) is None
+    # 单码通道 (另有 final_straight 一套)
+    assert launched(zone, dual_enabled=False) is None
+    # 现场一键回滚
+    assert launched(zone, **{'stopgo.heading_hold_enable': False}) is None
+
+
+def test_bad_hysteresis_config_disables_the_hold_instead_of_killing_the_dock():
+    """release >= engage 是唯一会让状态机失去意义的配法 (接通即断开)。把锦上
+    添花的微调变成整场本可成功的停泊的中止是错的交易 —— warn 后退回纯直行。"""
+    zone = RealActionPlan(kind='forward', jog_distance=.45, continuous=True)
+    for release in (2.0, 3.0):
+        assert launched(zone, **{'stopgo.heading_hold_release_deg': release}) is None
+
+
+def test_declared_defaults_match_the_shipped_yaml():
+    """七个参数在 declare_parameter 和 yaml 里各写一遍, 漂了就会出现"改了 yaml
+    没生效"或"单测按 A 跑、现场按 B 跑"。本仓库已有该病史 (forward_step)。"""
+    import ast
+    import yaml as _yaml
+    src = ast.parse((ROOT / 'tagdocking' / 'docking_node.py').read_text())
+    declared = {}
+    for n in ast.walk(src):
+        if (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                and n.func.attr == 'declare_parameter' and len(n.args) == 2
+                and isinstance(n.args[0], ast.Constant)
+                and 'heading_hold' in str(n.args[0].value)):
+            declared[n.args[0].value] = ast.literal_eval(n.args[1])
+    assert len(declared) == 7, f'declare 了 {len(declared)} 个, 应为 7'
+    shipped = _yaml.safe_load((ROOT / 'config' / 'docking.yaml').read_text())
+    shipped = next(iter(shipped.values()))['ros__parameters']
+    for name, default in declared.items():
+        assert shipped[name] == default, f'{name}: yaml={shipped[name]} declare={default}'

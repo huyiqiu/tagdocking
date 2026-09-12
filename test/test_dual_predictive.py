@@ -178,9 +178,17 @@ def test_false_odom_progress_fails_visual_feedback():
 
 
 @pytest.mark.parametrize('name,value', [('visibility_samples',.5),('visibility_samples',257),
-    ('feedback_fail_windows',1.5),('min_lateral_m',.04),('pile_tag_size',-1),
+    ('feedback_fail_windows',1.5),
+    # 最小横移不得超过横移步长。门槛跟着 lateral_step (0.05) 走, 不再是写死的
+    # 3cm —— 那个 min(.03, lateral_step) 的硬上限已拆除, 0.04 现在是合法值。
+    ('min_lateral_m',.06),
+    ('lateral_step',.002),('lateral_step',.12),
+    ('pile_tag_size',-1),
     ('straight_yaw_tol_deg',.2),('straight_yaw_tol_deg',5.),
-    ('straight_start_distance',1.75)])
+    ('straight_start_distance',1.75),
+    # 纯直行区上界须 dock_distance(.5) < 本值 <= straight_start_distance(1.70):
+    # 落在终点之后等于从不生效, 越过站位则把 observe 的双码对准一起禁掉。
+    ('steering_stop_distance',.5),('steering_stop_distance',1.75)])
 def test_invalid_parameter_bounds(name,value):
     from test_dual_docking import Node
     from tagdocking.dual_docking import DualTagDocking
@@ -258,6 +266,7 @@ def test_independent_world_full_approach_real_pile_loss_and_terminal_depth():
     world = ((2.0,.03,.6),(1.1,.03,.2))
     now = 10.
     locked = False
+    zone_steps = 0
     for iteration in range(140):
         for _ in range(4):
             now += .2
@@ -273,8 +282,17 @@ def test_independent_world_full_approach_real_pile_loss_and_terminal_depth():
         if step.kind == 'done':
             assert locked and c.progress and abs(wall[2]-.5) <= .02
             assert now-10 < 300
+            # 纯直行区 (1.0→0.5m) 一个动作走完, 旧行为是 10cm × 5 步 × ~2.9s。
+            assert zone_steps == 1, f'区内发了 {zone_steps} 个动作'
             return
-        assert not step.turn_angle and not step.lateral_distance and 0 < step.jog_distance <= .05
+        assert not step.turn_angle and not step.lateral_distance
+        if c.wall[2] <= c.steering_stop:
+            zone_steps += 1
+            assert step.continuous, '区内长行程必须带看门狗放宽标记'
+            assert step.jog_distance == pytest.approx(c.wall[2]-c.target)
+        else:
+            assert 0 < step.jog_distance <= c.p('forward_step')+1e-9
+            assert not step.continuous, '区外不得放宽看门狗'
         c.action_started(step,round(now*1e9))
         robot[0] += step.jog_distance
         now += step.jog_distance/.08+.4
@@ -478,7 +496,11 @@ def test_locked_turn_sign_is_verified_against_predict():
 def test_late_locked_correction_still_reaches_done():
     """进 locked 后才暴露的 bearing 误差: 转向清掉 qualified_ns, 但 progress
     是粘性的 —— 终点判定不得误报 'terminal depth without qualified approach'。"""
-    c = controller()
+    # 0.62m 在生产的纯直行区 (1.0m) 之内, 那里微调已按设计停摆; 本用例测的是
+    # "晚到的转向撤资格后终点仍判 done"这条路径, 把禁令下压到 0.55m 才暴露它。
+    c = DualTagDocking(Node(**{'dual.steering_stop_distance': .55}))
+    c.set_extrinsics((.2, .03, .4), (-.5, .5, -.5, .5))
+    c.camera = CameraModel(1600, 1296, 400., 400., 800., 648.)
     c.stage = 'locked'
     c.progress = True
     n = frames(c, depth=.62, x=.027, count=10)   # 0.62m 处 2.5° bearing
@@ -638,9 +660,12 @@ def shortcam(height):
     return CameraModel(1600, height, 400., 400., 800., 648.)
 
 
-# 站位处 (墙码光学 z=1.8) 桩码中心在 740 画幅内, 首步 5cm 之后出画幅 ——
-# 即"桩码恰在提交直行处离场", 现场那一幕。
-COMMIT_WORLD = ((2.0, .03, .6), (1.1, .03, .2))
+# 站位处 (墙码光学 z=1.83) 桩码中心在 740 画幅内, 首步之后出画幅 —— 即
+# "桩码恰在提交直行处离场", 现场那一幕。
+# 墙码故意不放在 2.00 (光学 1.80): 10cm 步长下 1.80 会让离场恰好落在 near
+# (1.70) 这个刀口上, 本用例"闭锁发生在 near 之上"的前提就变成了边界巧合而
+# 不再是断言。1.83 起步后每一步都离两个门槛都有余量。
+COMMIT_WORLD = ((2.03, .03, .6), (1.1, .03, .2))
 
 
 def commit_frames(c, robot, now, detect=True):
@@ -709,3 +734,417 @@ def test_pile_exit_at_the_commit_distance_latches_and_reaches_done():
         c.stopped(round(now*1e9))
         now += 1.9
     pytest.fail('提交距离桩码离场后未能走到 done')
+
+
+def tuned(**overrides):
+    """带参数覆写的控制器 (controller() 的同款标定/相机)。"""
+    c = DualTagDocking(Node(**{'dual.'+k: v for k, v in overrides.items()}))
+    c.set_extrinsics((.2, .03, .4), (-.5, .5, -.5, .5))
+    c.camera = CameraModel(1600, 1296, 400., 400., 800., 648.)
+    return c
+
+
+def test_jog_steps_are_actually_configurable_no_hidden_cap():
+    """五处发出点原来都写死 min(.05, ...), 配置项是装饰品 —— docking.yaml 里
+    reverse_step 早就是 0.10 却从未生效。用非 0.05/0.10 的值断言, 防止哪天又
+    冒出一个"顺手"的硬上限 (yaw_cap 那次的同一个病)。"""
+    c = tuned(forward_step=.17)
+    n = frames(c)                                  # 站位 1.8m, 已对准
+    assert plan(c, n)[0].jog_distance == pytest.approx(.17)
+    c = tuned(reverse_step=.13)
+    n = frames(c, missing=True, count=10)          # acquire 看不见桩码 → 后退找回
+    assert plan(c, n)[0].jog_distance == pytest.approx(-.13)
+    # 横移是同一个病的第三处: 候选枚举写死 min(.03, lateral_step), 现场把
+    # docking.yaml 调到 0.05 跑出来仍是 0.03。用 .07 断言枚举上限真的跟着配置。
+    c = tuned(lateral_step=.07, min_lateral_m=.003)
+    n = frames(c, x=.0, pile_x=-.25)               # 大横偏 → 最大横移候选被选中
+    step = plan(c, n)[0]
+    assert step.lateral_distance and abs(step.lateral_distance) > .03
+    assert abs(step.lateral_distance) <= .07 + 1e-9
+
+
+def test_terminal_step_still_shrinks_under_the_larger_jog():
+    """步长放大不牺牲停泊精度: 终点步按剩余距离收缩, 不许过冲。"""
+    c = tuned(forward_step=.10)
+    c.stage, c.progress = 'locked', True
+    n = frames(c, depth=.57, missing=True, count=10)
+    assert plan(c, n)[0].jog_distance == pytest.approx(.07)   # 而不是 .10
+    c.stopped(n)
+    n = frames(c, depth=.5, missing=True, start=14., count=10)
+    assert plan(c, n)[0].kind == 'done' and c.complete
+
+
+def straddle_frames(c, depth, start=10., count=4):
+    """跨禁令上界 (1.0m) 的 A/B 位姿: 两码都明显未对准, 且两个深度下桩码都
+    舒舒服服在画内 —— frames() 的桩码 (y=.3, z=depth-.9) 在 1m 附近已经贴着
+    画面下沿, 用它做 A/B 会把"禁令"和"包络破了"两件事混在一起。"""
+    for i in range(count):
+        stamp = int((start+i*.2)*1e9)
+        c.observe(stamp, stamp, (.06, -.2, depth), (-.06, .03, depth-.5))
+    return stamp
+
+
+def test_pure_straight_zone_bans_yaw_and_lateral():
+    """纯直行区内转向与横移都禁, 前进是唯一动作 —— 且不判失败: 近场不调
+    方向是取舍而非异常。A/B 只差深度跨过禁令上界, 位姿形状完全相同。"""
+    inside = tuned()
+    inside.stage = 'approach'
+    n = straddle_frames(inside, .95)
+    assert inside.wall[2] <= inside.steering_stop, '前提: 在禁令区内'
+    assert not inside.aligned(inside.wall, inside.pile), '前提: 此位姿确实未对准'
+    step = plan(inside, n)[0]
+    assert step.kind == 'forward' and step.jog_distance > 0
+    assert not step.turn_angle and not step.lateral_distance
+    assert not inside.failure and inside.no_candidates == 0
+    outside = tuned()                              # 同一位姿, 深度跨到禁令区外
+    outside.stage = 'approach'
+    n = straddle_frames(outside, 1.05)
+    assert outside.wall[2] > outside.steering_stop
+    step = plan(outside, n)[0]
+    assert step.turn_angle or step.lateral_distance, '区外必须照旧纠偏'
+
+
+def test_pure_straight_zone_forgives_the_pile_bottom_without_alignment():
+    """禁令区内 allow_exit 不再要求"两码对准": 航向已被策略冻结, 未对准既不
+    可被采纳为纠偏, 拦下这一步前进也换不回任何东西 —— 只会把一场合法的纯
+    直行变成三窗耗尽 (2026-09-11 那个失效模式的近场版本)。
+    但航向证据仍然是硬前提: 绝不按一个从未验证过的航向盲走。"""
+    c = tuned()
+    c.camera = shortcam(700)                       # 桩码中心在画内, 包络戳出下沿
+    c.stage = 'approach'
+    n = straddle_frames(c, .95)
+    assert c.wall[2] <= c.steering_stop, '前提: 在禁令区内'
+    assert not c.aligned(c.wall, c.pile), '前提: 未对准'
+    assert min(c.current_margins()) < c.required_margin, '前提: 桩码包络已戳出下沿'
+    assert 400*c.pile[1]/c.pile[2]+648 < c.camera.height, '前提: 桩码仍被检出 (中心在画内)'
+    assert plan(c, n) is None and c.no_candidates == 1, '无航向证据 → 仍不放行'
+    # _no_candidate 会 reset_filter(), 必须重新喂满稳定窗口; 证据要在 observe
+    # 之后才立 —— 未对准的新两码会撤销它 (observe 里那一笔)。
+    n = straddle_frames(c, .95, start=13.)
+    c.progress, c.qualified_ns = True, c.stamp     # 一步已完成的合格直行
+    step = plan(c, n)[0]
+    assert step.kind == 'forward' and step.jog_distance > 0
+    assert not step.turn_angle and not step.lateral_distance and not c.failure
+
+
+def test_locked_bearing_micro_correction_is_gated_not_stopped_inside_the_zone():
+    """区内微调**不停摆**, 改为按 _bearing_tol 的盈亏平衡门槛裁决。
+
+    钉住 2026-09-12 那趟现场: 区内 bearing +1.88→+3.75→+6.02→+11.22° 全程
+    无人纠, 终点横偏 ~91mm 对 dock_tolerance 20mm。原来的"整体停摆"拿一个
+    ~2° 量级的转向不确定度去否决一个 11° 量级的误差 —— 门槛化之后小的仍
+    不纠 (纠不过噪声), 大的必须纠。两半都要断言: 只断言"大的会纠"会让
+    "门槛恒为 0"通过, 只断言"小的不纠"就是在测旧行为。"""
+    small = controller()                           # bearing 1.8° < 区内门槛 2.2°
+    small.stage, small.progress = 'locked', True
+    n = frames(small, depth=.95, x=.03, missing=True, count=10)
+    b = abs(math.degrees(math.atan2(small.wall[0], small.wall[2])))
+    assert b > small.p('straight_yaw_tol_deg'), '前提: 已超区外门槛, 只可能被区内门槛拦下'
+    assert b < math.degrees(small._bearing_tol(small.wall[2])), '前提: 未超区内收紧门槛'
+    step = plan(small, n)[0]
+    assert step.kind == 'forward' and step.turn_angle == 0 and step.jog_distance > 0
+    assert small._locked_turns == 0 and not small.failure
+    big = controller()                             # bearing 6.4° > 区内门槛 3.3°
+    big.stage, big.progress = 'locked', True
+    n = frames(big, depth=.80, x=.09, missing=True, count=10)
+    assert big.wall[2] <= big.steering_stop, '前提: 确实在区内'
+    assert abs(math.degrees(math.atan2(big.wall[0], big.wall[2]))) > math.degrees(
+        big._bearing_tol(big.wall[2])), '前提: 已超区内收紧门槛'
+    step = plan(big, n)[0]
+    assert step.kind == 'yaw' and step.turn_angle, '区内大 bearing 必须纠 —— 这是本次改动'
+    assert step.turn_angle < 0, '墙码偏右 (x>0) → 右转, 符号不能反'
+    far = controller()                             # 禁令区之外同样的 bearing 仍要微调
+    far.stage, far.progress = 'locked', True
+    n = frames(far, depth=1.8, x=.057, missing=True, count=10)
+    assert plan(far, n)[0].kind == 'yaw'
+
+
+def test_in_zone_bearing_threshold_tightens_toward_the_dock():
+    """门槛随接近单调收紧, 贴到停泊点发散, 且永远不比区外更松。
+
+    这三条是"用门槛代替硬距离悬崖"的全部依据: 单调 = 越近越保守;
+    发散 = 最后一截自动禁转 (旧结论被保留, 只是落在物理正确的位置);
+    不更松 = 区内绝不会纠一个区外都懒得纠的误差。"""
+    c = tuned()
+    far = c._bearing_tol(c.steering_stop+.5)
+    assert far == pytest.approx(math.radians(c.p('straight_yaw_tol_deg')))
+    zone = [c._bearing_tol(z) for z in (1.00, .85, .75, .65, .55)]
+    assert all(a < b for a, b in zip(zone, zone[1:])), '越近门槛越高'
+    assert all(t >= far for t in zone), '区内门槛不得比区外松'
+    assert c._bearing_tol(c.target) == math.pi, '到达停泊点: 任何 bearing 都不再转'
+    assert c._bearing_tol(c.target-.05) == math.pi, '冲过停泊点同理 (gap ≤ 0)'
+    loose, tight = tuned(straight_yaw_lag_deg=.5), tuned(straight_yaw_lag_deg=8.)
+    assert tight._bearing_tol(.75) > loose._bearing_tol(.75), 'lag 调大 = 更保守'
+    assert math.degrees(tight._bearing_tol(.75)) > 15, 'lag=8° 近似恢复旧的整体停摆'
+
+
+def test_in_zone_turn_is_followed_by_the_one_shot_continuous_run():
+    """微调不把"一次停到位"换回走停: 纠完一次, 下一个窗口仍是整段连续直行。
+
+    转向是停稳时的原地动作, 前进仍然只发一次 —— 用户要的"不走停走停"说的是
+    前进被切碎, 不是不许在起点把方向摆正。"""
+    c = tuned()
+    c.stage, c.progress = 'locked', True
+    n = frames(c, depth=.90, x=.09, missing=True, count=10)
+    assert plan(c, n)[0].kind == 'yaw'
+    c2, n2 = straight_zone_locked(.90)             # 纠完 → bearing 回到门槛内
+    step = plan(c2, n2)[0]
+    assert step.kind == 'forward' and step.continuous
+    assert step.jog_distance == pytest.approx((.90-c2.target)/c2.r[0][2], abs=1e-6)
+
+
+def straight_zone_locked(depth, **overrides):
+    """禁令区内、航向已锁的对准位姿 —— 连续直行的唯一入口形态。
+
+    桩码故意缺失: 区内桩码 (0.9m 基线) 早已出画, locked 就是为这一幕设的,
+    此时只按墙码直行。progress=True 是 locked 的既有前提 (走到这里必然已有
+    合格前进), 终点 done 判据也依赖它。"""
+    c = tuned(**overrides)
+    c.stage, c.progress = 'locked', True
+    return c, frames(c, depth=depth, missing=True, count=10)
+
+
+def test_pure_straight_zone_emits_one_continuous_run_to_the_dock():
+    """区内一次直行到停泊处, 不再 10cm×5 次 jog。
+
+    区内禁转向/禁横移, jog 切分换不回任何修正机会, 只剩 5 次起停+停稳+重测
+    (现场 ~2.9s/停 ≈ 15s)。整段一次走完, 终点精度交给停稳重测。"""
+    c, n = straight_zone_locked(.95)
+    assert c.wall[2] <= c.steering_stop, '前提: 在禁令区内'
+    step = plan(c, n)[0]
+    assert step.kind == 'forward' and not step.turn_angle and not step.lateral_distance
+    assert step.jog_distance == pytest.approx(.45), '一步走完 0.95→0.50, 不是 0.10'
+    assert step.continuous, '看门狗要据此放宽 deadline, 否则 6s 掐死长行程'
+    # 走完停稳重测: 到位即 done, 一个动作解决整段。
+    c.action_started(step, n)
+    c.action_completed()
+    c.stopped(n)
+    n = frames(c, depth=.50, missing=True, count=10, start=20.)
+    assert plan(c, n)[0].kind == 'done' and c.complete and not c.failure
+
+
+def test_continuous_flag_only_inside_the_zone_and_last_step_still_shrinks():
+    """continuous 是区内专属标记: 区外照旧 forward_step 封顶 + 逐步重测
+    (那里还要纠偏, 长盲走会把没对准的航向走远)。区内不足一步则自然收缩。"""
+    far, n = straight_zone_locked(1.8)
+    assert far.wall[2] > far.steering_stop
+    step = plan(far, n)[0]
+    assert step.jog_distance == pytest.approx(far.p('forward_step'))
+    assert not step.continuous, '区外不得放宽看门狗'
+    near, n = straight_zone_locked(.57)              # 剩余 0.07 < forward_step
+    step = plan(near, n)[0]
+    assert step.jog_distance == pytest.approx(.07) and step.continuous
+
+
+def test_overshoot_inside_the_zone_trims_back_then_docks():
+    """冲过停泊点 → 回退修剪, 不是判失败: 连续直行让"冲过"成为预期结局之一
+    (里程计尺度误差无处吸收), 超/欠都由停稳重测兜住。"""
+    c, n = straight_zone_locked(.47)                 # 冲过 3cm > dock_tolerance
+    step = plan(c, n)[0]
+    assert step.kind == 'forward'
+    assert step.jog_distance == pytest.approx(-.03), '显式负 jog = 回退修剪'
+    assert not step.continuous, 'cm 级修剪不该放宽看门狗'
+    assert not c.failure
+    c.action_started(step, n)
+    c.action_completed()
+    c.stopped(n)
+    n = frames(c, depth=.50, missing=True, count=10, start=20.)
+    assert plan(c, n)[0].kind == 'done' and c.complete
+
+
+def test_overshoot_trim_is_capped_per_step_for_fresh_remeasure():
+    """真冲过一大截 (尺度标错/量测异常) 时分步退: 每步带新鲜重测, 比一次
+    长盲退稳。修剪走主账, max_actions 兜住病态振荡。"""
+    c, n = straight_zone_locked(.35)                 # 冲过 15cm > reverse_step
+    step = plan(c, n)[0]
+    assert step.jog_distance == pytest.approx(-c.p('reverse_step'))
+
+
+def test_qualified_endgame_overshoot_latches_instead_of_failing():
+    """冲过硬失败跑在 pile 丢失闭锁之前 —— 合格终局的冲过必须豁免, 否则
+    本应"闭锁 → 回退修剪"的局面被直接判死。无资格的异常贴近照旧判失败,
+    那才是这条检查要拦的东西。"""
+    ok = tuned()
+    ok.stage = 'approach'
+    n = frames(ok, depth=.47, missing=True, count=10)
+    ok.progress, ok.qualified_ns = True, ok.stamp
+    assert ok.wall[2] < ok.target-ok.p('dock_tolerance'), '前提: 已冲过'
+    step = plan(ok, n)[0]
+    assert not ok.failure and ok.stage == 'locked', '闭锁接手, 不判死'
+    assert step.kind == 'forward' and step.jog_distance == pytest.approx(-.03)
+    bad = tuned()                                    # 同样贴近, 但从无合格前进
+    bad.stage = 'approach'
+    n = frames(bad, depth=.47, missing=True, count=10)
+    assert plan(bad, n) is None or bad.failure
+    assert bad.failure and 'overshoot' in bad.failure
+
+
+def test_terminal_run_exempts_the_pile_entirely_it_ends_under_the_body():
+    """狗骑跨在桩上充电 (机体下方电极片对准桩上电极片): 到停泊处桩码必然在
+    机体下方、必然出画。要求它在终局整段的终点仍可见, 等于要求一个"成功时
+    必然不成立"的条件 —— 而桩码贴近时保守包围立方体的投影还会横向炸开,
+    连 allow_exit 保留的左右边也会把整段否掉。"""
+    c = tuned()
+    c.stage = 'approach'
+    n = straddle_frames(c, .95)
+    c.committed_ns = c.stamp                         # 航向证据来源② (持住对准)
+    c.wall, c.pile = (.06, -.2, .95), (-.06, .03, .45)
+    run = ActionPlan(kind='forward', jog_distance=.45, continuous=True)
+    assert c.wall[2] <= c.steering_stop, '前提: 区内 → allow_exit 不要求对准'
+    # 前提: 桩码这条路径确实"横向炸开", 不是只戳下沿。
+    worst = min(c.camera.bounds(c.predicted_pair(run, 11/12.)[1], .05)[:2])
+    assert worst < -100, f'前提: 左右边已炸开 ({worst:.0f}px)'
+    assert c.visible(run)[0], '终局整段对桩码整体免检'
+    assert not c.visible(ActionPlan(kind='forward', jog_distance=.45))[0], \
+        '非终局的同等长度前进不豁免 (桩码还要用于下一窗口)'
+    c.committed_ns = 0                               # 无航向证据 → allow_exit 死
+    assert not c.visible(run)[0], '无 allow_exit 时不得盲走整段'
+
+
+def test_action_watch_deadline_follows_the_continuous_run_length():
+    """外层 min(action_timeout_sec=6.0, …) 会把 6.3s 的合法长行程掐死在 6s。
+    continuous 时按实际行程放宽, 其余判据 (反向/无响应/直线一致性) 不动。"""
+    p = tuned().p
+    pose, spd = (0., 0., 0.), .08
+    long_run = ActionWatch(ActionPlan(kind='forward', jog_distance=.45, continuous=True),
+                           0, pose, .45, spd, p)
+    assert long_run.deadline == pytest.approx(1.5*.45/spd+2.)
+    assert long_run.deadline > p('action_timeout_sec')
+    normal = ActionWatch(ActionPlan(kind='forward', jog_distance=.10),
+                         0, pose, .10, spd, p)
+    assert normal.deadline == pytest.approx(min(p('action_timeout_sec'),
+                                                max(p('response_timeout_sec'),
+                                                    3*.10/spd+1.)))
+    trim = ActionWatch(ActionPlan(kind='forward', jog_distance=-.03),
+                       0, pose, .03, spd, p)
+    assert trim.deadline <= p('action_timeout_sec'), '修剪不放宽'
+
+
+# ── 行进中航向保持 (纯直行区那一步连续直行) ────────────────────────────
+
+HOLD_KW = dict(rate=.12, engage=math.radians(2.), release=math.radians(.7),
+               min_engage_ns=int(.15e9), cooldown_ns=int(.3e9),
+               budget=math.radians(15.))
+DT = int(.05e9)      # 20Hz 控制周期
+DEAD = 0.10          # l1w_control min_angular_z
+
+
+def held(rate=.12, **changes):
+    from tagdocking.action_executor import HeadingHold
+    return HeadingHold(**{**HOLD_KW, 'rate': rate, **changes})
+
+
+def jogger(hold, distance=.45, rate=.12):
+    """起步一段盲走直行 (= 双码纯直行区那一步), 返回 (executor, 步进函数)。
+
+    步进函数吃"当前 yaw", 按真实速度推进 x, 返回 (done, angular_cmd)。
+    """
+    from tagdocking.action_executor import ActionExecutor
+    ex = ActionExecutor(min_angular_rate=.12)
+    ex.start_jog(distance, .08, blind=True, hold=hold)
+    ex.set_odom_ref(0., 0., 0.)
+    clock = {'ns': int(10e9), 'x': 0.}
+    def step(yaw):
+        clock['ns'] += DT
+        clock['x'] += .08*DT*1e-9
+        done = ex.update(clock['x'], 0., yaw, False, None,
+                         lambda: 0., lambda d: (0., 0.), 0., .15, clock['ns'])
+        return done, ex.angular_cmd
+    return ex, step
+
+
+def test_heading_hold_never_commands_inside_the_chassis_dead_zone():
+    """l1w_control 把 |wz| < 0.10 截成 0: 配低了不是"转得慢", 是**根本不转**,
+    而日志照打、预算照扣 —— 功能被静默关掉。抬底必须是结构性的, 含 rate=0.0。"""
+    for rate in (0.0, .05, .08, .12, .2):
+        ex, step = jogger(held(rate=rate))
+        done, wz = step(math.radians(3.))      # 左偏 3° → 必接通
+        assert not done
+        assert abs(wz) >= .12 > DEAD, f'rate={rate} 下发量掉进死区'
+        assert wz < 0, f'rate={rate} 符号错: 左偏必须发 CW 才能让 |err| 下降'
+        _, wz_r = jogger(held(rate=rate))[1](-math.radians(3.))
+        assert wz_r > 0, f'rate={rate} 右偏必须发 CCW'
+
+
+def test_heading_hold_engages_on_drift_and_releases_before_zero_not_at_zero():
+    """瞄 0 断开 + 命令→odom 报告滞后 ⇒ 必过冲换符号 ⇒ 抖振。
+    断开点是 release(0.7°) 而非 0, 迟滞带 1.3° 要宽过最短接通粒度 1.03°。"""
+    ex, step = jogger(held())
+    assert step(math.radians(1.5))[1] == 0, '未达 engage 不接通'
+    assert step(math.radians(2.1))[1] < 0, '达 engage 接通'
+    for _ in range(3):                          # 熬过 min_engage (3 周期)
+        assert step(math.radians(1.4))[1] < 0, '接通期内不因误差回落就松手'
+    assert step(math.radians(.9))[1] < 0, '0.9deg 仍在迟滞带内, 保持接通'
+    wz = step(math.radians(.6))[1]
+    assert wz == 0, '0.6deg <= release 断开'
+    assert abs(ex.jog_yaw_error) > 0, '断开时误差必须仍非零 —— 瞄 0 就是在制造过冲'
+    assert ex.jog_yaw_error == pytest.approx(math.radians(.6))
+
+
+def test_heading_hold_cooldown_survives_pessimistic_report_latency():
+    """断开后 odom 还在沉降, 此时的读数不能拿来做下一次决策。
+    悲观推演: 释放后过冲到反向 3°, 冷却窗内必须一声不吭。"""
+    ex, step = jogger(held())
+    for yaw in (2.1, 1.4, 1.4, 1.4, .6):        # 接通 → 熬过 min_engage → 断开
+        step(math.radians(yaw))
+    assert ex.angular_cmd == 0
+    engaged = 0
+    for i in range(5):                          # 0.30s 冷却 = 6 周期, 前 5 周期在窗内
+        wz = step(-math.radians(3.))[1]         # 反向过冲, 幅值远超 engage
+        engaged += wz != 0
+    assert engaged == 0, f'冷却窗内接通了 {engaged} 次 —— 拿沉降中的读数做了决策'
+    assert step(-math.radians(3.))[1] > 0, '冷却到点 (0.30s) 后才允许反向接通'
+
+
+def test_a_plain_or_blind_jog_is_bit_identical_without_the_hold():
+    """保持渗漏到泊出/重试盲腿/单码是最坏的回归 —— 那些路径压根不该有角速度。
+    hold=None 时不只是 wz 为 0, 判停时序也必须与改动前逐位相同。"""
+    from tagdocking.action_executor import ActionExecutor
+    ex, step = jogger(None, distance=.20)
+    ticks = 0
+    while True:
+        done, wz = step(math.radians(8.))       # 大幅漂移也绝不响应
+        assert wz == 0, 'hold=None 却发出了角速度'
+        ticks += 1
+        if done:
+            break
+        assert ticks < 200
+    assert ticks == math.ceil(.20/(.08*.05)), '判停时序被改动'
+    # blind 仍跳过视觉早停: 视觉说"已到位"也必须走完整条腿
+    ex2 = ActionExecutor(min_angular_rate=.12)
+    ex2.start_jog(.20, .08, blind=True)
+    ex2.set_odom_ref(0., 0., 0.)
+    assert not ex2.update(.01, 0., 0., True, .01, lambda: 0.,
+                          lambda d: (0., 0.), .50, .15, int(10e9))
+
+
+def test_heading_hold_budget_is_a_diagnostic_gate_that_degrades_to_straight():
+    """预算不是安全边界 (那由符号规则给), 是"底盘不响应 wz / odom yaw 疯了"
+    的闸。耗尽后退化终点必须正好是 wz≡0 = 不做这件事的老行为, 且可上报。"""
+    ex, step = jogger(held(budget=math.radians(3.)), distance=3.0)
+    for _ in range(40):
+        step(math.radians(5.))                  # 持续大漂移, 保持怎么发都追不回
+    assert ex.jog_hold_spent, '预算耗尽未置位 —— 现场无从判断功能是否还活着'
+    assert ex.jog_hold_used >= math.radians(3.)
+    assert ex.angular_cmd == 0
+    for _ in range(20):
+        assert step(math.radians(5.))[1] == 0, '耗尽后又接通了'
+    # 读数故障 (|err| > 20°) 同样只退化到纯直行, 不中止动作
+    ex2, step2 = jogger(held())
+    assert not step2(math.radians(30.))[0]
+    assert step2(math.radians(30.))[1] == 0 and ex2.jog_hold_spent
+
+
+def test_straight_consistency_veto_tolerates_the_heading_hold_arc():
+    """ActionWatch 的直线一致性判据 (progress < target*0.8) 角度等价物是
+    arccos(0.8)=36.9°。保持的最坏情形 15° 必须放行, 而判据本身仍要能抓到
+    真正的横向漂移 —— 少了后半句就只是在测"什么都不发生"。"""
+    p = tuned().p
+    run = ActionPlan(kind='forward', jog_distance=.45, continuous=True)
+    def drift(deg):
+        w = ActionWatch(run, 0, (0., 0., 0.), .45, .08, p)
+        d = math.radians(deg)
+        return w.check(int(3e9), (.45*math.cos(d), .45*math.sin(d), d), int(3e9))
+    assert drift(15.) == '', '15deg 偏航 (预算全用光) 被误判'
+    assert drift(30.) == '', '30deg 仍在 36.9deg 判据内'
+    assert 'inconsistent' in drift(45.), '45deg 横向漂移必须照抓 —— 判据本身仍有效'

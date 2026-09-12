@@ -15,11 +15,38 @@ DEFAULTS = {
     # 用法 (排序校验 / yaw_cap 远近分档) —— 桩码垂直离场放行与丢失闭锁已改用
     # straight_envelope (= obs + tol), 见该 property 的死区说明。
     'observation_distance': 1.8, 'observation_tolerance': 0.1,
-    'forward_step': 0.05, 'reverse_step': 0.05, 'lateral_step': 0.03,
+    # 前进/后退步长。五处发出点原来都写 min(.05, self.p('forward_step')) ——
+    # 一个写死的硬上限, 把配置项变成了装饰 (和 yaw_cap 那次同一个病, 见
+    # yaw_step_deg 注释; 现场 docking.yaml 把 reverse_step 调到 0.10 一直没有
+    # 任何效果)。5cm 在 1.8→0.5m 这 1.3m 上是 26 步, 每步起停+停稳+重测
+    # ~2.9s ≈ 75s, 开销远大于位移本身; 10cm 减半到 13 步。
+    # 精度不受影响: 终点步仍按 remaining 收缩 (见 _advance), dock_tolerance 不变。
+    # 放大步长不牺牲可见性: visible() 逐段采样整条轨迹 (_emit 对一切计划
+    # 过这把尺), 会否掉把 tag 甩出视野的大步。曾写"stopgo.jog_max (0.20)
+    # 是执行器侧的硬闸" —— 错: jog_max 的 clamp 全部在单码 GeometryPlanner
+    # (geometry_planner.py 的 plan/plan_sequence/plan_straight), 执行器
+    # start_jog 对任何距离都不钳制, 双码从来不受它管。双码真实上限就是
+    # 本参数 (区外) 与纯直行区的"一次走完"。
+    # 后退预算按距离而非步数守: reverse_limit 0.80m 不变, 步数自然从 16 掉到
+    # 8 (reverse_count 退化为不起作用的天花板), 站位账 1.00m → 10 步。
+    # 横移步长是同一个病的第三处: 候选枚举里写死 min(.03, lateral_step), 于是
+    # docking.yaml 的 0.05 在现场跑出来仍是 0.03。硬上限一并拆除, 改由
+    # __init__ 的 [0.005, 0.10] 区间校验兜底 (单步盲走没有途中反馈, 上界
+    # 取保守的合理值, 防一步把两码一起推出画面)。
+    'forward_step': 0.10, 'reverse_step': 0.10, 'lateral_step': 0.05,
     'yaw_step_deg': 8.0, 'yaw_fine_step_deg': 3.0,
+    # 纯直行区上界: 墙码光学 z ≤ 此值后不再调方向 (转向与横移都禁), 只许前进。
+    # 近场调方向是负期望的交易: 相机在 base 上有横向力臂, bearing 增益
+    # 1+t_x/z 在 z=0.6 时已到 1.33 (命令 2.86° 实变 3.30°), 而底盘停止滞后
+    # ~2° 与命令本身同量级 —— 越近, 一步转向的不确定度越大、可纠偏的余量
+    # 越小。代价是放弃最后 ~0.5m 的 locked pure pursuit 横向收缩
+    # (0.5/1.3 ≈ 0.38, 见 README 设计决定 1); 换来的是近场不再摆头/横移。
+    # 取值须 target < 本值 <= straight_start_distance (启动校验)。
+    'steering_stop_distance': 1.0,
     # locked 直行的墙码 bearing 微调: 容差必须 ≤ align_tolerance_deg (它是最后
     # 的精修, 门槛比入口门还松就等于能撤销入口门), 下限 0.5° 是底盘转向分辨率。
     'straight_yaw_tol_deg': 1.5, 'straight_yaw_max_turns': 3,
+    'straight_yaw_lag_deg': 2.0,
     'prealign_tolerance_deg': 5.0, 'prealign_step_deg': 8.0,
     'prealign_max_steps': 12,
     'settle_sec': 1.5, 'min_frames': 3,
@@ -120,8 +147,15 @@ class DualTagDocking:
                     raise ValueError('dual.' + name + ' must be a positive integer')
             if self.p('visibility_samples') > 256:
                 raise ValueError('dual.visibility_samples must be <= 256')
-            if self.p('min_lateral_m') > min(.03, self.p('lateral_step')):
-                raise ValueError('dual.min_lateral_m exceeds lateral step cap')
+            if self.p('min_lateral_m') > self.p('lateral_step'):
+                raise ValueError('dual.min_lateral_m exceeds dual.lateral_step')
+            # 横移步长同样不再有 3cm 硬上限 (原 min(.03, lateral_step), 与 yaw_cap
+            # 和 forward_step 同一种病: 配置项是装饰)。上限留 0.10m —— 横移是
+            # 单步盲走, 没有转向那样的角度反馈, 一步太大轻则把两码推出画面
+            # (visible() 会拦), 重则误差无处吸收。执行器对任何通道都不钳制
+            # 距离 (jog_max 只闸单码规划器), 本区间就是双码横移的全部防线。
+            if not 0.005 <= self.p('lateral_step') <= .10:
+                raise ValueError('dual.lateral_step must be in [0.005, 0.10] m')
             # yaw 步长不再有 3° 硬上限 (见 yaw_cap): 3° 命令的停止滞后与命令本身
             # 同量级, 提前量被 0.5*target 钳位 → 每步只转一半, 远场 20° 偏差要
             # 30 步才收敛, 必然撞上 observe_timeout。但上限也不能无界: 大步转向
@@ -148,10 +182,25 @@ class DualTagDocking:
                     '(站立式: observation_distance=1.8, straight_start_distance=1.70)')
             if not 0 < self.p('pile_lock_distance') < self.p('observation_distance'):
                 raise ValueError('require 0 < pile_lock_distance < observation_distance')
+            # 纯直行区必须夹在停泊点与站位之间: 低于 dock_distance 等于从不生效
+            # (禁令区在终点之后), 高于站位则把 observe 的纠偏一起禁掉 —— 而双码
+            # 对准本来就只在站位处做, 禁掉它整场就没有对准环节了。
+            # 取 == near 合法: "整个 approach 全程纯直行"是一个有意义的配置。
+            if not self.target < self.p('steering_stop_distance') <= self.near:
+                raise ValueError(
+                    'require dock_distance < steering_stop_distance <= '
+                    'straight_start_distance, got '
+                    f"{self.target:.2f} / {self.p('steering_stop_distance'):.2f} / "
+                    f'{self.near:.2f}')
             # locked 的墙码 bearing 微调是最后的精修: 容差比双码对准门还松就
             # 等于能撤销入口门; 下限 0.5° 以下落进底盘转向分辨率, 是命令噪声。
             if not 0.5 <= self.p('straight_yaw_tol_deg') <= float(node._p('dual.align_tolerance_deg')):
                 raise ValueError('dual.straight_yaw_tol_deg must be in [0.5, align_tolerance_deg] degrees')
+            # 上界 15°: 门槛 = atan(target·sin(lag)/(z−target)), lag 再大只是
+            # 把区内转向整体关掉 (= 旧行为), 不会不安全; 拦在这里只为让
+            # "本以为配了个小旋钮、实际关掉了整个功能" 在启动时就被看见。
+            if not 0 < self.p('straight_yaw_lag_deg') <= 15:
+                raise ValueError('dual.straight_yaw_lag_deg must be in (0, 15] degrees')
             # 站位必须在观察窗内 (≤ obs-tol): 它同时是 approach 桩码丢失闭锁的
             # 窗口上界、yaw_cap 远/近分档与站位守卫的基准, 站在窗外没有意义。
             if self.near > self.p('observation_distance') - self.p('observation_tolerance') + 1e-9:
@@ -193,6 +242,21 @@ class DualTagDocking:
         硬失败 —— 放行制造出的新失效模式。
         """
         return self.p('observation_distance')+self.p('observation_tolerance')
+
+    @property
+    def steering_stop(self):
+        """纯直行区上界 (墙码光学 z): 之内禁横移, 转向按盈亏平衡门槛收紧。
+
+        等价于把 locked 的纯直行行为提前到这个距离 —— 区别只在桩码仍可见时
+        approach 不再纠偏。近场调方向越调越不准: bearing 的相机力臂增益
+        1+t_x/z 在 0.6m 处已 1.33, 底盘 ~2° 停止滞后与单步命令同量级。
+
+        但"不准"不等于"不做": 2026-09-12 现场证明整体停摆会让 bearing 一路
+        涨到 11°、终点横偏 91mm。区内转向现在交给 _bearing_tol 的门槛裁决
+        (小的不纠、大的纠、贴到停泊点自动禁转), 横移仍然整体禁止 —— 横移没有
+        对应的收益模型, 且近场横移正是 2026-09-11 那次失效的成因。
+        """
+        return self.p('steering_stop_distance')
 
     @property
     def heading_committed(self):
@@ -497,11 +561,17 @@ class DualTagDocking:
         """
         if self.camera is None:
             return False, None
+        # 纯直行区内不再要求"两码对准": 那一条前提原是为了只在真要直行时才
+        # 宽恕桩码垂直离场, 而 z ≤ steering_stop 之后航向已被策略冻结 ——
+        # 未对准既不可被采纳为纠偏, 拦下这一步前进也换不回任何东西, 只会把
+        # 一场合法的纯直行变成三窗耗尽 (2026-09-11 那个失效模式的近场版本)。
+        # 航向证据仍然要 (绝不按一个从未验证过的航向盲走), 包络上界仍然要。
         allow_exit = (self.stage == 'approach' and self.heading_committed
                       and self.wall[2] <= self.straight_envelope
                       and plan.jog_distance > 0
                       and not plan.lateral_distance and not plan.turn_angle
-                      and self.aligned(self.wall, self.pile))
+                      and (self.wall[2] <= self.steering_stop
+                           or self.aligned(self.wall, self.pile)))
         margins = [float('inf')]*4
         required = self.required_margin
         ok = True
@@ -509,11 +579,28 @@ class DualTagDocking:
             for index, pt in enumerate(self.predicted_pair(plan, i/int(self.p('visibility_samples')))):
                 if pt is None:
                     continue
+                # 终局整段 (continuous = 一个动作走完到停泊点) 对桩码整体免检,
+                # 不只是下沿: 狗是骑跨在桩上充电的 —— 机体下方的电极片对准桩上
+                # 的电极片, 所以到位时桩码必然在机体下方、必然出画。要求它在
+                # 路径终点仍可见, 等于要求一个"成功时必然不成立"的条件。
+                # (桩码贴近时保守包围立方体的投影还会横向炸开, 于是连 allow_exit
+                # 保留的左右边也会否掉整段 —— 那不是"走错了", 那是到位了。)
+                # 这一段结束即停泊: 下一个窗口只做容差判定或修剪, 不再需要桩码,
+                # 所以这里放弃的也不是任何后续要用的量测。
+                if index == 1 and allow_exit and plan.continuous:
+                    continue
                 try:
                     bounds = self.camera.bounds(pt, float(self._node._p(
                         'dual.wall_tag_size' if index == 0 else 'dual.pile_tag_size')))
                 except ValueError:
                     # Near-plane crossing has no finite enclosure to report.
+                    # 这里不给桩码开 allow_exit 的口子 —— 不是不该放行 (骑跨
+                    # 充电, 桩码到位时本就在机体下方), 而是到不了这里: 终局
+                    # 整段在上面就整体免检、根本不调 bounds; 任何更短的前进,
+                    # 采样点都细到必然先落进"横向炸开窗" (x≈0 时
+                    # z∈(0.035, 0.053), 包围立方体投影在 z→半径 时发散),
+                    # 被 allow_exit 保留的左右边先判否。写一个到不了的分支
+                    # 只会让人以为近场逐步走已经宽恕过桩码 —— 它没有。
                     if not full:
                         return False, tuple(margins)
                     ok = False
@@ -571,7 +658,10 @@ class DualTagDocking:
                   ('航向有证据', bool(self.heading_committed)),
                   (f'z<=直行包络{self.straight_envelope:.2f}m',
                    self.wall is not None and self.wall[2] <= self.straight_envelope),
-                  ('两码对准', self.aligned(self.wall, self.pile)))
+                  # 纯直行区内这一条自动成立 (航向已被策略冻结, 见 visible)。
+                  (f'两码对准或z<=纯直行{self.steering_stop:.2f}m',
+                   self.aligned(self.wall, self.pile)
+                   or (self.wall is not None and self.wall[2] <= self.steering_stop)))
         bad = [name for name, ok in checks if not ok]
         return '桩码垂直离场=' + ('放行' if not bad else '不放行(缺 '+'/'.join(bad)+')')
 
@@ -613,7 +703,7 @@ class DualTagDocking:
         ledger = []
         for kind, cap, residual, minimum in (
                 ('yaw', self.yaw_cap, theta, .005),
-                ('lateral', min(.03,self.p('lateral_step')), e/math.cos(theta), self.p('min_lateral_m'))):
+                ('lateral', self.p('lateral_step'), e/math.cos(theta), self.p('min_lateral_m'))):
             amounts = [cap, cap/2, cap/4, min(cap,abs(residual)), minimum]
             seen = set()
             for size in amounts:
@@ -708,9 +798,9 @@ class DualTagDocking:
             limit = self.p('reverse_limit')
             count = int(self.p('reverse_count'))
         if (actions >= count or
-                total + min(.05, self.p('reverse_step')) > limit + 1e-9):
+                total + self.p('reverse_step') > limit + 1e-9):
             return self._fail(f'dual reverse {why} budget exhausted')
-        return self._emit(ActionPlan(kind='forward', jog_distance=-min(.05, self.p('reverse_step'))),
+        return self._emit(ActionPlan(kind='forward', jog_distance=-self.p('reverse_step')),
                           relaxed=relaxed, reverse_kind=why)
 
     def plan_dual(self, wall, base_type, planner, now_ns):
@@ -734,8 +824,17 @@ class DualTagDocking:
             return None
         # locked (切站立后) 豁免: 姿态切换瞬间相机位姿变化会让墙码 z 读数
         # 跳变几厘米, 直行阶段的 z 只用于推进, 不会突然变近。
+        # 合格终局同样豁免: 连续直行后若冲过停泊点且 stage 仍是 approach
+        # (区内未对准入口路径), 这个检查跑在 pile 丢失闭锁之前, 会把本应
+        # "闭锁 → _advance 回退修剪" 的局面直接判死。豁免前提与闭锁分支
+        # 完全一致 (progress + 资格新鲜 + 直行包络内) —— 无资格的异常
+        # 贴近照旧判失败, 那才是这条检查要拦的东西。
         if (self.stage != 'locked'
-                and self.wall[2] < self.target-self.p('dock_tolerance')):
+                and self.wall[2] < self.target-self.p('dock_tolerance')
+                and not (self.progress and self.qualified_ns
+                         and now-self.qualified_ns
+                         <= self.p('qualification_sec')*1e9
+                         and self.wall[2] <= self.straight_envelope)):
             return self._fail('optical wall depth overshoot; no reverse retry')
         if now < self.settle_until_ns or self.wall_frames < max(3, int(self.p('min_frames'))):
             return None
@@ -757,6 +856,9 @@ class DualTagDocking:
             # 即对墙码做 pure pursuit —— 不只止住偏航误差增长, 还把横向误差按
             # 0.5/1.3 ≈ 0.38 收缩到接触点。None = 纯前进 (容差内 / 无可行候选 /
             # 连续转向达上限), 任何前进清零连续转向计数。
+            # 纯直行区内这条**仍然活着**, 只是门槛随接近收紧 (_bearing_tol) ——
+            # 它与区内的"行进中航向保持"是互补两层: 这条在停稳时纠视觉看得见的
+            # 残余 (航向 + 横偏), 那条在行进中守住视觉看不见的 yaw 漂移。
             turn = self._locked_bearing(d)
             if turn is None:
                 self._locked_turns = 0
@@ -781,7 +883,7 @@ class DualTagDocking:
                 obs = self.p('observation_distance')
                 if d > obs + self.p('observation_tolerance'):
                     return self._emit(ActionPlan(kind='forward', jog_distance=min(
-                        .05, self.p('forward_step'), (d-obs)/self.r[0][2])))
+                        self.p('forward_step'), (d-obs)/self.r[0][2])))
                 return self._reverse()
             if self.window_ns and now-self.window_ns > self.p('missing_timeout_sec')*1e9:
                 return self._fail('pile missing / invalid outside qualified final entry')
@@ -833,6 +935,19 @@ class DualTagDocking:
                 return self._reverse(relaxed=self.envelope_violated(),
                                      why='standoff')
         if not self.aligned(self.wall, self.pile):
+            # 纯直行区 (z ≤ steering_stop): 禁转向、禁横移, 未对准也只前进。
+            # 落到 _advance 而不是 _fail/_no_candidate —— 近场不再调方向是
+            # 有意的取舍, 不是异常; 把一次本可成功的直行变成中止是错的交易
+            # (2026-09-11 现场就是这么死的, 见 straight_envelope)。
+            # 也不走 _correction 的"无候选→后退脱困": 近场破包络正是桩码被
+            # 压出画面下沿的常态, 后退只会白退一场。
+            if d <= self.steering_stop:
+                self._node.get_logger().info(
+                    f'dual 纯直行区 (墙码 z={d:.3f}m ≤ {self.steering_stop:.2f}m): '
+                    f'不再调方向, 直行到底 (残余 theta='
+                    f'{math.degrees(metrics[1]):+.2f}deg 横偏 e={metrics[2]*1e3:+.0f}mm)',
+                    throttle_duration_sec=2.0)
+                return self._advance(d)
             return self._correction(metrics)
         # 对准成立 (两码 bearing ≈ 0, 正对充电桩) 且桩码到达锁定距离 → 切站立:
         # 桩码光学 z 再小就要出视野 (30cm 是匍匐视角的可见极限), 此后航向已由
@@ -863,13 +978,49 @@ class DualTagDocking:
             # 每个 observe 窗口都已经过一遍同一门槛, 走到这里 d 必然 ≥ 下沿。
             # 在此重复一遍只会是永不执行的死代码, 误导下一个读代码的人。
             if d > obs+self.p('observation_tolerance'):
-                return self._emit(ActionPlan(kind='forward', jog_distance=min(.05, self.p('forward_step'), (d-obs)/self.r[0][2])))
+                return self._emit(ActionPlan(kind='forward', jog_distance=min(self.p('forward_step'), (d-obs)/self.r[0][2])))
             self.stage = 'approach'
             # 一次性: 提交直行那一刻的余量 —— 之后桩码将随接近离开视野,
             # 这是最后一次能看到两码逐边状态的点。
             self._node.get_logger().info(
                 'dual 进入 approach (提交直行): ' + self.margin_report())
         return self._advance(d)
+
+    def _bearing_tol(self, depth):
+        """bearing 微调门槛; 纯直行区内随接近收紧, 而不是整体停摆。
+
+        区外恒为 straight_yaw_tol_deg。区内 (depth ≤ steering_stop) 取
+        "这一转到底值不值得发"的盈亏平衡点:
+
+          收益 —— 归零 bearing 即对墙码 pure pursuit, 终点横偏由 y 收缩到
+                  y·target/depth, 收益 = y·(1 − target/depth), 其中
+                  y = depth·tan|b|;
+          代价 —— 转向自身约 straight_yaw_lag_deg 的停止滞后残留成航向误差,
+                  一路带到接触点, 横向代价 = target·sin(lag)。
+
+        收益 > 代价 即 tan|b| > target·sin(lag)/(depth − target) —— 右边就是
+        门槛。它自己会做对两件事:
+          · depth → target 时 (depth−target) → 0, 门槛发散到 90°, 最后一截
+            没有任何 bearing 能过门 —— 原来那条"近场禁转"的结论被保留下来,
+            但落在物理正确的位置上, 而不是一条 1.0m 的硬悬崖;
+          · depth 远离 target 时门槛降到 straight_yaw_tol_deg 以下, 由后者
+            兜底 (max), 区内门槛因此永远不比区外更松。
+
+        典型值 (target=0.50, lag=2.0°): z=1.00→2.0°, 0.85→2.8°, 0.75→4.1°,
+        0.65→6.7°, 0.55→11.1°。现场那趟 z=0.74 时 bearing 已 6.0°, 收益
+        25mm 对代价 17mm —— 该纠, 而旧代码把它整个否掉了。
+
+        lag 是唯一的现场旋钮: 调大 = 更保守 = 区内更早停止转向。
+        """
+        tol = math.radians(self.p('straight_yaw_tol_deg'))
+        if depth > self.steering_stop:
+            return tol
+        gap = depth-self.target
+        if gap <= 0:
+            # 已到或冲过停泊点: 转向不再有任何横向收敛通道, 纯航向损伤。
+            return math.pi
+        lag = math.sin(math.radians(self.p('straight_yaw_lag_deg')))
+        return max(tol, math.atan2(self.target*lag, gap))
 
     def _locked_bearing(self, depth):
         """locked 直行的墙码 bearing 微调; 返回转向计划, None = 纯前进。
@@ -889,11 +1040,43 @@ class DualTagDocking:
         整场健康直行的中止是错的交易; 墙码仍受保护 —— 不可见的转向根本
         不会被发出。连续转向上限 (straight_yaw_max_turns) 兜住底盘 ~2°
         停止滞后导致的预测与现实偏差, 超限强制前进, 两条路径都不判失败。
+
+        纯直行区 (z ≤ steering_stop) 内**不再整体停摆**, 改为按 _bearing_tol
+        的盈亏平衡门槛收紧 —— 2026-09-12 现场推翻了原来的整体停摆: 区内
+        bearing 从 +1.88° 单调涨到 +11.22° 全程无人纠, 终点横偏 ~91mm, 而
+        dock_tolerance 只有 20mm。原论证 (力臂增益 + ~2° 停止滞后使单步转向
+        不确定) 本身没错, 错的是把一个 ~2° 量级的不确定度拿去否决一个 11°
+        量级的误差。门槛化之后这条论证以正确的形式保留: 小 bearing 仍不纠
+        (纠不过噪声), 大 bearing 纠 (代价远小于收益), 且 depth → target 时
+        门槛自动发散, 最后一截仍然禁转 —— 没有硬距离悬崖。
+
+        区内的"行进中航向保持"与这条是互补的两层, 不是重复:
+          · 参考量: 这里是墙码 bearing (力臂增益 1+t_x/z, z=0.6 时 1.33);
+            那里是 odom/IMU yaw 增量 (旋转不产生力臂误差, 增益恒为 1)。
+          · 闭环性: 这里单步开环 (停稳发一次, 下一个停看点才知道结果);
+            那里 20Hz 闭环 (单周期 0.34°, 过冲下一周期就被看到)。
+          · 纠的对象: 这里纠上一停视觉看见的残余误差 (含航向 + 横偏, bearing
+            把两者混在一起); 那里纠行程中新产生的 yaw 漂移 —— 上一停的视觉
+            物理上看不见它。现场那 91mm 里两者都有份, 少任何一层都补不齐。
         """
         b = math.atan2(self.wall[0], depth)
-        tol = math.radians(self.p('straight_yaw_tol_deg'))
+        tol = self._bearing_tol(depth)
+        near = depth <= self.steering_stop
         if abs(b) <= tol:
+            if near:
+                self._node.get_logger().info(
+                    f'dual 纯直行区 (墙码 z={depth:.3f}m ≤ {self.steering_stop:.2f}m): '
+                    f'bearing={math.degrees(b):+.2f}deg ≤ 收紧门槛 '
+                    f'{math.degrees(tol):.2f}deg, 直行 (纠它不划算)',
+                    throttle_duration_sec=2.0)
             return None
+        if near:
+            self._node.get_logger().info(
+                f'dual 纯直行区 (墙码 z={depth:.3f}m): bearing='
+                f'{math.degrees(b):+.2f}deg > 收紧门槛 {math.degrees(tol):.2f}deg '
+                f'— 先微调再直行 (终点横偏收益 '
+                f'{depth*math.tan(abs(b))*(1-self.target/depth)*1e3:.0f}mm)',
+                throttle_duration_sec=2.0)
         turns = int(self.p('straight_yaw_max_turns'))
         if self._locked_turns >= turns:
             self._node.get_logger().warn(
@@ -950,8 +1133,43 @@ class DualTagDocking:
         # aligned 恒 True: 调用方都已在对准/锁定航向下 (_advance 只从 approach
         # 对准分支与 locked 进入) —— locked 前进同样累积航向资格, 否则切站立后
         # progress 永远 False, 终点会误判 'without qualified approach'。
+        if remaining < 0:
+            # 冲过停泊点 (|remaining| > dock_tolerance): 回退修剪。此前这是
+            # min() 公式的隐式行为 (负数穿透 min(0.10, remaining)), 现场日志里
+            # 只会看到一条莫名其妙的前进 -0.03; 现在显式分支并说明缘由。
+            # 连续直行使冲过成为预期结局之一 (里程计尺度误差无处吸收), 修剪
+            # 而非判失败 —— 超出 dock_tolerance 的欠/过都由停稳重测兜住。
+            # 修剪单步封顶 reverse_step: 真冲过一大截 (尺度标错/量测异常) 时
+            # 分步退、每步带新鲜重测, 比一次长盲退稳; 修剪走主账 (见
+            # action_started), max_actions 兜住病态振荡。
+            trim = max(remaining/self.r[0][2], -self.p('reverse_step'))
+            self._node.get_logger().info(
+                f'dual 冲过停泊点 {-remaining*100:.1f}cm, 回退修剪 {trim*100:.1f}cm')
+            return self._emit(ActionPlan(kind='forward', jog_distance=trim),
+                              aligned=True)
+        if depth <= self.steering_stop:
+            # 纯直行区: 区内禁转向/禁横移, jog 切分毫无收益只有起停开销 ——
+            # 一次连续直行走完剩余距离, 终点精度交给停稳重测的修剪
+            # (欠: 本函数的收缩步; 过: 上面的回退修剪)。
+            # continuous 标记有两个消费者: ActionWatch 据此放宽 deadline
+            # (0.45m @ 0.08m/s ≈ 5.6s, 会撞 6s 动作超时); 节点侧据此武装
+            # 行进中航向保持 —— 区内一次走完与行进中守住航向是同一个决定的
+            # 两半: 既然不停下来纠方向, 就得在走的过程中不让它歪掉。守的是
+            # odom/IMU yaw 相对起步的增量 (连续微步闭环), 与下面 _locked_bearing
+            # 禁的"用近场视觉做离散大步开环转向"不是一回事, 那条禁令未被撤销。
+            # (0.45m @ 0.08m/s ≈ 5.6s, 会撞 6s 动作超时)。
+            # 整段不可见则退回 forward_step 逐步走, 而不是判无候选。此时被否的
+            # 只可能是墙码 (桩码在终局整段里整体免检 —— 骑跨充电, 到位时它就在
+            # 机体下方, 见 visible): 墙码是修剪和终点判定唯一的依据, 它要在整段
+            # 路径上都留在画里, 否则宁可逐步走、每停重测 —— 那是长期现场验证的
+            # 老行为。这里多算一次 visible (十几个采样点, 可忽略), 换 _emit 的
+            # 记账与无候选语义完全不动。
+            run = ActionPlan(kind='forward', jog_distance=remaining/self.r[0][2],
+                             continuous=True)
+            if self.visible(run)[0]:
+                return self._emit(run, aligned=True)
         return self._emit(ActionPlan(kind='forward', jog_distance=min(
-            .05, self.p('forward_step'), remaining/self.r[0][2])), aligned=True)
+            self.p('forward_step'), remaining/self.r[0][2])), aligned=True)
 
 
 def parallax_solve(b_w: float, d_w: float, b_p: float, d_p: float,

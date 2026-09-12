@@ -12,8 +12,16 @@ class ActionWatch:
         self.noise = p('odom_noise_rad' if self.yaw else 'odom_noise_m')
         # Executor's target is already divided by odom_scale. Use actual issued
         # speed (half-speed small turns), but cap every action in wall clock.
-        self.deadline = min(p('action_timeout_sec'), max(p('response_timeout_sec'),
-                            3*abs(amount)/max(abs(speed), 1e-6)+1.))
+        # 纯直行区的连续直行例外: 路程可远超单步 (0.45m @ 0.08m/s ≈ 5.6s),
+        # 外层 min(action_timeout_sec=6.0, …) 会把 6.3s 的合法行程掐死在 6s ——
+        # 此时不设 6s 上限, deadline 按实际行程放宽 (1.5× 行程 + 2s 裕量),
+        # 其余判据 (反向/无响应/直线一致性) 原样生效, 故障仍会被抓到。
+        if getattr(plan, 'continuous', False) and not self.yaw and not self.lateral:
+            self.deadline = max(p('action_timeout_sec'),
+                                1.5*self.target/max(abs(speed), 1e-6)+2.)
+        else:
+            self.deadline = min(p('action_timeout_sec'), max(p('response_timeout_sec'),
+                                3*abs(amount)/max(abs(speed), 1e-6)+1.))
         self.signed = 0.
 
     def check(self, now, pose, odom_stamp):

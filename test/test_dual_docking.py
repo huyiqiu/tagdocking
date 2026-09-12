@@ -54,7 +54,7 @@ def test_observation_then_forward_and_recorrect():
     c = controller()
     n = frames(c)
     step = plan(c, n)[0]
-    assert c.stage == 'approach' and step.jog_distance == .05
+    assert c.stage == 'approach' and step.jog_distance == .10
     c.action_started(step, n)
     assert not c.progress
     c.action_completed()
@@ -85,14 +85,17 @@ def test_wall_only_bounded_reverse():
     # 预算取小值: 本用例测的是"墙码单码后退有界、耗尽即判失败"这个机制, 不是
     # 生产配置里那个数。写死 6 次在预算从 0.30m/8 次调到 0.80m/16 次之后就静默
     # 失效了 (而 16 次 × 4s 还会先撞上 acquire_timeout_sec, 失败串也就不再是
-    # 预算)。
-    c = DualTagDocking(Node(**{'dual.reverse_count': 4., 'dual.reverse_limit': .20}))
+    # 预算)。limit 也不能写死: 步长改 10cm 后 0.20m 只够 2 步, 会先撞距离账,
+    # 测不到步数账 —— 按步长定 limit, 让两本账同时在第 4 步耗尽。
+    step_m = DEFAULTS['reverse_step']
+    c = DualTagDocking(Node(**{'dual.reverse_count': 4.,
+                               'dual.reverse_limit': 4*step_m}))
     c.set_extrinsics((.2, .03, .4), (-.5, .5, -.5, .5))
     c.camera = CameraModel(1600, 1296, 400., 400., 800., 648.)
     for i in range(4):
         n = frames(c, start=10+i*4, missing=True, count=10)
         step = plan(c, n)[0]
-        assert step.jog_distance == -.05
+        assert step.jog_distance == -step_m
         c.action_started(step, n)
         c.stopped(n)
     n = frames(c, start=26, missing=True, count=10)

@@ -21,7 +21,28 @@ Usage:
 """
 
 import math
+from typing import NamedTuple
+
 from .utils import normalize_angle
+
+
+class HeadingHold(NamedTuple):
+    """行进中航向保持的继电参数; None = 不启用 (普通 jog / 盲腿保持原行为)。
+
+    比例式航向保持发不出去: |wz| < l1w_control 的 min_angular_z(0.10) 会被
+    clampAxis 直接截成 0 (见 ActionExecutor._min_angular_rate 注释), 所以只能
+    是带迟滞的继电 —— 输出 0 或 ±rate, 无中间档。
+
+    参数走 start_jog() 入参而非 __init__: __init__ 在节点构造时读一次就冻结,
+    而这几个值恰恰最需要现场 `ros2 param set` 边跑边调 (_p() 每次现读, 改完
+    下一趟生效, 不必重启)。
+    """
+    rate: float           # rad/s, 下发幅值 (start_jog 用 min_angular_rate 抬底)
+    engage: float         # rad, |err| >= 此值接通
+    release: float        # rad, |err| <= 此值断开 (绝不取 0: 报告滞后必过冲)
+    min_engage_ns: int    # 最短接通时长: 单周期 wz 脉冲底盘可能不响应
+    cooldown_ns: int      # 断开后最短静默: 让下一次决策基于已沉降的 odom
+    budget: float         # rad, 单程累计下发角上限 (诊断闸, 非安全边界)
 
 
 class ActionExecutor:
@@ -89,6 +110,19 @@ class ActionExecutor:
         self._jog_start_yaw = 0.0
         self._jog_start_bearing = 0.0
         self._jog_blind = False
+        # 行进中航向保持 (见 HeadingHold)。_jog_hold None = 本次行程不保持,
+        # angular 恒 0, 与改动前逐位相同。
+        self._jog_hold: HeadingHold | None = None
+        self._jog_hold_engaged = 0.0     # 当前下发的 wz (0 = 未接通)
+        self._jog_hold_engage_ns = 0
+        self._jog_hold_release_ns = 0
+        self._jog_hold_tick_ns = 0       # 上一周期时刻, 用于积分已下发角
+        # 以下三个是诊断量, 供完成日志读取 —— 故意不在 _stop() 里清零:
+        # 完成日志在 update() 返回 True 之后才打, 那时 _stop() 已经跑过。
+        # 清零统一在 start_jog (下一次行程开始时)。
+        self._jog_yaw_error = 0.0        # 最近一次 normalize_angle(yaw - 出发 yaw)
+        self._jog_hold_used = 0.0        # 累计已下发角 (rad)
+        self._jog_hold_spent = False     # 预算耗尽 / yaw 不可信 → 本程不再保持
 
         # Turn tracking
         self._turn_start_yaw = 0.0
@@ -131,10 +165,26 @@ class ActionExecutor:
     def lateral_cmd(self) -> float:
         return self._action_lateral
 
+    @property
+    def jog_yaw_error(self) -> float:
+        """最近一次 normalize_angle(odom_yaw - 出发 yaw); 日志/现场标定用。"""
+        return self._jog_yaw_error
+
+    @property
+    def jog_hold_used(self) -> float:
+        """本次行程航向保持累计已下发角 (rad)。"""
+        return self._jog_hold_used
+
+    @property
+    def jog_hold_spent(self) -> bool:
+        """True = 预算耗尽或 yaw 不可信, 本程后段已退回纯直行。"""
+        return self._jog_hold_spent
+
     # ── Start actions ───────────────────────────────────────────────
 
     def start_jog(self, distance: float, linear_rate: float,
-                  blind: bool = False, odom_scale: float = 1.0):
+                  blind: bool = False, odom_scale: float = 1.0,
+                  hold: HeadingHold | None = None):
         """Start a straight-line jog of `distance` metres.
 
         Positive = forward, negative = reverse.
@@ -150,6 +200,10 @@ class ActionExecutor:
         the IMU yaw is trustworthy). `distance` is expressed in REAL metres;
         the stop target is divided by odom_scale so the run stops when the
         TRUE displacement — not the under-reported odometry — reaches it.
+
+        hold: 行进中航向保持的继电参数, None = 不保持 (angular 恒 0, 与改动前
+        逐位相同)。只有双码纯直行区那一步"一次走完"的长直行才传 (节点侧按
+        plan.continuous 武装) —— 普通 jog、泊出/重试盲腿一律 None。
         """
         if self._action != 'idle':
             return
@@ -159,6 +213,17 @@ class ActionExecutor:
         self._action_angular = 0.0
         self._action_target = abs(distance) / max(odom_scale, 0.05)
         self._jog_blind = blind
+        # rate 抬到 min_angular_rate 之上: 结构上不可能配进 l1w_control 的 0.10
+        # 死区 (同 start_turn 的减速抬底, 让死区不可达而不是靠启动校验报错)。
+        self._jog_hold = hold and hold._replace(
+            rate=max(abs(hold.rate), self._min_angular_rate))
+        self._jog_hold_engaged = 0.0
+        self._jog_hold_engage_ns = 0
+        self._jog_hold_release_ns = 0
+        self._jog_hold_tick_ns = 0
+        self._jog_yaw_error = 0.0
+        self._jog_hold_used = 0.0
+        self._jog_hold_spent = False
 
     def start_turn(self, angle: float, angular_rate: float,
                    full: bool = False) -> bool:
@@ -278,7 +343,8 @@ class ActionExecutor:
         if self._action == 'jogging':
             return self._update_jog(odom_x, odom_y, odom_yaw,
                                     tag_visible, raw_dist, bearing_fn,
-                                    theta_bounds_fn, target_distance, drift_tol)
+                                    theta_bounds_fn, target_distance, drift_tol,
+                                    now_ns)
 
         if self._action == 'lateral':
             return self._update_lateral(odom_x, odom_y,
@@ -291,10 +357,15 @@ class ActionExecutor:
         return False
 
     def _update_jog(self, ox, oy, oyaw, tag_visible, raw_dist,
-                    bearing_fn, theta_bounds_fn, target_dist, drift_tol) -> bool:
+                    bearing_fn, theta_bounds_fn, target_dist, drift_tol,
+                    now_ns) -> bool:
         dx = ox - self._jog_start_x
         dy = oy - self._jog_start_y
         traveled = math.hypot(dx, dy)
+
+        # 航向保持先算, 再走判停 —— 双码直行一律 blind=True (docking_node
+        # _launch_step), 放在下面的 _jog_blind 早返回之后就永远执行不到。
+        self._update_heading_hold(oyaw, traveled, now_ns)
 
         # Blind jog (turn-drive-turn leg): odometry-only, NO visual early-stop.
         # The pre-move tag pose is stale for the whole maneuver and the leg was
@@ -326,6 +397,79 @@ class ActionExecutor:
             return True
 
         return False
+
+    # 20°: 0.08m/s 走 6.5s 物理上不可能真偏这么多 (真偏了墙码早出画、另有丢失
+    # 闭锁), 只能是读数故障。不给参数 —— 它不是一个可调的取舍。
+    _HOLD_SANITY_RAD = 0.35
+
+    def _update_heading_hold(self, oyaw, traveled, now_ns):
+        """继电式航向保持: 输出 0 或 ±rate, 只能让 |err| 下降。
+
+        err = normalize_angle(odom_yaw - 出发 yaw)。参考是"出发那一刻的朝向",
+        只做差分用 —— 我们问的不是"绝对朝向对不对"(那由上一停的视觉对准决定,
+        本方法不碰), 而是"从出发到现在有没有漂"。起始朝向即便本身偏了, 保持
+        也只是原样保留它 (= wz≡0 的老行为), 不会放大。
+
+        wz = -copysign(rate, err) 的符号规则保证保持永远不会主动把狗转离出发
+        朝向, 所以"越修越歪"的唯一通道是 odom yaw 增量本身错了 —— 那会同时
+        打坏系统里每一次 start_turn (同一个 odom_yaw), 不是本功能新增的风险。
+        预算 (budget) 因此不是安全边界, 而是"底盘不响应 wz / odom yaw 疯了"
+        的诊断闸: 正常一趟只需 5-10°。
+
+        为什么不用墙码 bearing 做参考: ① 行程中根本没有 bearing (盲动期检测
+        冻结); ② 近场 bearing 带相机横向力臂增益 1+t_x/z, 最不可信 —— 那正是
+        区内禁转向的理由; ③ bearing 把横偏和航向混在一起, 追它就是 pure
+        pursuit (横向控制器); ④ 这个底盘只有 IMU yaw 可信 (见 start_jog)。
+        """
+        h = self._jog_hold
+        if h is None:
+            return
+        # 读数故障 → 断开并停用本程保持, 退化成 wz≡0 (即老行为)。odom 过期/
+        # 非有限的主防线在上游 (ActionWatch 每周期查, 过期即掐掉整个动作),
+        # 这里是给没有那层保护的路径 (单码/脚本) 兜底。
+        if not math.isfinite(oyaw):
+            self._jog_hold_engaged = self._action_angular = 0.0
+            self._jog_hold_spent = True
+            return
+        err = normalize_angle(oyaw - self._jog_start_yaw)
+        self._jog_yaw_error = err
+        if abs(err) > self._HOLD_SANITY_RAD:
+            self._jog_hold_engaged = self._action_angular = 0.0
+            self._jog_hold_spent = True
+            return
+        # dt 由时间差积分, 不写死控制周期 —— 免得与 docking_node 的定时器
+        # 周期形成隐式耦合 (改一个忘了改另一个, 预算就会静默偏掉)。
+        dt = (now_ns-self._jog_hold_tick_ns)*1e-9 if self._jog_hold_tick_ns else 0.
+        self._jog_hold_tick_ns = now_ns
+        if self._jog_hold_engaged:
+            self._jog_hold_used += abs(self._jog_hold_engaged)*max(dt, 0.)
+            if self._jog_hold_used >= h.budget:
+                self._jog_hold_spent = True
+            held_ns = now_ns-self._jog_hold_engage_ns
+            # 已越过零点并反向: 立刻断开, 不等 min_engage —— 继续发就是在
+            # 主动把狗往反方向推。
+            crossed = err*self._jog_hold_engaged > 0
+            if (self._jog_hold_spent
+                    or (abs(err) <= h.release and held_ns >= h.min_engage_ns)
+                    or (crossed and abs(err) > h.release)):
+                self._jog_hold_engaged = 0.0
+                self._jog_hold_release_ns = now_ns
+            # 否则维持原符号原幅值: 接通期内符号锁定是防抖振的结构性保证,
+            # 不依赖"我们猜对了底盘的停止滞后"。
+        elif (not self._jog_hold_spent
+                and abs(err) >= h.engage
+                and now_ns-self._jog_hold_release_ns >= h.cooldown_ns
+                and self._jog_hold_used + h.rate*h.min_engage_ns*1e-9 < h.budget
+                # 尾段留直: 剩余行程不够跑完一次最短接通 + 沉降就不再开,
+                # 停泊那一刻狗不在弧上。门槛由已有参数导出, 不新增配置项。
+                # (注: _action_target 已除过 odom_scale; 当前 jog_odom_scale
+                # = 1.0, 两者同为真实米。将来若标定出 scale≠1, 这里的米制
+                # 会失真, 需要改成用真实行程比较。)
+                and (self._action_target-traveled) > abs(self._action_linear)
+                     * (h.min_engage_ns+h.cooldown_ns)*1e-9):
+            self._jog_hold_engaged = -math.copysign(h.rate, err)
+            self._jog_hold_engage_ns = now_ns
+        self._action_angular = self._jog_hold_engaged
 
     def _update_lateral(self, ox, oy, tag_visible, raw_dist, target_dist) -> bool:
         """Check lateral odometry displacement against target."""
@@ -433,6 +577,11 @@ class ActionExecutor:
         self._action_linear = 0.0
         self._action_angular = 0.0
         self._jog_blind = False
+        # 停用航向保持, 但 _jog_yaw_error/_jog_hold_used/_jog_hold_spent 三个
+        # 诊断量故意留着: 完成日志在 update() 返回 True 之后才打, 那时这里
+        # 已经跑过了 —— 清掉就永远读不到。它们在下一次 start_jog 清。
+        self._jog_hold = None
+        self._jog_hold_engaged = 0.0
         if was_turning:
             self._last_stop_ns = None  # caller sets this via mark_stop_time
 
@@ -447,4 +596,6 @@ class ActionExecutor:
         self._action_angular = 0.0
         self._action_lateral = 0.0
         self._jog_blind = False
+        self._jog_hold = None
+        self._jog_hold_engaged = 0.0
         self._last_stop_ns = None

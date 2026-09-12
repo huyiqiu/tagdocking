@@ -38,6 +38,13 @@ class ActionPlan:
     turn_angle: float = 0.0      # rad, for 'yaw' actions
     jog_distance: float = 0.0    # m,   for 'forward' actions
     lateral_distance: float = 0.0  # m, for omni lateral correction (packed in 'forward')
+    # 纯直行区一次走完的连续前进 (双码专用): 路程可远超单步上限, ActionWatch
+    # 据此把 deadline 放宽到实际行程, 否则 6s 动作超时会掐死 6.3s 的长直行。
+    # 第二个消费者: docking_node._launch_step 据此武装"行进中航向保持"——
+    # 既然区内不停下来纠方向, 就得在走的过程中守住方向, 两者是同一个决定的
+    # 两半。所以这个字段的语义是"区内一次走完", 不是泛指的"步长较长"; 给
+    # 非区内行程置 True 会连带拿到航向保持 (节点侧另有 jog_distance>0 显式门)。
+    continuous: bool = False
 
 
 class GeometryPlanner:
