@@ -1,0 +1,14 @@
+#!/usr/bin/env python3
+"""Entry-point script for the docking web console.
+
+Usage:
+    ros2 run tagdocking docking_web --port 8090
+    # or via the launcher (随停泊栈一起起):
+    scripts/start_docking.sh
+"""
+
+from tagdocking.web_console import main
+
+
+if __name__ == '__main__':
+    main()

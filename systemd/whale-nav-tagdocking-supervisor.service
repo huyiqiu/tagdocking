@@ -1,0 +1,34 @@
+[Unit]
+Description=Whale Nav tagdocking 停泊栈按需启停 supervisor
+# 相机走 mediamtx 的 rtsp://127.0.0.1:8555/front。supervisor 本身不碰相机 ——
+# 它只在有人真要停泊/看视频时才把栈拉起来, 那时 mediamtx 早就好了。所以这里
+# 的依赖比满栈单元更松: 只要 After 排个序, 起早了也无害。
+After=network-online.target whale-nav-mediamtx.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=nvidia
+Group=nvidia
+ExecStart=/home/nvidia/whale-nav/src/tagdocking/scripts/start_docking.sh supervisor
+# 无条件重启: supervisor 挂了是静默的 —— 栈还在跑 (见下面 KillMode), 页面看着
+# 一切正常, 直到有人点停泊才发现没人应答。
+Restart=always
+RestartSec=3
+KillSignal=SIGINT
+TimeoutStopSec=15
+
+# ── KillMode=process 是有意的, 不要"统一"成 control-group ──────────────
+# 别的单元用 control-group (整个 cgroup 一起收, 不留孤儿)。这里**不能**那样:
+# 重启 supervisor 时不能连坐把停泊栈杀掉 —— 栈可能正停泊到一半, 机器人正在动。
+# process 模式下只收 supervisor 自己, 栈留在原地, supervisor 起来后靠
+# _adopt_existing() 重新认领它 (按 argv 匹配找到那棵 launch 树)。
+#
+# 孤儿风险由 supervisor 自己兜: 它的 shutdown() 会主动收栈, 且每次起栈前先
+# stop_launch_tree 清场。另外栈是用 start_new_session=True 起的, 本来就在
+# systemd 的 cgroup 信号范围之外 —— 就算这里写 control-group 也收不到它,
+# 只会多杀一个 supervisor 而已。
+KillMode=process
+
+[Install]
+WantedBy=multi-user.target

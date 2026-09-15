@@ -67,8 +67,40 @@ DUAL_TUNING_ARGS = (
     'pile_lock_distance', 'crouch_settle_sec',
 )
 
+# dual_* 里少数几个的实测最优值 (2026-09 现场标定, 成功率最高的一组)。
+# 其余 dual_* 仍是空串 = 保留 config/docking.yaml 的权威值 —— 这张表只是
+# 对那条约定的按名例外, 不要顺手往里加参数: 进了这张表的值就脱离了 yaml,
+# 改 yaml 不再生效, 只能改这里。
+DUAL_ARG_DEFAULTS = {
+    'settle_sec': '1.0',      # yaml 为 1.5; 实测 1.0 停稳足够且更快
+    'dock_distance': '0.47',  # yaml 为 0.50; 实测 0.47 到位更稳
+}
+
+DEFAULT_RTSP_URL = 'rtsp://127.0.0.1:8555/front'
+
+# rtsp 模式的默认内参: 写成包内绝对路径而不是留空靠回退逻辑猜。
+#   - `--show-args` 里直接看得到用的是哪一份, 不用去读回退代码才敢确定;
+#   - 不用相对路径 config/rtsp_camera_info.yaml —— systemd 下工作目录不确定,
+#     相对路径会指到别处或直接找不到;
+#   - symlink-install 让这条路径就是源码那一份 (已确认是软链), 重新标定后
+#     不用 rebuild 即生效。
+DEFAULT_RTSP_CAMERA_INFO = os.path.join(
+    get_package_share_directory('tagdocking'), 'config', 'rtsp_camera_info.yaml')
+
 
 def launch_setup(context):
+    # ── 参数体检要在清场之前 ──────────────────────────────────────
+    # 下面那段 pkill 有副作用: 它会收掉正在跑的 apriltag_node/camera_info_bridge,
+    # 而 apriltag 一死 `ros2 launch` 会连坐把整棵树带走。所以参数拼错必须在
+    # **动手之前**就炸掉 —— 否则一条 `nodes:=camrea` 的手抖就把好好跑着的栈
+    # 收了, 而且自己还起不来。(实测踩过: nodes:=bogus 把活栈整棵带下来了。)
+    nodes_mode = LaunchConfiguration('nodes').perform(context).strip().lower()
+    if nodes_mode not in ('all', 'camera'):
+        # 照 rtsp/odin 互斥那条的写法: 拼错的值当场炸, 不静默退回默认值 ——
+        # 悄悄起了满栈就把"按需省 CPU"这件事整个抵消了。
+        raise RuntimeError(
+            f"nodes 只能是 all 或 camera, 收到 '{nodes_mode}'")
+
     # ── Kill stray apriltag_node / camera_info_bridge processes ──
     # apriltag_node is a separate process from docking_node; if docking_node
     # crashed (or was SIGKILLed), the apriltag node survived. Multiple stray
@@ -144,22 +176,30 @@ def launch_setup(context):
     # ── Odin1 相机模式 (后装 3D 视觉模组) ──
     use_odin = (LaunchConfiguration('use_odin').perform(context)
                 .strip().lower() == 'true')
+    if use_odin and rtsp_url == DEFAULT_RTSP_URL:
+        # rtsp_url 现在有非空默认值, 而 ros2 launch 的 CLI 传不进空串
+        # (`rtsp_url:=` 直接报 malformed) —— 不特判的话 use_odin 就没法用了,
+        # 每次都撞下面那条互斥错误。只吃掉"用户没动过的默认值"; 显式传了别的
+        # 地址仍然按冲突报错, 该拦的还是拦。
+        rtsp_url = ''
+        use_rtsp = False
     if use_odin and use_rtsp:
         raise RuntimeError('rtsp_url 与 use_odin 互斥: 一次只能选一种相机源')
 
     pkg_share = get_package_share_directory('tagdocking')
-    if use_rtsp and not camera_info_file:
-        # 未显式给内参时回退到包内标定文件 (config/rtsp_camera_info.yaml, 由
-        # scripts/calibrate_rtsp 生成后随包安装) —— 换机器/重部署不用记着传路径。
-        default_intr = os.path.join(pkg_share, 'config', 'rtsp_camera_info.yaml')
-        if os.path.isfile(default_intr):
-            camera_info_file = default_intr
-            print(f'[docking.launch] camera_info_file 未指定, 使用包内标定文件: '
-                  f'{default_intr}')
+    if use_rtsp:
+        # 默认值已是包内绝对路径 (DEFAULT_RTSP_CAMERA_INFO)。显式传空串时补回来,
+        # 保留"换机器/重部署不用记着传路径"的老行为。
+        if not camera_info_file:
+            camera_info_file = DEFAULT_RTSP_CAMERA_INFO
+        # 存在性检查对显式传入的路径同样生效: 打错一个字符就在这里报, 而不是
+        # 等 rtsp_camera 起不来再去翻它的日志。
+        if os.path.isfile(camera_info_file):
+            print(f'[docking.launch] rtsp 内参: {camera_info_file}')
         else:
-            print('[docking.launch] 警告: rtsp_url 已设置但 camera_info_file 为空 '
-                  '(包内也无 config/rtsp_camera_info.yaml), rtsp_camera 将启动失败。'
-                  '先标定: python3 scripts/calibrate_rtsp '
+            print(f'[docking.launch] 警告: 内参文件不存在: {camera_info_file} '
+                  '—— rtsp_camera 将启动失败。先标定: '
+                  'python3 scripts/calibrate_rtsp '
                   '--url <rtsp地址> --out config/rtsp_camera_info.yaml',
                   file=sys.stderr)
 
@@ -167,7 +207,10 @@ def launch_setup(context):
     if use_odin:
         # odin 驱动只发去畸变图像 (无 camera_info, frame_id 为空), 内参回退到
         # 包内 odin_camera_info.yaml (抄自 odin calib.yaml, 随包安装)。
-        if not camera_info_file:
+        # 判据含"仍等于 rtsp 默认值": camera_info_file 现在默认非空 (指向 rtsp
+        # 那份标定), 只判空会让 use_odin 被悄悄喂上 rtsp 内参 —— 图照出、位姿
+        # 全错, 属于最难查的一类故障。
+        if not camera_info_file or camera_info_file == DEFAULT_RTSP_CAMERA_INFO:
             odin_intr = os.path.join(pkg_share, 'config', 'odin_camera_info.yaml')
             if os.path.isfile(odin_intr):
                 camera_info_file = odin_intr
@@ -366,6 +409,18 @@ def launch_setup(context):
             output='screen',
         ))
 
+    if nodes_mode == 'camera':
+        # ── camera 模式在此收尾 ──────────────────────────────────
+        # 只要相机链路: rtsp_camera (含它自己发的 mount 静态 TF) + 同步桥,
+        # 不起检测器也不起控制器。供 Web 在停泊栈没起时单纯看画面用 ——
+        # 看画面不需要检测, 而 apriltag 那份 decimate=1.0 的逐帧检测正是
+        # 这次要省掉的开销大头。
+        #
+        # 用提前 return 而不是把下面两段包进 if: 那样要重排近百行缩进, 在一个
+        # "只加参数" 的改动里混进大段格式变化, 日后 blame 这个文件的人得先
+        # 分辨哪些是真改动。相机链路本来就全在上面, 早退是顺着结构来的。
+        return nodes
+
     # ── AprilTag detection node ─────────────────────────────────
     # 双码模式: 墙码 + 桩码两 tag 逐 tag 边长 (嵌套 tag.sizes; 桩码 5cm 与
     # 墙码 15cm 边长不同, 旧 fork 的单一 size 参数解不出桩码正确 PnP ——
@@ -481,7 +536,8 @@ def generate_launch_description():
             description='raw or rectified; empty uses YAML (known Odin undistorted source selects rectified)'),
         DeclareLaunchArgument('dual_camera_info_topic', default_value='',
             description='Exact detection-image CameraInfo; empty preserves YAML'),
-        *[DeclareLaunchArgument('dual_' + name, default_value='',
+        *[DeclareLaunchArgument('dual_' + name,
+            default_value=DUAL_ARG_DEFAULTS.get(name, ''),
             description='Override dual.' + name + '; empty preserves YAML')
           for name in DUAL_TUNING_ARGS],
         DeclareLaunchArgument('image_topic', default_value='/image_raw',
@@ -490,8 +546,8 @@ def generate_launch_description():
                              description='Camera info topic (source for sync bridge)'),
         DeclareLaunchArgument('family', default_value='36h11',
                              description='AprilTag family (36h11, 25h9, etc.)'),
-        DeclareLaunchArgument('tag_size', default_value='0.16',
-                             description='Tag edge size in meters'),
+        DeclareLaunchArgument('tag_size', default_value='0.15',
+                             description='Tag edge size in meters (墙码实测 0.15)'),
         DeclareLaunchArgument('dock_tag_id', default_value='0',
                              description='Tag ID to dock to'),
         DeclareLaunchArgument('camera_frame',
@@ -512,10 +568,13 @@ def generate_launch_description():
         DeclareLaunchArgument('entry_lateral_m', default_value='',
                              description='直行入口横向门槛 (m): 进入直行距离时 |横向| 超此值报导航失败 '
                                          '(空 = 使用 yaml 的 final_straight.entry_lateral_m)'),
-        DeclareLaunchArgument('camera_lateral_offset_m', default_value='',
+        DeclareLaunchArgument('camera_lateral_offset_m', default_value='0',
                              description='相机光学中心相对底盘中心线的横向偏移 (m, + = 相机偏左): '
-                                         '加回量测 lat 补偿安装误差, 直行前触发左移修正 '
-                                         '(空 = 使用 yaml 的 camera.lateral_offset_m; 本机实测 0.03)'),
+                                         '加回量测 lat 补偿安装误差, 直行前触发左移修正。'
+                                         '默认 0 —— 当前相机 (odin1 RTSP) 光心与底盘中心线齐平, '
+                                         '0.03 那个值是上一个相机的, 填非零等于凭空注入假横偏。'
+                                         '换装偏心相机时按实测填; 传空串则用 yaml 的 '
+                                         'camera.lateral_offset_m'),
         DeclareLaunchArgument('final_straight_lateral_threshold', default_value='',
                              description='近场横移修正/捷径横向门槛 (m, 比入口 entry_lateral_m 更紧): '
                                          '量测补偿加回偏置后防止真实偏移被捷径放行直行 '
@@ -565,10 +624,11 @@ def generate_launch_description():
                                           '(空 = 使用 yaml 的 charge.static_stand)'),
 
         # ── 双二维码模式 (dual.*) ────────────────────────────────
-        DeclareLaunchArgument('dual_enable', default_value='',
+        DeclareLaunchArgument('dual_enable', default_value='true',
                               description='双二维码对准总开关 true/false: 墙码(36h11:0)+桩码 '
-                                          '联合对准 → 纯直行 → 距墙码 0.50m 停泊 '
-                                          '(空 = 使用 yaml 的 dual.enable)'),
+                                          '联合对准 → 纯直行 → 距墙码 dual_dock_distance 停泊。'
+                                          '默认 true (实测默认配置); 传 false 回单码路径, '
+                                          '传空串则用 yaml 的 dual.enable'),
         DeclareLaunchArgument('dual_crouch_enable', default_value='',
                               description='匍匐 profile 开关 true/false: false=全程站立 '
                                           '(默认, 匍匐单轮转向附带 4.5~7cm 前移已弃用); '
@@ -586,16 +646,20 @@ def generate_launch_description():
                                           '(空 = 使用 yaml 的 dual.pile_tag_size, 默认 0.05)'),
 
         # ── RTSP 相机模式 (机器狗) ──────────────────────────────
-        DeclareLaunchArgument('rtsp_url', default_value='',
+        DeclareLaunchArgument('rtsp_url',
+                             default_value=DEFAULT_RTSP_URL,
                              description='RTSP 地址。非空时用 rtsp_camera 桥替代 '
-                                         'camera_info_bridge + 外部相机话题 (机器狗模式)'),
+                                         'camera_info_bridge + 外部相机话题 (机器狗模式)。'
+                                         '默认指向 mediamtx 的 front 通道 (实测默认配置); '
+                                         '传空串回到外部相机话题模式'),
         DeclareLaunchArgument('use_odin', default_value='false',
                              description='用 odin1 相机 (/odin1/image/undistorted '
                                          '去畸变流 + 包内 odin_camera_info.yaml 内参 '
                                          '+ frame_id 重打 + 静态TF) 替代普通相机话题'),
-        DeclareLaunchArgument('camera_info_file', default_value='',
-                             description='相机内参 YAML (rtsp 模式必填; use_odin 时 '
-                                         '缺省用包内 odin_camera_info.yaml; 由 '
+        DeclareLaunchArgument('camera_info_file', default_value=DEFAULT_RTSP_CAMERA_INFO,
+                             description='相机内参 YAML (默认=包内 rtsp 标定文件绝对路径; '
+                                         'use_odin 时若未显式覆盖则自动换成包内 '
+                                         'odin_camera_info.yaml; 由 '
                                          'scripts/calibrate_rtsp 生成)'),
         DeclareLaunchArgument('camera_downscale', default_value='0',
                              description='输出降采样倍数 (0=自动: RTSP 到 ~640 宽; '
@@ -603,9 +667,16 @@ def generate_launch_description():
         DeclareLaunchArgument('camera_backend', default_value='ffmpeg',
                              description='RTSP 拉流后端: ffmpeg | gstreamer '
                                          '(Jetson 硬解, FFmpeg 解码冻结时用)'),
-        DeclareLaunchArgument('odom_topic', default_value='',
-                             description='里程计话题 (空 = 使用 config/docking.yaml 的 '
-                                         'odom_topic; 机器狗为 /dog/odom)'),
+        DeclareLaunchArgument('nodes', default_value='all',
+                             description='起哪些节点: all = 相机+检测+控制器 (默认, '
+                                         '与历史行为一字不差); camera = 只起相机链路 '
+                                         '(rtsp_camera + 同步桥), 供 Web 在停泊栈未起时'
+                                         '看画面, 由 docking_supervisor 按需使用'),
+        DeclareLaunchArgument('odom_topic',
+                             default_value='/odin1/odometry_highfreq',
+                             description='里程计话题 (默认 odin1 高频里程计, 实测默认配置; '
+                                         '空 = 使用 config/docking.yaml 的 odom_topic, '
+                                         '机器狗为 /dog/odom)'),
         DeclareLaunchArgument('base_frame', default_value='base_link',
                              description='机器人基座坐标系 (静态 TF 父系 + docking 测量系)'),
         DeclareLaunchArgument('camera_mount_x', default_value='0.0',

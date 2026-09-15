@@ -1,0 +1,30 @@
+[Unit]
+Description=Whale Nav tagdocking Web 控制台 (端口 8090)
+After=network-online.target whale-nav-tagdocking-supervisor.service
+Wants=network-online.target
+# 刻意不写 Requires/BindsTo/PartOf: Web 与停泊栈相互独立, 这份解耦正是按需启停
+# 需要的 —— 重启 Web 绝不能带走正在进行的停泊, 所以栈的命归 supervisor 管。
+# 重启停泊栈也不该踢掉正在看视频的人。
+# 栈没起来时 Web 照常服务, 且**按钮照常可点**: 页面显示「栈未运行（按需启动）」,
+# 点停泊就是让 supervisor 去起栈。按钮的禁用条件是 supervisor 不在, 不是栈不在。
+
+[Service]
+Type=simple
+# 这个 User 不能随便改: fastapi/uvicorn 是 pip 装在 /home/nvidia/.local 下的
+# (0.139/0.51, 比 apt 的 0.63/0.15 新), 只对该用户可见。换成 root 或别的用户
+# 会直接 ImportError —— 真要换用户, 先把这两个包装到系统级。
+User=nvidia
+Group=nvidia
+# 端口可在这里覆盖 (脚本读 TAGDOCKING_WEB_PORT):
+# Environment=TAGDOCKING_WEB_PORT=8090
+# 注意 8080 已被 robot_web_console 占用, 两者无关联, 不要改到 8080。
+ExecStart=/home/nvidia/whale-nav/src/tagdocking/scripts/start_docking.sh web
+# 无条件重启而不是 on-failure: Web 挂了是静默的, 没人会收到提示, 下次想用时
+# 才发现打不开。
+Restart=always
+RestartSec=3
+KillSignal=SIGINT
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target

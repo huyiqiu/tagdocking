@@ -1,0 +1,16 @@
+#!/usr/bin/env python3
+"""Entry-point script for the docking stack supervisor.
+
+按需启停停泊栈 —— 用时才起, 用完就收。它自己是常驻的, 但很轻。
+
+Usage:
+    ros2 run tagdocking docking_supervisor
+    # or via the launcher (whale-nav-tagdocking-supervisor.service 走这条):
+    scripts/start_docking.sh supervisor
+"""
+
+from tagdocking.stack_supervisor import main
+
+
+if __name__ == '__main__':
+    main()

@@ -36,6 +36,8 @@ rosidl_generate_interfaces(${PROJECT_NAME}
 
 # ── Install Python package ────────────────────────────────────────
 # All modules under tagdocking/ (including base_adapter/)
+# 递归安装, 所以 tagdocking/static/index.html 也随之装好 —— web_console.py 用
+# __file__ 相对定位该目录, 少了它 Web 控制台首页会 404。
 install(
   DIRECTORY tagdocking
   DESTINATION local/lib/python3.10/dist-packages
@@ -45,6 +47,8 @@ install(
 # ── Install entry-point scripts ───────────────────────────────────
 install(PROGRAMS
   scripts/docking_node
+  scripts/docking_web
+  scripts/docking_supervisor
   scripts/camera_info_bridge
   scripts/rtsp_camera
   scripts/calibrate_rtsp
@@ -53,6 +57,7 @@ install(PROGRAMS
   scripts/test_apriltag
   scripts/calibrate_camera
   scripts/mock_l1w_control
+  scripts/start_docking.sh
   DESTINATION lib/${PROJECT_NAME}
 )
 

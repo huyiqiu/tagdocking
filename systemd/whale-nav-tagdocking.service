@@ -1,0 +1,41 @@
+[Unit]
+Description=Whale Nav tagdocking 停泊栈 (AprilTag 双码自动停泊, 常驻满栈)
+# ── 这个单元默认**不 enable** ─────────────────────────────────────────
+# 常驻的是 whale-nav-tagdocking-supervisor.service, 由它在有人真要停泊时才把
+# 这套栈拉起来、终态后延迟收掉。原因是空转不比工作省: rtsp_camera 的 max_fps
+# 限的是发布不是解码 (cap.read 一直在跑), apriltag 对每帧都检测且
+# detector.decimate 被刻意关掉 —— IDLE 开销结构上约等于停泊开销。
+# 这个文件保留下来是为了"排查/标定时手工起一个不会被自动收掉的常驻满栈":
+#     systemctl start whale-nav-tagdocking      # 手工起, 不 enable
+# 手工起它是安全的: supervisor 会接管 (adopt) 而不是重起一棵。
+#
+# 相机走 mediamtx 的 rtsp://127.0.0.1:8555/front, 起早了拉不到流。
+# 不用 Requires: mediamtx 掉了 rtsp_camera 会自己重连, 不该连坐整个停泊栈。
+After=network-online.target whale-nav-mediamtx.service
+Wants=network-online.target whale-nav-mediamtx.service
+
+[Service]
+Type=simple
+User=nvidia
+Group=nvidia
+# 启动参数已固化为 docking.launch.py 的默认值, 脚本不重复传参。
+# 要核对实际生效的九个值, 看 scripts/start_docking.sh 头部注释, 或跑:
+#   ros2 launch tagdocking docking.launch.py --show-args
+ExecStart=/home/nvidia/whale-nav/src/tagdocking/scripts/start_docking.sh docking
+# ── Restart=no 是有意的 (原来是 on-failure) ───────────────────────────
+# supervisor 接管这棵栈之后, 空闲到期会主动把它收掉 —— 而 `ros2 launch` 被
+# SIGINT 收走时退出码不保证是 0。on-failure 会让 systemd 把这次"计划内的收栈"
+# 当成崩溃再拉起来, supervisor 再接管、再收…… 成一个无限起收循环, 而且是持续
+# 烧 CPU 的那种, 正好与这次改动的目的相反。
+# 要一个会自愈的常驻栈, 该做的是 enable supervisor, 不是在这里开重启。
+Restart=no
+# 照 whale-nav-base.service: 给底盘 SDK 时间把 socket 干净关掉, 并且用 SIGINT
+# 让 rclpy 走正常析构 —— SIGTERM 直接砍会留下还在广播 tag TF 的 apriltag 进程,
+# 下次启动时两个进程抢同一个 TF frame, 量测会在两组互相矛盾的值之间跳。
+KillSignal=SIGINT
+TimeoutStopSec=15
+# 整个 cgroup 一起收, launch 拉起的 apriltag_node / rtsp_camera 都不留孤儿。
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target

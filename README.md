@@ -210,7 +210,200 @@ colcon build --packages-select tagdocking --symlink-install
 source install/setup.bash
 ```
 
-### 2.3 启动
+### 2.3 一键启动 (本机默认部署)
+
+本机实测成功率最高的那一组参数**已经固化为 `docking.launch.py` 的默认值**，
+所以不再需要手敲一长串 `xxx:=yyy`：
+
+```bash
+# 常驻组合: supervisor + Web (Ctrl-C 一并收掉)。满栈不在这里起 ——
+# 有人真要停泊 / 看视频时才由 supervisor 拉起, 见下面「按需启停」。
+src/tagdocking/scripts/start_docking.sh
+
+# 或分开起
+src/tagdocking/scripts/start_docking.sh supervisor  # 只起按需启停 supervisor
+src/tagdocking/scripts/start_docking.sh web         # 只起 Web (端口 8090)
+src/tagdocking/scripts/start_docking.sh docking     # 前台起一个常驻满栈
+                                                    #   (排查/标定用; 也是
+                                                    #    supervisor 内部调的那条)
+```
+
+> 注意 `all`（不带参数）的语义变了：它现在起的是 **supervisor + Web**，不再前台起
+> 满栈。要一个不会被自动收掉的满栈，显式跑 `docking`。
+
+固化的默认值（等价于下面这条历史命令，核对用 `ros2 launch tagdocking
+docking.launch.py --show-args`）：
+
+| 参数 | 默认值 |
+| --- | --- |
+| `rtsp_url` | `rtsp://127.0.0.1:8555/front` |
+| `camera_info_file` | `<包share>/config/rtsp_camera_info.yaml`（绝对路径） |
+| `odom_topic` | `/odin1/odometry_highfreq` |
+| `camera_downscale` | `0` |
+| `dual_enable` | `true` |
+| `dual_settle_sec` | `1.0` |
+| `dual_dock_distance` | `0.47` |
+| `camera_lateral_offset_m` | `0` |
+| `tag_size` | `0.15` |
+
+> `camera_info_file` 写的是**包内绝对路径**（`DEFAULT_RTSP_CAMERA_INFO`），不是实测
+> 命令里的相对路径 `config/rtsp_camera_info.yaml`——后者在 systemd 下工作目录不确定
+> 会失效；也不留空靠回退逻辑猜——`--show-args` 里要能直接看到用的是哪一份。
+> symlink-install 让这条绝对路径就是源码同一份文件，重新标定后不用 rebuild 即生效。
+> 启动时 launch 打印 `[docking.launch] rtsp 内参: <路径>`，可据此核对；文件不存在
+> 时立刻告警并提示先跑 `calibrate_rtsp`，而不是等 `rtsp_camera` 起不来再翻日志。
+>
+> 因为这个默认值现在非空，`use_odin:=true` 的内参回退判据同步改成「为空**或**仍等于
+> 该默认值」——否则 odin 会被悄悄喂上 rtsp 的内参，图照出、位姿全错。
+
+> `dual_settle_sec` / `dual_dock_distance` 不是普通声明，而是 `DUAL_TUNING_ARGS`
+> 批量生成的；它们的默认值在 `docking.launch.py` 的 `DUAL_ARG_DEFAULTS` 表里。
+> 其余 45 个 `dual_*` 仍保持「空串 = 用 `config/docking.yaml` 权威值」的约定。
+
+临时改某个值，命令行照常覆盖：
+
+```bash
+scripts/start_docking.sh docking dual_dock_distance:=0.50
+```
+
+#### Web 控制台
+
+浏览器打开 `http://<机器人IP>:8090`：
+
+- **视频**：一个开关，不是一组旋钮。转播 `/camera_sync/image_raw`，即 AprilTag
+  实际检测的那一路图像；**打开即按 tagdocking 自己看到的原分辨率、原帧率推流**，
+  不缩放、不丢帧（JPEG 质量 95）。关掉就退订该话题，对 Jetson 零开销。
+  实测 1:1 跟随相机帧率（相机 15.0fps → 推流 15.1fps）。
+
+  > 之前做成画质/缩放/帧率三个滑块是错的思路：压糊只让**人**看不清，检测器那一份
+  > 根本不受影响，省下的编码开销换来的是排查时看不出问题。要省资源就关掉它。
+  >
+  > 唯一与检测器输入不同的地方：MJPEG 必须编成 JPEG，而检测器拿的是原始 BGR。
+  > 质量 95 已接近视觉无损，但严格说仍是有损的；分辨率和帧率则完全一致。
+- **状态**：两行，说的是两件事。横幅是 `/docking_node/state` 实时状态（按活动 /
+  成功 / 失败分色）；横幅下面一行是**停泊栈本身在不在**（`栈未运行（按需启动）` /
+  `栈启动中…` / `栈就绪（完整栈|仅相机链路）` / `收栈中…`）。
+  两者可以任意组合，其中最常见的就是「控制台在线 + 栈未运行」——那是正常的省电常态，
+  不是故障。
+- **操作**：停泊 / 泊出（二次确认）、取消（立即生效，当急停用）。
+  栈没起时按钮**照常可点**——点它就是让 supervisor 去起栈；确认框会预告要先花
+  5~8 秒冷启动，免得有人以为没反应而连点。按钮的禁用条件是 `docking_supervisor`
+  不在，不是 `docking_node` 不在。
+
+Web 自己既不 spawn 也不发信号，进程生命周期归 **`docking_supervisor`**。
+为什么不把按需启停做在 Web 里：一是 ROS 入口要在栈没起时也能用（外部平台直接调
+`/docking_supervisor/dock`，不该被迫走 HTTP）；二是 Web 是 `Restart=always` 的，
+改个静态文件就会重启它，而重启一个正在停泊的栈是不能接受的。
+
+#### 按需启停（省 CPU）
+
+常驻的是 `docking_supervisor` + Web；**停泊栈三个进程用时才起、用完就收**。
+
+动机是空转并不比工作省，这一点是结构性的、不是调参能解决的：
+
+- `rtsp_camera._pump`（`rtsp_camera.py:527-543`）的 `max_fps` 限的是**发布**不是
+  **解码**，`cap.read()` 一直在跑；
+- `apriltag_node` 对每一帧都做检测，且 `detector.decimate: 1.0`
+  （`docking.launch.py`）刻意关掉了它自己的降采样。
+
+也就是说 IDLE 态的开销结构上约等于停泊态的开销，而停泊是个偶发的、人触发的动作。
+
+**实测**（Jetson，`/proc/<pid>/stat` 的 utime+stime 差分，窗口 45 秒，一个核 =
+100%。不要用 `ps pcpu` 复核：那给的是进程**整个生命周期**的平均值，会被启动开销
+冲淡，量不出这个差别）：
+
+| 状态 | rtsp_camera | apriltag | docking_node | supervisor | web | 合计 |
+| --- | --- | --- | --- | --- | --- | --- |
+| (a) 常驻满栈 **IDLE**（改动前） | 61.8% | 18.6% | 91.1% | — | — | **171.4%** |
+| (b) supervisor + Web（改动后的常驻） | — | — | — | 2.5% | 0.8% | **3.3%** |
+| (c) 只起相机链路 + 网页正在看视频 | 66.8% | — | — | 0.5% | 12.6% | **79.8%** |
+
+**空闲时省掉约 1.68 个核**（171.4% → 3.3%）。(a) 那一列是在 IDLE 上量的 ——
+机器人停着不动、没人停泊，`docking_node` 那 91% 也照跑不误，这正是上面说的
+"空转不比工作省"。(c) 里 Web 的 12.6% 是 MJPEG 转推的代价，只在真有人看时才付；
+即便这样也只有改动前空转的一半不到。
+
+> supervisor 自己必须便宜，否则这件事就白做了。第一版把 `camera_info` / odom /
+> `detections` 做成常驻订阅，其中 `/odin1/odometry_highfreq` 实测 **~385Hz** ——
+> 光是 rclpy 反序列化 `Odometry`（两个 36 元协方差数组）就吃掉 **48% 一个核**，
+> 等于把省下来的又烧回去三分之一。对照实验（空回调 + 同样的 executor 组合）只有
+> 0.4%，所以贵的不是 executor 而是那几条订阅本身。现在这三项和 TF 监听一样，
+> 只在就绪门开着的那几秒里存在（`stack_supervisor.py` 的 `_make_probe`）——
+> 常驻的只剩 `/docking_node/state`（20Hz 的 String）。
+
+**怎么触发**（两条入口等价，HTTP 那条就是网页按钮）：
+
+```bash
+ros2 service call /docking_supervisor/dock       std_srvs/srv/Trigger
+ros2 service call /docking_supervisor/undock     std_srvs/srv/Trigger
+ros2 service call /docking_supervisor/cancel     std_srvs/srv/Trigger
+ros2 service call /docking_supervisor/stack_down std_srvs/srv/Trigger   # 立即收栈
+ros2 service call /docking_supervisor/ready_check std_srvs/srv/Trigger  # 只读诊断
+ros2 topic echo   /docking_supervisor/status                            # JSON, 2Hz
+```
+
+**两种模式**。有停泊占用 → 满栈；只有视频占用（网页开着视频）→ 只起相机链路，
+不起 apriltag / docking_node。占用清空 → 收栈。
+`camera → 满栈`要收了重起（跑起来的 launch 加不了节点），视频会中断 5~8 秒；
+反方向（停泊结束、还有人在看）同样重起一次相机链路。
+
+**六信号就绪门**。这一项是必须的，不是保险：`docking_node.py:754-766` 查相机外参
+用的是**零超时、不重试**的 lookup，失败直接 `MOTION_FAILED`，而 `_on_start_docking`
+（`:2411-2421`）除了 `'already active'` 没有任何就绪检查。过去这条竞态被掩盖了
+——栈开机起一次，然后在 IDLE 上坐几个小时才有人停泊；**改成按需后 start_docking
+会紧贴在进程刚起来的几秒内发生，正好踩进竞态**。所以 supervisor 在转发之前自己等：
+`start_docking` 服务可见（前置条件，不算判据）、`state` 有流量且不在活动态、
+`camera_info` 收到、odom 收到、`/detections` 有流量、`base_link → camera 光学系`
+的 TF 可解；全部到齐再多等 1 秒（留给 latched `/tf_static` 送达）。
+超时 20 秒则收栈并报明卡在第几项，不留半死的栈。
+
+> 想知道门当前卡在哪，调 `~/ready_check` —— 它是**只读**的，不起栈、不转发、
+> 不让机器人动。这个接口存在的主要理由就是让这道门本身可以被验证，否则每验一次
+> 就得让机器人真跑一趟。
+
+**延迟收栈**。到终态（`docked`/`undocked`/`tag_lost`/`timeout`/`motion_failed`/
+`cancelled`）后等 30 秒才释放占用，让「泊入完接着泊出」「失败后立刻重试」不用再付
+一次冷启动。**活动态期间绝不收栈**（机器人正在动）；`retrying` 算活动态不是终态。
+
+**视频占用是租约不是开关**：网页有观看者时每 5 秒续一次，supervisor 侧 15 秒过期。
+这样 Web 被 `kill -9`、掉电、或浏览器连接半开时，相机链路不会被永久钉住——而
+"不常驻"正是这整件事的目的。
+
+**接管既有栈**。supervisor 每 5 秒扫一次进程表，发现已有 tagdocking 的 launch 树
+就接管它而不是再起一棵。所以手工 `systemctl start whale-nav-tagdocking`（排查用的
+常驻满栈）仍然安全，supervisor 重启后也能重新认领正在停泊的栈。
+
+> **还能再省的一处（本次没做，记在这儿备查）**：栈真正跑起来时最贵的仍是解码 ——
+> 上表里 `rtsp_camera` 占 61.8%（IDLE）/ 66.8%（推流）。`camera_backend` 默认
+> `ffmpeg` 走软件色彩转换，`rtsp_camera.py:421-424` 记着那条路在 Jetson 上只
+> 消化得了 ~5-8fps；`gstreamer` 后端（Jetson 硬解）是现成的，换过去有可能再削一截。
+> 这与按需启停互不冲突、也互不依赖，属于另一件事，要换先按上面同样的方法量一遍。
+
+#### 开机自启
+
+```bash
+sudo install -m 0644 systemd/whale-nav-tagdocking-supervisor.service /etc/systemd/system/
+sudo install -m 0644 systemd/whale-nav-tagdocking-web.service        /etc/systemd/system/
+sudo install -m 0644 systemd/whale-nav-tagdocking.service            /etc/systemd/system/
+sudo systemctl daemon-reload
+# 常驻的是 supervisor + web。满栈单元只装不 enable。
+sudo systemctl enable --now whale-nav-tagdocking-supervisor.service \
+                            whale-nav-tagdocking-web.service
+```
+
+> `whale-nav-tagdocking.service`（常驻满栈）**默认不 enable**，只在排查 / 标定时
+> 手工 `systemctl start whale-nav-tagdocking` 起一个不会被自动收掉的满栈。
+> 它的 `Restart=no` 是有意的：supervisor 收栈时 `ros2 launch` 的退出码不保证为 0，
+> `on-failure` 会把计划内的收栈当成崩溃再拉起来，变成无限起收循环。
+
+三个单元刻意互不依赖：重启 Web 不打断正在进行的停泊，重启停泊栈也不踢掉看视频的人。
+supervisor 用 `KillMode=process`（不是别处的 `control-group`）——重启它时不能连坐
+杀掉可能正停泊到一半的栈，起来后靠接管逻辑重新认领。
+
+> 开机自启是安全的：supervisor 起来后什么都不起，栈也停在 `IDLE`，只有显式调用
+> `/docking_supervisor/dock`（或点网页上的「停泊」）才会让机器人移动。
+
+### 2.3.1 手动启动 (通用/其它机器)
 
 ```bash
 # 终端 1: 启动停靠系统
@@ -324,7 +517,7 @@ ros2 launch tagdocking docking.launch.py \
 | 参数 | 说明 |
 |------|------|
 | `rtsp_url` | RTSP 地址。非空即切换到机器狗模式（替代 camera_info_bridge） |
-| `camera_info_file` | 内参 YAML（`calibrate_rtsp` 生成；不传时自动用包内 `config/rtsp_camera_info.yaml`，包内也没有才报错） |
+| `camera_info_file` | 内参 YAML（`calibrate_rtsp` 生成；默认即包内 `config/rtsp_camera_info.yaml` 的绝对路径，文件不存在时启动告警） |
 | `odom_topic` | 狗的里程计话题（默认 `/odom_combined`，按实际改） |
 | `camera_mount_x/y/z` | 相机在 base_link 下的安装位置（米） |
 | `camera_mount_yaw/pitch/roll_deg` | 相机安装姿态（0=正前水平；低头用正 pitch，抬头用负 pitch） |
@@ -376,10 +569,15 @@ ros2 launch tagdocking docking.launch.py \
 | 参数 | 说明 |
 |------|------|
 | `use_odin` | true 时用 `/odin1/image/undistorted` + 内参合成替代普通相机话题 |
-| `camera_info_file` | 缺省自动用包内 `config/odin_camera_info.yaml` |
+| `camera_info_file` | 未显式覆盖时自动换成包内 `config/odin_camera_info.yaml`（它的默认值是 rtsp 那份，`use_odin` 会识别并替换） |
 | `camera_mount_x/y/z`、`camera_mount_yaw/pitch/roll_deg` | 与 RTSP 模式同一套安装位姿参数 |
 | `camera_downscale` | 默认 0=自动 ×2（800x648）；传 1 用全分辨率 1600x1296（仅追更远小 tag 时用，见下方延迟说明） |
 | `image_topic` | 缺省即 `/odin1/image/undistorted`，可显式覆盖 |
+
+> `use_odin:=true` 单独传即可，**不需要也无法**再清空 `rtsp_url`：它现在的默认值非空，
+> 而 `ros2 launch` 的 CLI 传不进空串（`rtsp_url:=` 报 malformed）。launch 会识别
+> 「rtsp_url 仍是默认值」并自动让位给 odin；只有显式传了**另一个** RTSP 地址才按
+> 「两种相机源互斥」报错。
 
 **延迟实测（2026-09-08, Jetson）**：odin 源 ~55ms、桥 ~45ms 都很快，瓶颈在
 apriltag —— 全分辨率 1600x1296 下它只消化 ~6fps，odin 22fps 输入把 RELIABLE

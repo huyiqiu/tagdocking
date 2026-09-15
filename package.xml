@@ -34,6 +34,13 @@
   <exec_depend>python3-opencv</exec_depend>
   <exec_depend>python3-yaml</exec_depend>
   <exec_depend>python3-numpy</exec_depend>
+  <!-- docking_web (Web 控制台)。注意本机这两个是 pip 装在 ~/.local 下的
+       (fastapi 0.139 / uvicorn 0.51), 比 apt 的 0.63 / 0.15 新得多, 且只对
+       安装它的用户可见 —— whale-nav-tagdocking-web.service 因此必须以该用户
+       运行, 换成 root 或别的用户会 ImportError。 -->
+  <exec_depend>python3-fastapi</exec_depend>
+  <exec_depend>python3-uvicorn</exec_depend>
+  <exec_depend>cv_bridge</exec_depend>
 
   <test_depend>ament_cmake_pytest</test_depend>
   <test_depend>ament_copyright</test_depend>

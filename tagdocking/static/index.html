@@ -1,0 +1,411 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tagdocking 控制台</title>
+<style>
+  :root {
+    --bg: #11151c;
+    --panel: #1a1f28;
+    --line: #2b323d;
+    --fg: #e6eaf0;
+    --muted: #8b95a5;
+    --accent: #4a9eff;
+    --ok: #2ecc71;
+    --warn: #f5a623;
+    --err: #e74c3c;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 14px/1.5 system-ui, -apple-system, "PingFang SC", "Noto Sans CJK SC", sans-serif;
+  }
+  header {
+    padding: 12px 16px; border-bottom: 1px solid var(--line);
+    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--err); }
+  .dot.on { background: var(--ok); }
+  #conn { color: var(--muted); font-size: 12px; }
+
+  main {
+    display: grid; grid-template-columns: minmax(0,2fr) minmax(280px,1fr);
+    gap: 16px; padding: 16px; align-items: start;
+  }
+  @media (max-width: 860px) { main { grid-template-columns: 1fr; } }
+
+  .panel {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 8px; padding: 14px;
+  }
+  .panel h2 {
+    font-size: 12px; text-transform: uppercase; letter-spacing: .08em;
+    color: var(--muted); margin: 0 0 10px; font-weight: 600;
+  }
+
+  /* 状态横幅 */
+  #banner {
+    border-radius: 8px; padding: 18px; text-align: center;
+    border: 1px solid var(--line); background: #222834; margin-bottom: 16px;
+  }
+  #banner .name { font-size: 30px; font-weight: 700; letter-spacing: .02em; }
+  #banner .desc { color: var(--muted); margin-top: 4px; font-size: 13px; }
+  #banner.active { background: #1c3350; border-color: var(--accent); }
+  #banner.ok     { background: #143d2a; border-color: var(--ok); }
+  #banner.err    { background: #45211d; border-color: var(--err); }
+  #banner.off    { background: #26292e; border-color: var(--line); }
+  #banner.off .name { color: var(--muted); }
+
+  /* 栈状态行 —— 与横幅分开。横幅说的是"停泊到哪一步了", 这行说的是"那三个
+     进程在不在"。两者可以任意组合 (最常见的组合就是 supervisor 在线 + 栈没起,
+     那是完全正常的省电常态), 所以不能挤进同一个控件里。 */
+  .stack-row {
+    display: flex; align-items: center; gap: 8px;
+    margin: 8px 0 16px; padding: 8px 12px;
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 8px; font-size: 13px;
+  }
+  .stack-row small { color: var(--muted); margin-left: auto; text-align: right; }
+  .stack-led {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--muted); flex: none;
+  }
+  .stack-led.up      { background: var(--ok); }
+  .stack-led.pending { background: var(--accent); animation: pulse 1s infinite; }
+  @keyframes pulse { 50% { opacity: .3; } }
+
+  /* 视频 */
+  .video-wrap {
+    background: #000; border-radius: 6px; overflow: hidden;
+    display: flex; align-items: center; justify-content: center;
+    min-height: 220px; position: relative;
+  }
+  .video-wrap img { width: 100%; display: block; }
+  .video-wrap .placeholder { color: var(--muted); padding: 40px; font-size: 13px; }
+
+  .video-toggle { margin-top: 12px; display: flex; align-items: flex-start; gap: 12px; }
+  .toggle-text { display: grid; gap: 3px; }
+  .toggle-text span { font-size: 13px; }
+  .toggle-text small { color: var(--muted); font-size: 11px; line-height: 1.5; }
+  .switch { flex: none; cursor: pointer; padding-top: 1px; }
+  .switch input { position: absolute; opacity: 0; width: 0; height: 0; }
+  .switch .track {
+    display: block; width: 44px; height: 24px; border-radius: 12px;
+    background: #333a45; transition: background .15s;
+  }
+  .switch .knob {
+    display: block; width: 18px; height: 18px; margin: 3px; border-radius: 50%;
+    background: #8b94a3; transition: transform .15s, background .15s;
+  }
+  .switch input:checked + .track { background: var(--accent); }
+  .switch input:checked + .track .knob { transform: translateX(20px); background: #fff; }
+  .switch input:focus-visible + .track { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  /* 指标 */
+  .metrics { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+  .metric { background: #222834; border-radius: 6px; padding: 10px; text-align: center; }
+  .metric .k { color: var(--muted); font-size: 11px; }
+  .metric .v { font-size: 18px; font-weight: 600; font-variant-numeric: tabular-nums; margin-top: 2px; }
+
+  /* 按钮 */
+  .actions { display: grid; gap: 10px; }
+  button {
+    font: inherit; font-weight: 600; color: #fff; border: 0;
+    border-radius: 6px; padding: 13px; cursor: pointer;
+  }
+  button:disabled { opacity: .4; cursor: not-allowed; }
+  .btn-dock   { background: #2f7d32; }
+  .btn-undock { background: #8a6d1f; }
+  .btn-cancel { background: #a33228; }
+  button:not(:disabled):hover { filter: brightness(1.15); }
+
+  #log {
+    margin-top: 10px; font-size: 12px; color: var(--muted);
+    max-height: 150px; overflow-y: auto; font-family: ui-monospace, monospace;
+  }
+  #log div { padding: 2px 0; border-bottom: 1px solid #232a35; }
+  .offline-note {
+    margin-top: 10px; padding: 8px 10px; border-radius: 6px;
+    background: #45211d; color: #ffb3ab; font-size: 12px; display: none;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <span class="dot" id="dot"></span>
+  <h1>tagdocking 控制台</h1>
+  <span id="conn">连接中…</span>
+</header>
+
+<main>
+  <div>
+    <div id="banner" class="off">
+      <div class="name" id="state-name">—</div>
+      <div class="desc" id="state-desc">等待 docking_node</div>
+    </div>
+
+    <div id="stack-row" class="stack-row">
+      <span class="stack-led" id="stack-led"></span>
+      <span id="stack-text">栈状态未知</span>
+      <small id="stack-detail"></small>
+    </div>
+
+    <div class="panel">
+      <h2>检测视图 <span id="topic-name" style="text-transform:none;letter-spacing:0"></span></h2>
+      <div class="video-wrap">
+        <img id="video" alt="" hidden>
+        <div class="placeholder" id="video-ph">视频已关闭</div>
+      </div>
+      <div class="video-toggle">
+        <label class="switch">
+          <input type="checkbox" id="video-on">
+          <span class="track"><span class="knob"></span></span>
+        </label>
+        <div class="toggle-text">
+          <span id="toggle-label">视频已关闭</span>
+          <small>开启后按 tagdocking 自己看到的原分辨率 / 原帧率推流。
+                 关闭即退订，不占 CPU。</small>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div>
+    <div class="panel" style="margin-bottom:16px">
+      <h2>对准误差</h2>
+      <div class="metrics">
+        <div class="metric"><div class="k">横向 x</div><div class="v" id="e-x">—</div></div>
+        <div class="metric"><div class="k">距离 y</div><div class="v" id="e-y">—</div></div>
+        <div class="metric"><div class="k">航向 yaw</div><div class="v" id="e-yaw">—</div></div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>操作</h2>
+      <div class="actions">
+        <button class="btn-dock"   id="btn-dock">停　泊</button>
+        <button class="btn-undock" id="btn-undock">泊　出</button>
+        <button class="btn-cancel" id="btn-cancel">取消 / 停止</button>
+      </div>
+      <div class="offline-note" id="offline-note">
+        docking_node 未运行，操作不可用。
+      </div>
+      <div id="log"></div>
+    </div>
+  </div>
+</main>
+
+<script>
+// 状态分族 —— 与 state_machine.py 的 _ACTIVE_STATES / _SUCCESS_STATES /
+// _ERROR_STATES 保持一致。改那边记得同步这里。
+const ACTIVE = new Set(['search_tag','align','approach','final_servo','retrying','undocking']);
+const OK     = new Set(['docked','undocked']);
+const ERR    = new Set(['tag_lost','timeout','motion_failed','cancelled']);
+
+const DESC = {
+  idle: '空闲，等待指令',
+  search_tag: '搜索二维码',
+  align: '对准中',
+  approach: '接近中',
+  final_servo: '末端精调',
+  docked: '停泊完成',
+  retrying: '失败重试中',
+  undocking: '泊出中',
+  undocked: '泊出完成',
+  tag_lost: '二维码丢失',
+  timeout: '超时',
+  motion_failed: '运动失败',
+  cancelled: '已取消',
+};
+
+const $ = (id) => document.getElementById(id);
+let online = false;
+// 栈起没起 —— 停泊按钮的确认文案要用它 (栈没起就得先等冷启动)。
+let stackUp = false;
+// 当前是满栈还是只有相机 —— camera → full 要收了重起, 视频会断, 确认框要说。
+let currentMode = null;
+
+// 栈状态文案。这一层是"那三个进程在不在", 与横幅的"停泊到哪一步"是两回事。
+const STACK_TEXT = {
+  down:     '栈未运行（按需启动，省 CPU）',
+  starting: '栈启动中…',
+  ready:    '栈就绪',
+  stopping: '收栈中…',
+};
+
+// ── 视频 ────────────────────────────────────────────────────────
+// 开关式。默认关: 停泊时没人盯着画面也就不该有人替他订阅图像。
+const toggle = $('video-on');
+let retryTimer = null;
+
+function startVideo() {
+  clearTimeout(retryTimer);
+  const img = $('video');
+  img.hidden = false;
+  $('video-ph').hidden = true;
+  $('toggle-label').textContent = '视频已开启（原分辨率 / 原帧率）';
+  // 带时间戳: 否则浏览器可能复用上一条已断开的 multipart 连接的缓存。
+  img.src = `/api/video?_=${Date.now()}`;
+}
+
+function stopVideo() {
+  clearTimeout(retryTimer);
+  const img = $('video');
+  // 先摘 src 再隐藏: 摘掉 src 浏览器才会真正断开 multipart 连接, 服务端的
+  // finally 才跑得到 release_viewer —— 只 hidden 的话连接还挂着, 图像订阅
+  // 不会退, "关掉省 CPU" 就成了空话。
+  img.removeAttribute('src');
+  img.hidden = true;
+  $('video-ph').hidden = false;
+  $('video-ph').textContent = '视频已关闭';
+  $('toggle-label').textContent = '视频已关闭';
+}
+
+toggle.addEventListener('change', () => toggle.checked ? startVideo() : stopVideo());
+
+$('video').addEventListener('error', () => {
+  if (!toggle.checked) return;          // 关的时候摘 src 也会触发 error, 忽略
+  $('video').hidden = true;
+  $('video-ph').hidden = false;
+  $('video-ph').textContent = '视频流中断，正在重试…';
+  clearTimeout(retryTimer);
+  retryTimer = setTimeout(() => { if (toggle.checked) startVideo(); }, 2000);
+});
+
+stopVideo();
+
+// ── 状态 ────────────────────────────────────────────────────────
+function render(st) {
+  online = st.online;
+  $('dot').classList.toggle('on', online);
+  $('conn').textContent = online
+    ? `在线 · ${st.fps.toFixed(1)}fps · ${st.viewers} 观看`
+    : '离线';
+  $('topic-name').textContent = st.image_topic || '';
+
+  // ── 栈状态行 ──
+  // online 判的是 supervisor, stack 判的是那三个进程。"supervisor 在线 +
+  // 栈未运行"是正常常态, 不是故障 —— 文案必须让人一眼看出这一点, 否则每次
+  // 打开页面都像看到一个坏了的系统。
+  stackUp = st.stack === 'ready';
+  currentMode = st.stack_mode || null;
+  const led = $('stack-led');
+  led.className = 'stack-led';
+  if (!online) {
+    $('stack-text').textContent = 'supervisor 未运行 —— 无法启停停泊栈';
+  } else if (st.stack == null) {
+    $('stack-text').textContent = '等待 supervisor 状态…';
+  } else {
+    let t = STACK_TEXT[st.stack] || st.stack;
+    if (st.stack === 'ready') {
+      t += st.stack_mode === 'camera' ? '（仅相机链路）' : '（完整栈）';
+      led.classList.add('up');
+    } else if (st.stack === 'starting' || st.stack === 'stopping') {
+      led.classList.add('pending');
+    }
+    $('stack-text').textContent = t;
+  }
+  let sd = online ? (st.stack_detail || '') : '';
+  if (st.release_in != null && st.release_in > 0) {
+    sd = `${Math.round(st.release_in)}s 后收栈`;
+  }
+  $('stack-detail').textContent = sd;
+
+  const banner = $('banner');
+  const name = st.state;
+  banner.className = '';
+  if (!online || !name) {
+    banner.classList.add('off');
+    // "docking_node 未运行"在按需启停下是常态而不是错误, 所以这里不再把它
+    // 说成离线 —— 离线现在指的是 supervisor 不在。
+    $('state-name').textContent = online ? '—' : '控制台离线';
+    $('state-desc').textContent = online
+      ? '停泊栈未运行，点"停泊"会先自动启动'
+      : 'docking_supervisor 未运行';
+  } else {
+    if (OK.has(name))          banner.classList.add('ok');
+    else if (ERR.has(name))    banner.classList.add('err');
+    else if (ACTIVE.has(name)) banner.classList.add('active');
+    $('state-name').textContent = name.toUpperCase();
+    let d = DESC[name] || '';
+    // state 每个 tick 都发 (20Hz), 所以"很久没更新"就意味着栈已经不在了 ——
+    // 这时候显示的是最后一次看到的状态, 必须标出年龄, 别让它冒充实时值。
+    if (st.state_age != null && st.state_age > 5) {
+      d += `（${Math.round(st.state_age)}s 前）`;
+    }
+    $('state-desc').textContent = d;
+  }
+
+  const e = st.error || {};
+  const fmt = (v, u, k) => (st.error_age == null) ? '—' : (v * k).toFixed(1) + u;
+  $('e-x').textContent   = fmt(e.x, 'cm', 100);
+  $('e-y').textContent   = fmt(e.y, 'cm', 100);
+  $('e-yaw').textContent = fmt(e.yaw, '°', 180 / Math.PI);
+
+  // 按钮只看 supervisor 在不在 —— 栈没起正是最该能点"停泊"的时候 (点它就是
+  // 让 supervisor 去起栈)。照旧判 docking_node 的话按钮会永久禁用。
+  $('btn-dock').disabled   = !online;
+  $('btn-undock').disabled = !online;
+  $('btn-cancel').disabled = !online;
+  $('offline-note').style.display = online ? 'none' : 'block';
+}
+
+function log(msg) {
+  const d = document.createElement('div');
+  d.textContent = `${new Date().toLocaleTimeString()}  ${msg}`;
+  $('log').prepend(d);
+  while ($('log').children.length > 40) $('log').lastChild.remove();
+}
+
+// ── WebSocket, 断线自动重连 ─────────────────────────────────────
+function connect() {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  const ws = new WebSocket(`${proto}://${location.host}/ws`);
+  ws.onmessage = (ev) => render(JSON.parse(ev.data));
+  ws.onclose = () => {
+    render({ online: false, fps: 0, viewers: 0 });
+    setTimeout(connect, 1500);
+  };
+  ws.onerror = () => ws.close();
+}
+connect();
+
+// ── 操作 ────────────────────────────────────────────────────────
+async function send(path, label) {
+  try {
+    const r = await fetch(path, { method: 'POST' });
+    const j = await r.json();
+    log(`${label}: ${j.success ? '已接受' : '被拒绝'} — ${j.message}`);
+  } catch (err) {
+    log(`${label}: 请求失败 — ${err}`);
+  }
+}
+
+// 停泊/泊出会让机器人动, 二次确认。取消是止损动作, 故意不确认 —— 要按下就生效。
+// 栈没起时确认框要多说一句: 请求会先花 5~8 秒起栈, 这期间按钮像是"没反应",
+// 不预告的话人会以为点失败了而连点几次。
+function moveConfirm(what, extra) {
+  let msg = `开始${what}？机器人将${extra}。`;
+  if (!stackUp) {
+    msg += '\n\n停泊栈当前未运行，会先自动启动（约 5~8 秒）再开始。'
+         + '\n这段时间按钮不会立刻有反应，请勿重复点击。';
+  } else if (currentMode === 'camera') {
+    msg += '\n\n当前只运行了相机链路，需要切换到完整栈 —— 视频会短暂中断'
+         + '（约 5~8 秒）后自行恢复。';
+  }
+  return confirm(msg);
+}
+
+$('btn-dock').onclick = () => {
+  if (moveConfirm('停泊', '开始移动')) send('/api/dock', '停泊');
+};
+$('btn-undock').onclick = () => {
+  if (moveConfirm('泊出', '后退并转向')) send('/api/undock', '泊出');
+};
+$('btn-cancel').onclick = () => send('/api/cancel', '取消');
+</script>
+</body>
+</html>
