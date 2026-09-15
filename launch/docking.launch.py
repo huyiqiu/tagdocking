@@ -76,7 +76,7 @@ DUAL_ARG_DEFAULTS = {
     'dock_distance': '0.47',  # yaml 为 0.50; 实测 0.47 到位更稳
 }
 
-DEFAULT_RTSP_URL = 'rtsp://127.0.0.1:8555/front'
+DEFAULT_RTSP_URL = 'rtsp://127.0.0.1:8589/test'
 
 # rtsp 模式的默认内参: 写成包内绝对路径而不是留空靠回退逻辑猜。
 #   - `--show-args` 里直接看得到用的是哪一份, 不用去读回退代码才敢确定;
