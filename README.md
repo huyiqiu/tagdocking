@@ -212,6 +212,9 @@ source install/setup.bash
 
 ### 2.3 一键启动 (本机默认部署)
 
+> 本包全部终端命令（启动/参数三层覆盖/标定/台架测试/调试/停止）的速查表：
+> [`docs/tagdocking_commands.md`](docs/tagdocking_commands.md)（本包内）。
+
 本机实测成功率最高的那一组参数**已经固化为 `docking.launch.py` 的默认值**，
 所以不再需要手敲一长串 `xxx:=yyy`：
 
