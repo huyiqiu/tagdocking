@@ -938,6 +938,34 @@ class DualTagDocking:
         #   窗口 = 单步有用但互相抵消 → 振荡, 查是哪两个通道在互相破坏。
         # 旧串两条共用一句话, 现场只能看到"no progress / oscillation", 而这
         # 两个词恰好互为反义 —— 等于什么都没说。
+        # 豁免: 看门狗不杀已对准的位姿。2026-09-17 现场, 窗口判据以净改善
+        # -0.44 判死时, 位姿其实已过 aligned() 全部门槛 (bearing
+        # -2.26/-2.58°, theta +2.00°, e +8mm, 全在 3°/20mm 内) —— 09-11 现场
+        # 的同款结论"此时直行即可"。两条判据管的都是"还需要纠偏却纠不动";
+        # 位姿一旦已对准, 剩下的 J 全是量测/执行噪声, 判死只会把可入库的
+        # 局面做死。连败支路排在窗口之前, 故豁免放在两条支路共用之前。
+        # 放行后计数复位重新武装 —— 对准一旦再破, 看门狗照常累计; 兜底仍有
+        # max_actions / observe 超时 / 整体超时 / 后退预算, 不会无限循环。
+        if ((self.feedback_bad >= limit
+                or (self.feedback_count >= limit and window < minimum))
+                and self.aligned(self.wall, self.pile)):
+            which = (f'连败判据: 连续 {self.feedback_bad} 步修正每步改善都 < {minimum:.5f}'
+                     if self.feedback_bad >= limit else
+                     f'窗口判据: {self.feedback_count} 步修正净改善 '
+                     f'{self.feedback_anchor:.5f}->{after:.5f} = {window:+.5f} '
+                     f'< {minimum:.5f}')
+            self._node.get_logger().warn(
+                f'视觉修正看门狗放行 — {which} 本应判死, 但当前位姿已过对准全部门槛 '
+                f'(bearing {math.degrees(metrics[0][0]):+.2f}/'
+                f'{math.degrees(metrics[0][1]):+.2f}deg, '
+                f'theta {math.degrees(metrics[1]):+.2f}deg, '
+                f'e {metrics[2]*1e3:+.0f}mm, 门槛 {math.degrees(self.tol):.1f}deg/'
+                f"{self.p('lateral_tolerance_m')*1e3:.0f}mm) → 复位窗口放行, "
+                '交给对准保持/直行')
+            self.feedback_anchor, self.feedback_count = after, 0
+            self.feedback_trail = [after]
+            self.feedback_bad = 0
+            return True
         if self.feedback_bad >= limit:
             return self._fail_feedback(
                 f'连败判据: 连续 {self.feedback_bad} 步修正, 每步改善都 < {minimum:.5f}',

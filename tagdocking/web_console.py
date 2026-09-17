@@ -43,7 +43,7 @@ import rclpy
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy
+from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 
 from geometry_msgs.msg import Vector3
 from sensor_msgs.msg import Image
@@ -67,6 +67,11 @@ STALE_SEC = 5.0
 
 STATE_TOPIC = '/docking_node/state'
 ERROR_TOPIC = '/docking_node/error'
+# 每轮停泊结束发一次的结果 JSON (锁存, 含失败码与原因)。直接订 docking_node,
+# 不绕 supervisor —— 单次停泊的遥测 (state/error) 本来就是节点直连,
+# 只有进程/栈的事实才走 supervisor。收栈后节点的锁存会没, 但本进程常驻,
+# 上一条结果留在内存里, 页面照样显示得出。
+OUTCOME_TOPIC = '/docking_node/outcome'
 IMAGE_TOPIC = '/camera_sync/image_raw'
 SUP_STATUS_TOPIC = '/docking_supervisor/status'
 
@@ -123,6 +128,9 @@ class DockingWebNode(Node):
         self._state_mono: float = 0.0
         self._error = (0.0, 0.0, 0.0)
         self._error_mono: float = 0.0
+        # 最后一次停泊结果 (dict), 解不开就保持 None。
+        self._outcome: Optional[dict] = None
+        self._outcome_mono: float = 0.0
 
         # ── 图像: 只存最新一帧, 慢的观看者自然丢帧而不是堆积内存 ──
         self._frame_lock = threading.Lock()
@@ -148,6 +156,14 @@ class DockingWebNode(Node):
             Vector3, ERROR_TOPIC, self._on_error, 10, callback_group=self._cbg)
         self.create_subscription(
             String, SUP_STATUS_TOPIC, self._on_sup_status, 10,
+            callback_group=self._cbg)
+        # QoS 要与发布端的锁存对上 (transient_local/depth 1), 否则本进程
+        # 先起来时收不到那次锁存值。
+        self.create_subscription(
+            String, OUTCOME_TOPIC, self._on_outcome,
+            QoSProfile(depth=1,
+                       reliability=ReliabilityPolicy.RELIABLE,
+                       durability=DurabilityPolicy.TRANSIENT_LOCAL),
             callback_group=self._cbg)
 
         self._cli = {
@@ -184,6 +200,16 @@ class DockingWebNode(Node):
     def _on_error(self, msg: Vector3):
         self._error = (msg.x, msg.y, msg.z)
         self._error_mono = time.monotonic()
+
+    def _on_outcome(self, msg: String):
+        try:
+            parsed = json.loads(msg.data)
+        except (ValueError, TypeError):
+            return
+        if not isinstance(parsed, dict):
+            return
+        self._outcome = parsed
+        self._outcome_mono = time.monotonic()
 
     def _on_sup_status(self, msg: String):
         try:
@@ -332,6 +358,11 @@ class DockingWebNode(Node):
             'stack_detail': (sup.get('detail') if (sup and sup_fresh) else None),
             'stack_holds': (sup.get('holds') if (sup and sup_fresh) else None),
             'release_in': (sup.get('release_in') if (sup and sup_fresh) else None),
+            # 这一轮的结果 (成功/失败 + 码 + 原因), 整块透传给前端。**不判**
+            # 新鲜度: 它是锁存的边沿值, 年龄一直涨, 用 STALE_SEC 判会把
+            # 刚失败 6 秒的结果当成过期的丢掉。前端按 state 是否对得上来决定
+            # 显不显示。
+            'outcome': self._outcome,
         }
 
     def latest_frame(self):

@@ -24,6 +24,11 @@ posture_mode 同一套约定。
 含重试, 耗尽则 abort_motion 落 MOTION_FAILED (狗已泄力无法泊出, 必须
 显式失败而不是干等超时)。
 
+门控判据只信桥 latched 的 motion_enabled, 不看本进程的 _phase —— 栈是
+按需启停的 (supervisor 到终态 30s 后收栈), 泊出那一下往往由一个全新的
+docking_node 发起, 它没参与过泊入, _phase 是 IDLE。桥 (zsibot_l1_control)
+是独立常驻节点, 活得比栈久, transient_local 让新进程一订阅就拿到真相。
+
 降级策略: 桥不存在 (无 l1w_control 的机器狗/纯台架) 时, service_wait_sec
 宽限后序列落 FAILED 并告警一次 —— DOCKED 是成功终态, 收尾失败绝不回写
 错误状态、绝不卡死控制循环。
@@ -32,6 +37,8 @@ posture_mode 同一套约定。
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 from std_msgs.msg import Bool, String
 from std_srvs.srv import Trigger
+
+from .state_machine import CODE_MOTION_GATED
 
 
 class ChargeMode:
@@ -184,16 +191,24 @@ class ChargeMode:
             if self._step_tries <= self._retries:
                 self._send_stand(now_ns)
                 return False
-            self._sm.abort_motion('stand_up 超时, 无法从锁定/阻尼恢复运动模式')
+            self._sm.abort_motion(
+                f'stand_up 超时, 无法从锁定/阻尼恢复运动模式 '
+                f'(重发 {self._step_tries} 次 × {self._static_ack_ns * 1e-9:.1f}s, '
+                f'motion_enabled={self._motion_enabled} '
+                f'posture_state={self._posture_state!r})',
+                CODE_MOTION_GATED)
             self._phase = self.FAILED
             return False
         return False
 
     def reset(self) -> None:
-        """新一轮 dock 开始/泊出完成: 回 IDLE, 下次 DOCKED 重新收尾。"""
-        if self._phase == self.DISABLED:
-            return
-        self._phase = self.IDLE
+        """新一轮 dock 开始/泊出完成: 回 IDLE, 下次 DOCKED 重新收尾。
+
+        charge.enable=false 时回 DISABLED 而不是 IDLE —— 泊出恢复
+        (_begin_recover) 会把 _phase 写成 RECOVERING, 把"收尾已停用"这件事
+        冲掉; 若这里再回 IDLE, 下一次 begin() 就会真去跑收尾。以 _enable 为准。
+        """
+        self._phase = self.IDLE if self._enable else self.DISABLED
         self._step_tries = 0
         self._step_future = None
 
@@ -273,21 +288,36 @@ class ChargeMode:
     # ── 内部: 泊出恢复 ─────────────────────────────────────────────
 
     def _gated(self) -> bool:
-        """狗的 cmd_vel 是否可能被桥门控 (锁定/阻尼过)。"""
+        """狗的 cmd_vel 是否被桥门控 (锁定/阻尼过)。
+
+        判据只看 /motion_enabled —— 它就是桥的 cmd_vel 门控本身
+        (posture_mode 模块头同一套约定), 且 transient_local latched,
+        新进程一订阅就拿到当前快照。
+
+        原先末行还要求 _phase in (STATIC, DAMPING, DONE): 那是进程内记忆。
+        supervisor 按需起栈后 docking_node 是全新进程 (_phase=IDLE), 狗却还
+        泊在上一个进程留下的 passive 泄力态 —— 门控看不见, stand_up 不发,
+        盲退白发, 里程计不动, 30s 后落 MOTION_FAILED。桥活得比栈久, 以它为准。
+        (posture_state=='static_stand' 那条也被覆盖: 锁定态同样 motion_enabled=False。)
+        """
         if self._motion_enabled is True:
             return False
         if self._motion_enabled is None:
             # 无状态回传 = 桥多半不存在, 没有 gate 可言
             return False
-        if self._posture_state == 'static_stand':
-            return True
-        return self._phase in (self.STATIC, self.DAMPING, self.DONE)
+        return True
 
     def _begin_recover(self, now_ns: int) -> None:
-        if self._phase in (self.DAMPING, self.DONE):
-            self._node.get_logger().info(
-                f'泊出请求 → 中断充电收尾 ({self.phase_name}), '
-                f'恢复运动模式 (stand_up)')
+        # stand_up 要拿满自己的重试预算: _step_tries 可能残留 static/passive
+        # 那一步的计数 (=1), 不清零会让首次 ack 超时就直接 abort ——
+        # charge.retries 形同 0, 与模块头写的"含重试"不符。
+        self._step_tries = 0
+        # 无条件打印: 按需起栈后 _phase 是 IDLE/DISABLED 也会走恢复,
+        # phase_name 正好自述"这次是从哪个相位被打断的"。原先只在
+        # DAMPING/DONE 打印, 重启路径会静默恢复、留不下证据。
+        self._node.get_logger().info(
+            f'泊出请求 → 中断充电收尾 ({self.phase_name}), '
+            f'恢复运动模式 (stand_up)')
         self._phase = self.RECOVERING
         self._send_stand(now_ns)
 

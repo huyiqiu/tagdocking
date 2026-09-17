@@ -7,6 +7,10 @@ from types import SimpleNamespace as NS
 import pytest
 
 from tagdocking.state_machine import DockingStateMachine, DockingState
+from tagdocking.state_machine import (
+    FAILURE_CODES, CODE_TAG_NOT_FOUND, CODE_VISION_NO_PROGRESS,
+    CODE_MOTION_GATED, CODE_MOTION_STALLED, CODE_TIMEOUT, CODE_CANCELLED,
+    CODE_UNSPECIFIED)
 from tagdocking.utils import TagPose
 from tagdocking.action_executor import HeadingHold
 from tagdocking.geometry_planner import ActionPlan as RealActionPlan
@@ -27,7 +31,13 @@ def method_class(file, name, env):
                 'Odometry': object, 'Trigger': NS(Request=lambda: None),
                 'String': object, 'Bool': object, 'ActionPlan': object,
                 'HeadingHold': HeadingHold,
-                'DockingState': DockingState})
+                'DockingState': DockingState,
+                # 失败码常量: 方法体里的 abort_motion(..., CODE_*) 会在**调用
+                # 时**去 env 里找它们, 不进来就是 NameError。
+                'CODE_TAG_NOT_FOUND': CODE_TAG_NOT_FOUND,
+                'CODE_VISION_NO_PROGRESS': CODE_VISION_NO_PROGRESS,
+                'CODE_MOTION_GATED': CODE_MOTION_GATED,
+                'CODE_MOTION_STALLED': CODE_MOTION_STALLED})
     exec(compile(ast.Module(body=[cls], type_ignores=[]), file, 'exec'), env)
     return env[name]
 
@@ -101,6 +111,7 @@ def test_pending_expiry_does_not_start_or_qualify():
     seq = plan(c, n)
     node = cls.__new__(cls)
     node._dual = c
+    node._dual_prealign_active = False   # _launch_pending_seq 的粗对准豁免读它
     node._pending_seq = seq
     stops = []
     node._adapter = NS(publish_stop=lambda: stops.append(True))
@@ -196,6 +207,16 @@ def intake():
     n._dual_diag_ns = {}
     n._frozen = False
     n._det_msg_count = 0
+    # _reset_maneuver / _launch_pending_seq 会读写的手搭属性 (__init__ 里有,
+    # 这里必须补齐, 否则 reset/cancel 族用例 AttributeError):
+    n._dual_posture = NS(reset=lambda: None)
+    n._dual_watch = None
+    n._dual_prealign_active = False
+    n._dual_prealigned = False
+    n._dual_prealign_steps = 0
+    n._dual_stand_grace_ns = 0
+    n._dual_reject_last = None
+    n._dual_reject_count = {}
     n._sm = NS(state=DockingState.APPROACH)
     n._p = lambda name: {'tag.id': 0, 'tag.frame': 'wall',
         'camera_frame': 'optical', 'base.type': 'omni',
@@ -207,7 +228,9 @@ def intake():
     n.get_logger = lambda: NS(info=lambda text: n.logs.append(text))
     n._adapter = NS(publish_stop=lambda: n.events.append('stop'))
     n._executor = NS(cancel=lambda: n.events.append('cancel'), is_active=False)
-    n._sm.abort_motion = lambda reason: n.events.append(reason)
+    # 桩要收下 code (生产代码每处 abort 都带码了); events 仍只记 reason,
+    # 这一族用例咬的是文案可读性, 码由 FAILURE_PATHS 那一节咬。
+    n._sm.abort_motion = lambda reason, code='': n.events.append(reason)
     n._pose_buffer = PoseBuffer(max_latency_ns=150_000_000)
     n.available = set()
     def lookup(target, frame, when, timeout):
@@ -702,7 +725,7 @@ def launched(plan_step, dual_enabled=True, **overrides):
     node._is_omni = lambda t: True
     node._adapter = NS(publish_stop=lambda: None, publish_jog=lambda v: None,
                        publish_arc=lambda v, w: None)
-    node._sm = NS(abort_motion=lambda m: None)
+    node._sm = NS(abort_motion=lambda m, code='': None)
     node._dual_prealign_active = False
     node._dual_watch = None
     node._executor = NS(
@@ -918,3 +941,272 @@ def test_abort_reason_is_kept_for_the_action_result():
     assert sm.failure_reason == '墙码丢失 — 测试'
     sm.reset()
     assert sm.failure_reason == ''
+
+
+# ── 失败留档: 每条通往错误终态的路都要有 reason + code ───────────────
+# 起因是要把停泊接口交给上层应用。改之前"状态有、原因基本没有":
+# _abort_reason 只在 abort_motion() 里赋值 —— TIMEOUT 全族 / CANCELLED /
+# 运动卡死 / 倒车超时 / fail() 路径共 8 处只留一行日志, 上层拿到的是个
+# 光秃秃的 'motion_failed'。以下用例钉住"每条路都记账"与"码是 6 族之一"。
+
+
+def logging_node():
+    """带日志捕获的假节点 —— test_dual_docking.Node 的 logger 吞掉一切。"""
+    node = clock_node()
+    node.logged = {'info': [], 'warn': [], 'error': []}
+    node.get_logger = lambda: NS(
+        info=lambda m, **kw: node.logged['info'].append(m),
+        warn=lambda m, **kw: node.logged['warn'].append(m),
+        error=lambda m, **kw: node.logged['error'].append(m))
+    return node
+
+
+def _sm_at(state, **attrs):
+    """把状态机摆到 state 上, 时间起点 = 节点时钟 (20s)。
+
+    必须先 start() 再直接写 _state: state_elapsed_ns 把 _state_start_ns==0
+    当"未开始"的哨兵返回 0, 光设 _state 的话所有超时判据永不触发 (这一脚
+    在写这些用例时就真踩过一次)。
+    """
+    sm = DockingStateMachine(logging_node())
+    sm.start()
+    sm._state = state
+    for k, v in attrs.items():
+        setattr(sm, k, v)
+    return sm
+
+
+def _tick(sm, now_s, params, visible=False, pose=None, stalled=False):
+    sm.evaluate(pose, visible, 0, 0, 0, 0, 0, 0, stalled,
+                int(now_s * 1e9), params)
+    return sm
+
+
+def _overall_timeout():
+    return _tick(_sm_at(DockingState.SEARCH_TAG), 200, {'timeout_sec': 120.0})
+
+
+def _motion_stalled():
+    return _tick(_sm_at(DockingState.APPROACH), 21, {}, stalled=True)
+
+
+def _search_timeout():
+    return _tick(_sm_at(DockingState.SEARCH_TAG), 100,
+                 {'timeout_sec': 9e9, 'search': {'timeout_sec': 60.0}})
+
+
+def _approach_timeout():
+    return _tick(_sm_at(DockingState.APPROACH), 100,
+                 {'timeout_sec': 9e9, 'approach_timeout_sec': 60.0},
+                 visible=True, pose=TagPose(2.0, 0, 0, int(20e9), 0))
+
+
+def _retry_reverse_timeout():
+    return _tick(_sm_at(DockingState.RETRYING), 100,
+                 {'timeout_sec': 9e9, 'retry': {'timeout_sec': 15.0}})
+
+
+def _undock_timeout(node_code):
+    sm = DockingStateMachine(logging_node())
+    sm._node._undock_note = '测试: 卡在这一步'
+    sm._node._undock_code = node_code
+    sm.start_undock()
+    return _tick(sm, 100, {'undock': {'timeout_sec': 30.0}})
+
+
+def _dual_wall_loss():
+    sm = _sm_at(DockingState.APPROACH, _tag_lost_count=200)
+    return _tick(sm, 21, {'timeout_sec': 9e9, 'dual_enable': True,
+                          'tag': {'tag_loss_timeout_sec': 2.5}})
+
+
+def _final_servo_timeout(visible):
+    # 位姿超差 (距离 0.9m 远于 dock_target 0.30m ± 容差), 只有可见性不同。
+    # 码可见那一支走 fail() —— 它先退满重试才是终态, 所以重试预算要先用光,
+    # 否则这里停在 RETRYING (那是活动态, 不该有失败留档)。
+    pose = TagPose(0.9, 0.2, 0.3, int(20e9), 0)
+    sm = _sm_at(DockingState.FINAL_SERVO)
+    sm._retry_count = sm._max_retries
+    return _tick(sm, 100,
+                 {'timeout_sec': 9e9, 'final_servo_timeout_sec': 30.0},
+                 visible=visible, pose=pose if visible else None)
+
+
+def _cancelled():
+    sm = _sm_at(DockingState.APPROACH)
+    sm.cancel()
+    return sm
+
+
+def _retries_exhausted():
+    sm = _sm_at(DockingState.FINAL_SERVO)
+    for _ in range(sm._max_retries + 1):
+        sm._state = DockingState.FINAL_SERVO   # fail() 后会去 RETRYING
+        sm.fail('测试: 直行入口对准过差')
+    return sm
+
+
+# 每一行 = 一条通往错误终态的路。加新的 abort 点就往这里加一行 ——
+# 漏加也不会静默: _transition_to 的守卫会把它报成 unspecified, 而
+# test_unaccounted_failure_path_warns_and_marks_itself 咬着那个码。
+FAILURE_PATHS = [
+    ('整体超时', _overall_timeout, CODE_TIMEOUT),
+    ('运动卡死', _motion_stalled, CODE_MOTION_STALLED),
+    ('搜索超时', _search_timeout, CODE_TAG_NOT_FOUND),
+    ('接近超时', _approach_timeout, CODE_VISION_NO_PROGRESS),
+    ('倒车超时', _retry_reverse_timeout, CODE_MOTION_STALLED),
+    ('泊出超时-门控', lambda: _undock_timeout(CODE_MOTION_GATED),
+     CODE_MOTION_GATED),
+    ('泊出超时-节点没给码', lambda: _undock_timeout(''), CODE_MOTION_STALLED),
+    ('双码外层丢码', _dual_wall_loss, CODE_TAG_NOT_FOUND),
+    ('末端精调超时-码可见', lambda: _final_servo_timeout(True),
+     CODE_VISION_NO_PROGRESS),
+    ('末端精调超时-码不可见', lambda: _final_servo_timeout(False),
+     CODE_TAG_NOT_FOUND),
+    ('用户取消', _cancelled, CODE_CANCELLED),
+    ('重试耗尽', _retries_exhausted, CODE_VISION_NO_PROGRESS),
+]
+
+
+@pytest.mark.parametrize('name,drive,expect', FAILURE_PATHS,
+                         ids=[p[0] for p in FAILURE_PATHS])
+def test_every_error_terminal_carries_a_reason_and_a_code(name, drive, expect):
+    """本次改动的主断言: 没有哪条失败路径能只给上层一个状态名。"""
+    sm = drive()
+    assert sm.is_error, f'{name}: 没走到错误终态, 状态={sm.state_name}'
+    assert sm.failure_code == expect, f'{name}: 码={sm.failure_code!r}'
+    assert sm.failure_code in FAILURE_CODES, f'{name}: 码不在 6 族里'
+    assert sm.failure_reason, f'{name}: 原因是空串'
+    # 守卫兜底码不是对外承诺的一族 —— 出现它就说明这条路漏了记账。
+    assert sm.failure_code != CODE_UNSPECIFIED, f'{name}: 漏记账'
+    assert '未记账' not in ''.join(sm._node.logged['warn']), f'{name}: 触发了守卫'
+
+
+def test_unaccounted_failure_path_warns_and_marks_itself():
+    """漏记账的失败路径必须自己喊出来, 而不是静默给上层一个空原因。"""
+    sm = DockingStateMachine(logging_node())
+    sm.start()
+    sm._transition_to(DockingState.MOTION_FAILED)   # 绕开所有记账入口
+    assert sm.failure_code == CODE_UNSPECIFIED
+    assert sm.failure_reason         # 兜底串, 不许空
+    warns = ''.join(sm._node.logged['warn'])
+    assert '未记账的失败路径' in warns and 'MOTION_FAILED' in warns
+
+
+def test_failure_ledger_is_cleared_on_each_new_run_and_seq_advances():
+    """改之前只有 reset() 清账, 而包里没有任何节点调用 reset() ——
+    上一次的失败原因会一路活到下一次, 被当成这一次的原因报给上层。"""
+    sm = DockingStateMachine(logging_node())
+    first = sm.run_seq
+    sm.start()
+    sm.abort_motion('第一轮: 墙码丢失', CODE_TAG_NOT_FOUND)
+    assert (sm.failure_code, sm.run_seq) == (CODE_TAG_NOT_FOUND, first + 1)
+
+    sm.start()                       # 新一轮停泊
+    assert sm.failure_reason == '' and sm.failure_code == ''
+    assert sm.run_seq == first + 2
+
+    sm.abort_motion('第二轮', CODE_MOTION_GATED)
+    sm.start_undock()                # 泊出同样算新一轮
+    assert sm.failure_reason == '' and sm.failure_code == ''
+    assert sm.run_seq == first + 3
+
+
+def test_retryable_failure_does_not_leave_a_failure_record():
+    """中途可重试的失败不该留下失败留档 —— 那一轮最后可能是成功的。"""
+    sm = _sm_at(DockingState.FINAL_SERVO)
+    sm.fail('测试: 第一次对准过差')
+    assert sm.state == DockingState.RETRYING
+    assert sm.failure_code == '' and sm.failure_reason == ''
+
+
+def test_publish_outcome_emits_code_and_reason_once_per_terminal():
+    """~/outcome 是给上层的出口: 终态那一沿发一次, 成功也发, 带轮次号。"""
+    published = []
+    env = {'json': __import__('json'), 'time': __import__('time'),
+           'math': math}
+    cls = method_class('docking_node.py', 'DockingNode', env)
+    # method_class 自己把 String 设成 object 占位 (多数用例只需要它能被
+    # 引用), 这里真要构造消息, 所以在它之后再覆盖回来。
+    env['String'] = lambda: NS(data='')
+
+    sm = DockingStateMachine(logging_node())
+    # 假节点的时钟拨到 66s: 状态机侧 logging_node 的时钟固定在 20s (start
+    # 记 t0), 两者相减就是可断言的整轮耗时 46.0s。
+    logs = {'info': [], 'error': []}
+    node = NS(_sm=sm, _prev_state=DockingState.IDLE,
+              _outcome_pub=NS(publish=lambda m: published.append(m.data)),
+              get_clock=lambda: NS(now=lambda: NS(nanoseconds=int(66e9))),
+              get_logger=lambda: NS(info=lambda m, **kw: logs['info'].append(m),
+                                    error=lambda m, **kw: logs['error'].append(m)))
+
+    sm.start()
+    sm.abort_motion('测试: 视觉修正振荡', CODE_VISION_NO_PROGRESS)
+    cls._publish_outcome(node, sm.state)
+    fail = __import__('json').loads(published[-1])
+    assert fail['ok'] is False
+    assert fail['state'] == 'motion_failed'
+    assert fail['code'] == CODE_VISION_NO_PROGRESS
+    assert fail['reason'] == '测试: 视觉修正振荡'
+    assert fail['op'] == 'dock' and fail['seq'] == sm.run_seq
+    assert isinstance(fail['stamp'], float)
+    assert fail['elapsed_sec'] == 46.0, '整轮耗时 (start→终态) 要进载荷'
+    assert '耗时=46.0s' in logs['error'][-1], '失败日志要带耗时'
+
+    # 成功也发, 且 code/reason 必须是空的 (不能带上一轮的残留)。
+    sm.start()
+    sm._state = DockingState.APPROACH
+    sm.finish_dual()
+    cls._publish_outcome(node, sm.state)
+    ok = __import__('json').loads(published[-1])
+    assert (ok['ok'], ok['state'], ok['code'], ok['reason']) == (
+        True, 'docked', '', '')
+    assert ok['seq'] == fail['seq'] + 1
+    assert isinstance(ok['elapsed_sec'], float)
+    assert any('耗时' in m for m in logs['info']), \
+        '成功原来没有结果日志, 现场问"这次停了多久"只能翻系统日志'
+
+    # 泊出的结果要能和停泊分开 —— 同一个 motion_failed 上层处置不同。
+    sm.start_undock()
+    sm.finish_undock()
+    cls._publish_outcome(node, sm.state)
+    assert __import__('json').loads(published[-1])['op'] == 'undock'
+
+
+def test_action_result_carries_the_code_after_the_state_name():
+    """action 的调用方也要能按码分支, 而状态名前缀不能被破坏 (有 startswith
+    消费者)。"""
+    src = (ROOT / 'tagdocking' / 'docking_node.py').read_text()
+    assert "f'{state}: {tail}' if tail else state" in src
+    assert "f'[{code}]' if code else ''" in src
+
+
+def test_outcome_is_forwarded_and_exposed_verbatim():
+    """web_console / stack_supervisor 的转发只做源码级断言。
+
+    这两个模块目前零测试, 且模块作用域就 import rclpy/cv2/fastapi/uvicorn,
+    纯离线环境里根本 import 不进来 —— 为 3 行不透明转发去建该包的首个真
+    单测, 成本远大于收益。**这不等于它们被真覆盖了**, 上机清单里有对应的
+    人工验证项 (收栈后从 /docking_supervisor/status 读 last_outcome)。
+    照本文件既有的 AST/源码断言先例。
+    """
+    sup = (ROOT / 'tagdocking' / 'stack_supervisor.py').read_text()
+    assert "OUTCOME_TOPIC = '/docking_node/outcome'" in sup
+    assert "'last_outcome': self._last_outcome" in sup
+    # 转发必须是不透明的: supervisor 一行停泊逻辑都不碰 (模块头硬约束),
+    # 所以它不许 import 状态机/码常量, 也不许按码分支。
+    # (按"整词"断言而不是子串: 它的注释里合法地提到 state_machine.py 的行号。)
+    assert 'from .state_machine' not in sup and 'import state_machine' not in sup
+    assert 'CODE_' not in sup.replace('# ', '')
+    assert "_last_outcome['code']" not in sup and '.get(\'code\')' not in sup
+
+    web = (ROOT / 'tagdocking' / 'web_console.py').read_text()
+    assert "OUTCOME_TOPIC = '/docking_node/outcome'" in web
+    assert "'outcome': self._outcome" in web
+    assert 'DurabilityPolicy.TRANSIENT_LOCAL' in web   # 必须匹配锁存 QoS
+
+    page = (ROOT / 'tagdocking' / 'static' / 'index.html').read_text()
+    # 显示门槛按 state 对齐 (不按年龄 —— 锁存边沿值的年龄一直涨),
+    # 失败沿按 seq 去重 (render() 是 5Hz)。
+    assert 'outcome.state === name' in page
+    assert 'lastOutcomeSeq' in page

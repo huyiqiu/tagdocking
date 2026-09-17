@@ -329,7 +329,8 @@ Web 自己既不 spawn 也不发信号，进程生命周期归 **`docking_superv
 > 等于把省下来的又烧回去三分之一。对照实验（空回调 + 同样的 executor 组合）只有
 > 0.4%，所以贵的不是 executor 而是那几条订阅本身。现在这三项和 TF 监听一样，
 > 只在就绪门开着的那几秒里存在（`stack_supervisor.py` 的 `_make_probe`）——
-> 常驻的只剩 `/docking_node/state`（20Hz 的 String）。
+> 常驻的只剩 `/docking_node/state`（20Hz 的 String）与 `/docking_node/outcome`
+> （锁存，每轮停泊只在进终态那一沿发一次，见 §3「结果与失败原因」）。
 
 **怎么触发**（两条入口等价，HTTP 那条就是网页按钮）：
 
@@ -718,6 +719,85 @@ webapp 据此弹"泊出完成"提示。泊出可从任意非停泊态触发 (IDL
 
 > 泊出是盲动 (后退 + 转向)，**调用方需确保车后方无障碍**。
 
+### 结果与失败原因 (给上层应用的出口)
+
+上面三种触发都只告诉你"请求受理了"。**失败发生在几十秒之后**，Trigger 的响应
+早就返回了，结构上带不了原因 —— 所以结果单独走一条出口：
+
+```
+/docking_node/outcome   std_msgs/String (JSON), transient_local 锁存 depth=1
+```
+
+每轮停泊/泊出**进终态那一沿发一次**（成功也发）：
+
+```jsonc
+{
+  "seq": 7,                      // 第几轮 (start/start_undock 各自 +1)
+  "op": "dock",                  // dock | undock —— 同一个 motion_failed 处置不同
+  "state": "motion_failed",      // 终态名, 与 ~/state 同一套小写名
+  "ok": false,                   // 成功终态 (docked/undocked) 才为 true
+  "code": "vision_no_progress",  // 稳定错误码, 见下表; ok=true 时为空串
+  "reason": "dual 视觉修正无进展/振荡 — 窗口判据: 3 步修正的净改善 0.46390->0.83752 …",
+  "elapsed_sec": 46.2,           // 整轮耗时 (start→终态, 重试不重置起点)
+  "stamp": 1789457757.318        // 墙上时钟 (仅供展示/对日志)
+}
+```
+
+耗时同时进了节点日志：成功 `停泊结果: docked op=dock seq=7 耗时=46.2s`（INFO，
+原来成功没有结果日志），失败在原 `停泊结果: …` 行尾追加 `耗时=`。前端
+`renderOutcome` 把它显示在失败原因尾部、并按轮次号给成功记一行日志。
+
+三个设计点，各解决一个具体问题：
+
+- **锁存** —— 上层随时订阅都拿得到最后一次结果，不用跟 20Hz 的 `~/state` 抢时间窗。
+  按需启停的下栈随时会起会收，这点尤其要紧。
+- **`seq`** —— 锁存值分不出"这一轮的"还是"上一轮残留的"，靠它分。
+  **别用年龄判**：边沿发布的锁存值年龄会一直增长，改成每 tick 发又恒为 ~0.05s，
+  两种都判不出串味。
+- **成功也发** —— 上层订一个话题就拿到完整"结果"语义，不必自己再维护一份终态名单。
+
+```bash
+# 挂上等结果 (锁存: 失败后新开一个也立刻能打印出上一条)
+ros2 topic echo /docking_node/outcome
+
+# 收栈之后 (docking_node 已消失, 它的锁存也跟着没了) 从常驻的 supervisor 读:
+ros2 topic echo /docking_supervisor/status --once
+# {"stack": "down", …, "last_outcome": {"seq": 7, "state": "motion_failed", …},
+#  "last_outcome_age": 47.3}
+```
+
+> supervisor 对这段 JSON 只做**不透明转发**（不解析 `code`、不按它分支、不加解释），
+> 以守住它"只管进程生命周期，一行停泊逻辑都不碰"的分层约束。
+
+`Dock` action 的 result 也带上了码：`motion_failed: [vision_no_progress] <原因>`
+（状态名前缀保留不动，仍有 `startswith` 的消费者）。注意实际部署链路
+（网页控制台 → supervisor 的 Trigger）**不走 action**，所以 `~/outcome` 才是那条
+拿得到原因的路。
+
+#### 错误码 (6 族，按**上层该怎么办**分，不按内部失败点分)
+
+这样上层的 `if/else` 不会随我们新增一个 abort 点而爆炸；精确的现场留在
+`reason` 串里给人读。
+
+| `code` | 含义 | 上层典型处置 |
+|--------|------|--------------|
+| `tag_not_found` | 码不在视野 / 丢了 | 重新导航把机器人引导进视野后重试 |
+| `vision_no_progress` | 码看得见，但视觉闭环修不动 / 振荡 | 换个起始位姿重试 |
+| `motion_gated` | `cmd_vel` 被桥门控（锁定 / 电机泄力没恢复） | 查 l1w 桥与电机状态，**不要盲重试** |
+| `motion_stalled` | 指令已发但里程计不走 | 底盘不响应 → 报警，人工介入 |
+| `timeout` | 整体超时（`timeout_sec`，默认 120s） | 可直接重试一次 |
+| `cancelled` | 用户主动取消 | 不算故障 |
+
+> **粗粒度的一处已知代价，别粉饰**：「双码时效窗连续拒收全部检测帧」归进了
+> `tag_not_found`，但那时两码其实**一直看得见** —— 真问题是感知链路延迟，
+> 正确处置是查相机/降低检测延迟（或上调 `dual.fresh_sec`），而不是"重新引导进视野"。
+> 该条的 `reason` 串自带完整排查指引，所以接受这个归族。若现场发现这类感知
+> 故障需要独立分支，再加第 7 族 `perception_unhealthy`。
+
+还有一个**不对外承诺**的码 `unspecified`：它只在"某条失败路径漏了记账"时出现，
+同时状态机会 `WARN` 一句 `未记账的失败路径: X → Y`。看到它就是代码 bug
+（给那个 abort 点补一个上表里的码），不是现场故障。
+
 ---
 
 ## 4. 状态机详解
@@ -741,12 +821,15 @@ webapp 据此弹"泊出完成"提示。泊出可从任意非停泊态触发 (IDL
 
 ### 4.2 异常状态
 
-| 状态 | 枚举值 | 触发条件 |
-|------|--------|----------|
-| `TAG_LOST` | 10 | 预留终态。现行实现中视觉状态丢 tag 超 1s 会**先回 SEARCH_TAG 重锁**而非直接报错；只有搜索本身超时才失败（落 `TIMEOUT`） |
-| `TIMEOUT` | 11 | 全局超时 (120s) 或各阶段超时（搜索 60s / 接近 60s / 精停确认 30s） |
-| `MOTION_FAILED` | 12 | 直行入口对准过差且重试耗尽（`retry.max_retries`=2）；或重试倒车超时、泊出超时（里程计不走时兜底） |
-| `CANCELLED` | 13 | 用户主动取消 |
+| 状态 | 枚举值 | 触发条件 | `~/outcome` 的 `code` |
+|------|--------|----------|------------------------|
+| `TAG_LOST` | 10 | 预留终态。现行实现中视觉状态丢 tag 超 1s 会**先回 SEARCH_TAG 重锁**而非直接报错；只有搜索本身超时才失败（落 `TIMEOUT`） | — (当前不可达, 全包无 `_transition_to(TAG_LOST)`) |
+| `TIMEOUT` | 11 | 全局超时 (120s) 或各阶段超时（搜索 60s / 接近 60s / 精停确认 30s） | `timeout` (全局) / `tag_not_found` (搜索、近场丢码) / `vision_no_progress` (接近) |
+| `MOTION_FAILED` | 12 | 直行入口对准过差且重试耗尽（`retry.max_retries`=2）；或重试倒车超时、泊出超时（里程计不走时兜底） | `vision_no_progress` / `tag_not_found` / `motion_gated` / `motion_stalled` |
+| `CANCELLED` | 13 | 用户主动取消 | `cancelled` |
+
+同一个状态可能对应不同的码 —— 状态说的是"停在哪"，码说的是"上层该怎么办"，
+两者不是一对一。码表见 §3「结果与失败原因」。
 
 > 单帧丢检（低帧率/转向后模糊）不会终止停泊：连续丢失约 1s 才回 SEARCH_TAG
 > 重新锁定，机动（盲动）期间不计丢失。
@@ -842,10 +925,17 @@ SEARCH_TAG 重新锁定靠近；退满次数仍失败 → `MOTION_FAILED` 终态
 ### 4.4 状态发布
 
 ```bash
-# 监听状态变化
+# 监听状态变化 (20Hz, 每 tick 都发, 只有状态名)
 ros2 topic echo /docking_node/state
 # 输出: data: "approach"
+
+# 每轮的结果 (锁存, 进终态那一沿发一次, 带失败码与原因)
+ros2 topic echo /docking_node/outcome
+# 输出: data: '{"seq": 7, "op": "dock", "state": "docked", "ok": true, …}'
 ```
+
+`~/state` 只回答"现在在哪个状态"，`~/outcome` 回答"这一轮的结果是什么、为什么"。
+上层应用要分支处理失败，订的是后者 —— 字段与错误码表见 §3「结果与失败原因」。
 
 ---
 
@@ -1635,7 +1725,7 @@ python3 scripts/calibrate_rtsp --url rtsp://...   # RTSP 模式 (纯 ssh 无 GUI
 | 区内 `wall_bearing` 一路变大却没人纠 | bearing 没超 `_bearing_tol` 的收紧门槛，或转向候选全被 `visible()` 否掉 | 看 `纯直行区 … bearing=X ≤ 收紧门槛 Y` 这行：X<Y 是设计行为（纠它不划算）；要更早介入就调小 `dual.straight_yaw_lag_deg`。若打的是 `无可行转向候选` 则是墙码要被转出画面——那是余量问题，抬 `observation_distance` 或相机下俯，不要动门槛。**注意 `Δyaw` 现在每一步都有真实读数**（含横移步与走停退化路径；转向步额外附指令角以便读欠转），不再是"只有 `continuous=True` 那一步才测" |
 | 区内仍在 10cm 走停、拿不到一次停到位 | 整段连续直行被 `visible()` 否掉，静默退化成 `forward_step` 逐步走 | 看该窗口日志里的 `min_margin`：整段长跑会把墙码推到画面边缘，余量见底就会被否。抬 `observation_distance` 或相机下俯增加余量；`dual.visibility_margin_px` 只买到 ~2mm，是最后手段。退化路径本身是安全的（每停重测 + bearing 微调仍在工作），但拿不到 `continuous` 的航向保持 |
 | 双码近场摆头/角速度段数 >10 | 航向保持抖振（迟滞带偏窄或底盘报告滞后偏大） | `heading_hold_engage_deg`→2.5、`heading_hold_release_deg`→0.5 拉宽迟滞带，或 `heading_hold_cooldown_sec`→0.45 |
-| `dual visual correction no progress / oscillation` 中止 | 两条判据之一触发，失败串已写明是哪条 | **连败判据**（连续 N 步每步改善都 < 门槛）→ 指令根本没起作用：查 `/cmd_vel` 有没有发出去、底盘响不响应、里程计标定。**窗口判据**（N 步净改善 < 门槛，单步可以很好）→ 振荡，两个通道在互相破坏：读 `dual visual feedback` 那行的 theta/e 分解，看是哪一项与预测背离；若 e 与预测相符而 theta 大幅变差，再看那一步的 `Δyaw` —— 横移步打出 `(寄生!)` 就是底盘在横移中带出了转动，见下一行 |
+| `dual visual correction no progress / oscillation` 中止 | 两条判据之一触发，失败串已写明是哪条 | **连败判据**（连续 N 步每步改善都 < 门槛）→ 指令根本没起作用：查 `/cmd_vel` 有没有发出去、底盘响不响应、里程计标定。**窗口判据**（N 步净改善 < 门槛，单步可以很好）→ 振荡，两个通道在互相破坏：读 `dual visual feedback` 那行的 theta/e 分解，看是哪一项与预测背离；若 e 与预测相符而 theta 大幅变差，再看那一步的 `Δyaw` —— 横移步打出 `(寄生!)` 就是底盘在横移中带出了转动，见下一行。**豁免**：两条判据都不杀已过 `aligned()` 全部门槛的位姿 —— 那时日志打 `视觉修正看门狗放行`（自述是哪条判据本应判死 + 当前 bearing/theta/e 实测与门槛），窗口计数复位，对准保持/直行接管；09-17 现场就是修正净改善为负但位姿其实已对准、直行即可的局面。放行后对准若再破，看门狗照常重新累计 |
 | `no visible translation candidate; independent stable-window budget exhausted` | 前进被 `visible()` 否掉，三个独立稳定窗口耗尽 | 先读同一行尾部的**两段**余量：`wall/pile L/R/T/B` 是**当前位姿**的，`被否的一步 … 预测路径最坏 L/R/T/B … 破的是 X 边` 才是**被否那一步**的 —— 前者宽裕后者破了是正常的，只看前者会以为自相矛盾。再看 `桩码垂直离场=不放行(缺 …)`：缺 `stage=approach`/`z<=直行包络` 且墙距只差几十 mm，就是"要进窗才能进窗"的死锁（见 §6.5b）；缺 `对准(横向≤…cm)` 时先看括号里的容差是不是放行专用的 `dual.exit_lateral_tolerance_m`（0.04，比严格门槛 0.02 宽）——e 卡在 0.02~0.04 之间本应放行直行，还拦就是航向证据或 bearing 没过；此时日志里应当先出现 `dual 前进收缩 …cm → …cm`，没出现说明阶梯没生效。若打的是 `前进收缩阶梯全否 … 不是步长的问题`，那就别再调 `dual.forward_step` —— 去查相机外参/`visibility_margin_px`/桩码是否真的该被免检 |
 | 横移步 `Δyaw` 打出 `(寄生! 平移步不该转)` | 底盘执行横移时带出转动（步态耦合，omni 腿式常见） | 单次 >1° 就足以吃掉那一步的修正收益（0.5×sin1°=8.7mm，`dock_tolerance` 才 20mm），累起来会触发窗口判据。先用 `ros2 topic echo /cmd_vel --field angular.z` 确认这段 wz 确实是 0（是 0 = 底盘自己转的，不是我们发的）；再减小 `dual.lateral_step` —— 它按比例缩整个候选菜单（`cap / cap÷2 / cap÷4`），单步横移短了带出的寄生角也小。**注意 `dual.min_lateral_m` 不是这个旋钮**：它只是菜单下限，抬高它只删掉低于门槛的小候选，中段候选照选不误；yaw 与 lateral 是各自独立枚举、最后按 J 一起排序，没有"通道优先级"可调 |
 | 转角/直行不准（车没走够量） | 里程计漂移或打滑 | `test_turn_angle` / `test_jog_distance` 实测误差；降速率 |

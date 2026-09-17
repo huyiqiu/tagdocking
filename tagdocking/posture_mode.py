@@ -36,6 +36,8 @@ from rclpy.qos import (QoSProfile, ReliabilityPolicy, DurabilityPolicy)
 from std_msgs.msg import Bool, String
 from std_srvs.srv import Trigger
 
+from .state_machine import CODE_MOTION_GATED
+
 
 class PostureMode:
     """共享的 静止站立(锁定)/运动模式 状态机, 每个停-看循环调用一次。
@@ -258,7 +260,11 @@ class PostureMode:
                 # 有服务但始终无状态回传: 无法确认, 停用而非中止 (与无桥同待遇)
                 self._disable('无法确认运动模式 (状态话题无回传), 本次会话停用静止站立')
                 return True
-            self._sm.abort_motion('stand_up 超时, 无法恢复运动模式')
+            self._sm.abort_motion(
+                f'stand_up 超时, 无法恢复运动模式 '
+                f'(motion_enabled={self._motion_enabled} '
+                f'posture_state={self._posture_state!r})',
+                CODE_MOTION_GATED)
             self._phase = self.UNLOCK_FAILED
             return False
         return False

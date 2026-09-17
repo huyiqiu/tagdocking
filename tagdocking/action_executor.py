@@ -180,6 +180,21 @@ class ActionExecutor:
         """True = 预算耗尽或 yaw 不可信, 本程后段已退回纯直行。"""
         return self._jog_hold_spent
 
+    def progress_note(self, odom_x: float, odom_y: float) -> str:
+        """当前动作的"已走/目标"自述串 (纯诊断, 不参与判停)。
+
+        泊出超时等兜底失败拿它当证据: 区分"指令根本没生效 (0.002/0.800m)"
+        和"走到一半卡住"。idle 时返回空串。
+        """
+        if self._action in ('jogging', 'lateral'):
+            traveled = math.hypot(odom_x - self._jog_start_x,
+                                  odom_y - self._jog_start_y)
+            return f'已走 {traveled:.3f}/{self._action_target:.3f}m'
+        if self._action == 'turning':
+            return (f'已转 {math.degrees(abs(self._turn_accumulated)):.1f}/'
+                    f'{math.degrees(self._action_target):.1f}°')
+        return ''
+
     # ── Start actions ───────────────────────────────────────────────
 
     def start_jog(self, distance: float, linear_rate: float,

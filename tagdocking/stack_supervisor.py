@@ -46,6 +46,7 @@ from rclpy.duration import Duration
 from rclpy.executors import MultiThreadedExecutor, SingleThreadedExecutor
 from rclpy.node import Node
 from rclpy.time import Time
+from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 
 from sensor_msgs.msg import CameraInfo
 from nav_msgs.msg import Odometry
@@ -66,6 +67,10 @@ SRV_UNDOCK = '/docking_node/start_undock'
 SRV_CANCEL = '/docking_node/cancel_docking'
 
 STATE_TOPIC = '/docking_node/state'
+# 每次进终态发一次的结果 JSON (锁存)。supervisor 转发它, 是为了
+# **收栈之后还答得出上一次为什么失败** —— 那时 docking_node 没了,
+# 它的锁存也跟着没了, 常驻的只剩本节点。
+OUTCOME_TOPIC = '/docking_node/outcome'
 CAMERA_INFO_TOPIC = '/camera_sync/camera_info'
 DETECTIONS_TOPIC = '/detections'
 
@@ -145,6 +150,9 @@ class StackSupervisor(Node):
         # ── 就绪信号 (订阅回调里置位, 门里轮询) ──
         self._state: Optional[str] = None
         self._state_mono = 0.0
+        # 最后一次停泊结果 (原样转发的 dict) + 收到时刻。
+        self._last_outcome: Optional[dict] = None
+        self._last_outcome_mono = 0.0
         self._cam_info_seen = False
         self._odom_seen = False
         self._detections_seen = False
@@ -166,6 +174,15 @@ class StackSupervisor(Node):
         # 就绪门开着的那几秒里存在, 见 _make_probe。
         self.create_subscription(
             String, STATE_TOPIC, self._on_state, 10, callback_group=self._cbg)
+        # outcome 同样常驻, 但 QoS 必须与发布端的锁存对上 (transient_local,
+        # depth 1), 否则起栈前订阅的这一条收不到那次锁存值。它一轮只来一次,
+        # 便宜得可以忽略。
+        self.create_subscription(
+            String, OUTCOME_TOPIC, self._on_outcome,
+            QoSProfile(depth=1,
+                       reliability=ReliabilityPolicy.RELIABLE,
+                       durability=DurabilityPolicy.TRANSIENT_LOCAL),
+            callback_group=self._cbg)
 
         self._cli = {
             'dock': self.create_client(Trigger, SRV_DOCK,
@@ -226,6 +243,25 @@ class StackSupervisor(Node):
     def _on_state(self, msg: String):
         self._state = msg.data
         self._state_mono = time.monotonic()
+
+    def _on_outcome(self, msg: String):
+        """停泊结果: 只存不解读 —— 本节点一行停泊逻辑都不碰 (见模块头)。
+
+        parse 只为了让 ~/status 是一整块 JSON 而不是里面嵌个字符串;
+        解不开就存 None, 绝不让上游的一条坏消息把 status 发布掐死
+        (照 web_console 对 ~/error 的防御写法)。码不看、不分支、不解释。
+        """
+        try:
+            parsed = json.loads(msg.data)
+        except (ValueError, TypeError):
+            self.get_logger().warn(
+                f'{OUTCOME_TOPIC} 不是合法 JSON, 已丢弃: {msg.data[:120]!r}')
+            return
+        if not isinstance(parsed, dict):
+            return
+        with self._lock:
+            self._last_outcome = parsed
+            self._last_outcome_mono = time.monotonic()
 
     def _on_cam_info(self, _msg):
         self._cam_info_seen = True
@@ -867,6 +903,13 @@ class StackSupervisor(Node):
                 'video_lease_in': (
                     round(self._video_lease_until - time.monotonic(), 1)
                     if self._video_lease_until else None),
+                # 上一次停泊结果, 原样转发。上层在收栈之后 (docking_node
+                # 已消失) 也能从这里读出失败状态与原因; seq 用来判它是不是
+                # 新一轮的结果。
+                'last_outcome': self._last_outcome,
+                'last_outcome_age': (
+                    round(time.monotonic() - self._last_outcome_mono, 1)
+                    if self._last_outcome_mono else None),
             }
         msg = String()
         msg.data = json.dumps(payload, ensure_ascii=False)

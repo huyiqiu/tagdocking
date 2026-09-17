@@ -29,7 +29,11 @@ import yaml
 from tagdocking.dual_docking import DEFAULTS, DualTagDocking
 from tagdocking.dual_posture import DualPosture
 from tagdocking.dual_feedback import ActionWatch
+from tagdocking.charge_mode import ChargeMode
 from tagdocking.geometry_planner import ActionPlan
+from tagdocking.state_machine import (DockingStateMachine, DockingState,
+                                      FAILURE_CODES, CODE_MOTION_GATED,
+                                      CODE_MOTION_STALLED)
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 STEP = 0.1                      # s — observation tick
@@ -95,12 +99,27 @@ class MotionMsg:
         self.data = data
 
 
+class FakeSM:
+    """state_machine 桩 — 记录 abort_motion 的理由串与失败码 (ChargeMode 要 node._sm)。
+
+    码是给上层应用分支用的稳定契约 (state_machine.FAILURE_CODES), 每处 abort
+    都必须带; 桩收下它, 否则生产代码补码后这里会以 TypeError 形式假失败。
+    """
+    def __init__(self):
+        self.aborts = []
+        self.codes = []
+    def abort_motion(self, reason='', code=''):
+        self.aborts.append(reason)
+        self.codes.append(code)
+
+
 class FakeNode:
     def __init__(self, params, clients=None):
         self._params = params
         self.logger = FakeLogger()
         self._clients = clients or {}
         self.subs = []
+        self._sm = FakeSM()
     def _p(self, name):
         return self._params[name]
     def get_logger(self):
@@ -142,6 +161,14 @@ def set_motion(node, value):
             cb(MotionMsg(value))
             return
     raise AssertionError('motion_enabled subscription missing')
+
+
+def set_posture(node, value):
+    for topic, cb in node.subs:
+        if topic.endswith('posture_state'):
+            cb(MotionMsg(value))
+            return
+    raise AssertionError('posture_state subscription missing')
 
 
 # ── World / mock camera ─────────────────────────────────────────────
@@ -543,10 +570,187 @@ def t9_standing_end_to_end(params):
           f'actions={len(actions)} wall_z={wall_z:.3f} stage={d.stage}')
 
 
+# ── T10: ChargeMode 泊出门控 (按需启停栈重启后仍要 stand_up) ──────────
+
+def make_charge(params, ready=True, result=True, enable=True):
+    p = dict(params)
+    p['charge.enable'] = enable
+    prefix = p['base.l1w_prefix']
+    node = FakeNode(p, clients={
+        f'{prefix}/static_stand': FakeClient(ready, result),
+        f'{prefix}/lie_down': FakeClient(ready, result),
+        f'{prefix}/passive': FakeClient(ready, result),
+        f'{prefix}/stand_up': FakeClient(ready, result),
+    })
+    return (ChargeMode(node), node,
+            node._clients[f'{prefix}/stand_up'],
+            node._clients[f'{prefix}/passive'])
+
+
+def t10_charge_undock_gate(params):
+    ack_ns = int(float(params['charge.static_ack_timeout_sec']) * 1e9)
+
+    # G1 (本 bug): supervisor 按需起栈 → 全新进程 _phase=IDLE, 桥 latched
+    # motion_enabled=False / posture_state='not_standing' (passive 泄力态)。
+    # 必须判定为门控并发 stand_up, 不能放行盲退。
+    c, node, stand, _ = make_charge(params)
+    set_motion(node, False)
+    set_posture(node, 'not_standing')
+    ready = c.motion_ready(0)
+    check('T10-G1 重启后仍认门控→发stand_up',
+          ready is False and stand.calls == 1
+          and c._phase == ChargeMode.RECOVERING,
+          f'ready={ready} calls={stand.calls} phase={c.phase_name}')
+
+    # G2: 桥回传 motion_enabled=True → 放行, 不再重发。
+    set_motion(node, True)
+    ready2 = c.motion_ready(int(0.1e9))
+    check('T10-G2 motion_enabled转True→放行',
+          ready2 is True and stand.calls == 1,
+          f'ready={ready2} calls={stand.calls}')
+
+    # G3 (重试预算): stand_up 一直受理但 motion_enabled 永不 True →
+    # 首次 ack 超时必须重发一次 (charge.retries=1), 再超时才 abort。
+    c, node, stand, _ = make_charge(params)
+    set_motion(node, False)
+    set_posture(node, 'not_standing')
+    c.motion_ready(0)
+    c.motion_ready(ack_ns + 1)                      # 首次 ack 超时 → 重发
+    resent = stand.calls
+    c.motion_ready(2 * (ack_ns + 1))                # 预算耗尽 → abort
+    reason = node._sm.aborts[0] if node._sm.aborts else ''
+    check('T10-G3 stand_up重试预算=charge.retries',
+          resent == 2 and len(node._sm.aborts) == 1
+          and 'motion_enabled=False' in reason
+          and node._sm.codes == [CODE_MOTION_GATED]
+          and c._phase == ChargeMode.FAILED,
+          f'resent={resent} aborts={node._sm.aborts!r} '
+          f'codes={node._sm.codes!r}')
+
+    # G4 (无桥/台架): motion_enabled 从未回传 → 不门控, 泊出照走。
+    c, node, stand, _ = make_charge(params)
+    ready4 = c.motion_ready(0)
+    check('T10-G4 无状态回传→不门控放行',
+          ready4 is True and stand.calls == 0,
+          f'ready={ready4} calls={stand.calls}')
+
+    # G5 (DISABLED 黏住): charge.enable=false 时泊出恢复会把 _phase 写成
+    # RECOVERING; reset() 必须回 DISABLED, 否则下次 begin() 会真去跑收尾。
+    c, node, stand, passive = make_charge(params, enable=False)
+    set_motion(node, False)
+    c.motion_ready(0)
+    c.reset()
+    phase_after = c._phase
+    c.begin(0)
+    check('T10-G5 charge停用时reset回DISABLED',
+          phase_after == ChargeMode.DISABLED and passive.calls == 0,
+          f'phase={c._PHASE_NAMES[phase_after]} passive_calls={passive.calls}')
+
+    # G6 (同进程路径不回归): 正常泊入后 DONE, 泊出仍先 stand_up 再放行,
+    # 且中断日志仍打得出来 (自述从哪个相位被打断)。
+    c, node, stand, passive = make_charge(params)
+    set_motion(node, True)
+    c.begin(0)
+    c.tick(int(0.1e9))
+    c.tick(int(10e9))                               # passive settle 走完 → DONE
+    set_motion(node, False)                         # 桥门控合上 (泄力)
+    ready6 = c.motion_ready(int(11e9))
+    logged = any('恢复运动模式 (stand_up)' in m for _, m in node.logger.lines)
+    check('T10-G6 同进程DONE→泊出仍stand_up',
+          ready6 is False and stand.calls == 1 and logged
+          and c._phase == ChargeMode.RECOVERING,
+          f'ready={ready6} calls={stand.calls} logged={logged}')
+
+
+# ── T11: 泊出超时的失败码分流 (门控 vs 底盘不走) ──────────────────────
+#
+# 泊出超时只有一个终态 (motion_failed), 但两种病因的处置完全相反:
+# 卡在桥门控 → 查桥/电机泄力, 盲重试没用; 指令发了里程计不走 → 查底盘。
+# 合成一个码等于没分, 所以码由节点给 (只有它知道卡在哪), 状态机取用。
+
+BASE_NS = int(1e12)      # 非 0: state_elapsed_ns 把 _state_start_ns==0 当"未开始"
+
+
+class UndockNode:
+    """泊出超时只需要 logger + clock + 节点每 tick 记的 note/code。"""
+    def __init__(self, note='', code=''):
+        self.logger = FakeLogger()
+        self.ns = BASE_NS
+        if note:
+            self._undock_note = note
+        if code:
+            self._undock_code = code
+
+    def get_logger(self):
+        return self.logger
+
+    def get_clock(self):
+        return type('C', (), {'now': lambda _s=None: type(
+            'T', (), {'nanoseconds': self.ns})()})()
+
+
+def undock_timeout(note='', code='', elapsed=31.0):
+    node = UndockNode(note, code)
+    sm = DockingStateMachine(node)
+    sm.start_undock()
+    node.ns = BASE_NS + int(elapsed * 1e9)
+    sm.evaluate(None, False, 0., 0., 0., 0., 0., 0., False, node.ns,
+                {'undock': {'timeout_sec': 30.0}})
+    return sm
+
+
+def t11_undock_failure_codes():
+    # G1 (门控): charge 还没把 stand_up 做成 → 码必须是 motion_gated,
+    # 上层看到它就该去查桥, 而不是再点一次泊出。
+    sm = undock_timeout('cmd_vel 被桥门控, 等 stand_up (charge=IDLE)',
+                        CODE_MOTION_GATED)
+    check('T11-G1 门控→motion_gated',
+          sm.state == DockingState.MOTION_FAILED
+          and sm.failure_code == CODE_MOTION_GATED
+          and '被桥门控' in sm.failure_reason
+          and '泊出超时 30s' in sm.failure_reason,
+          f'state={sm.state_name} code={sm.failure_code!r} '
+          f'reason={sm.failure_reason!r}')
+
+    # G2 (底盘不走): 指令已经在发了 → motion_stalled, 处置是查底盘/报警。
+    sm = undock_timeout('phase0 已走 0.002/0.800m', CODE_MOTION_STALLED)
+    check('T11-G2 指令已发没走→motion_stalled',
+          sm.failure_code == CODE_MOTION_STALLED
+          and '0.002/0.800m' in sm.failure_reason,
+          f'code={sm.failure_code!r} reason={sm.failure_reason!r}')
+
+    # G3 (节点没记码): 兜底成 motion_stalled, 但**绝不能是空码** ——
+    # 空码等于上层又拿不到可分支的信息, 正是这次改动要消灭的东西。
+    sm = undock_timeout('', '')
+    check('T11-G3 节点没给码→兜底非空且在6族里',
+          sm.failure_code == CODE_MOTION_STALLED
+          and sm.failure_code in FAILURE_CODES
+          and sm.failure_reason == '泊出超时 30s',
+          f'code={sm.failure_code!r} reason={sm.failure_reason!r}')
+
+    # G4 (没超时不许开枪): 29s 时还在 UNDOCKING, 且没有失败留档。
+    sm = undock_timeout('phase0 已走 0.002/0.800m', CODE_MOTION_STALLED, 29.0)
+    check('T11-G4 未超时→不记账不落终态',
+          sm.state == DockingState.UNDOCKING
+          and sm.failure_code == '' and sm.failure_reason == '',
+          f'state={sm.state_name} code={sm.failure_code!r}')
+
+    # G5 (不串味): 泊出失败后再起一轮, 轮次号必须自增且留档清零 ——
+    # outcome 是锁存的, 上层靠 seq 分辨"这是新一轮的结果"还是上次的残留。
+    sm = undock_timeout('x', CODE_MOTION_GATED)
+    seq_failed = sm.run_seq
+    sm.start_undock()
+    check('T11-G5 新一轮清账且seq自增',
+          sm.run_seq == seq_failed + 1
+          and sm.failure_code == '' and sm.failure_reason == '',
+          f'seq={seq_failed}→{sm.run_seq} code={sm.failure_code!r} '
+          f'reason={sm.failure_reason!r}')
+
+
 def main():
     crouch = load_params(CROUCH_PROFILE)
     standing = load_params(STANDING_PROFILE)
-    # T1/T2/T6/T7/T8 与 profile 无关的场景走匍匐参数 (历史场景按匍匐调);
+    # T1/T2/T6/T7/T8/T10 与 profile 无关的场景走匍匐参数 (历史场景按匍匐调);
     # T3/T4/T5 匍匐全链 (含 T3 内嵌的 30cm 主动锁定); T9 站立 profile 全程。
     d0, _, _, _, _ = t1_acquire_forward(crouch)
     t2_acquire_reverse(crouch)
@@ -556,6 +760,8 @@ def main():
     t7_dual_posture(crouch)
     t8_action_watch(d0)
     t9_standing_end_to_end(standing)
+    t10_charge_undock_gate(crouch)
+    t11_undock_failure_codes()
 
     failed = [n for n, ok in RESULTS if not ok]
     total = len(RESULTS)

@@ -33,6 +33,7 @@ Architecture:
 """
 
 import math
+import json
 import signal
 import threading
 import time
@@ -44,7 +45,8 @@ from rclpy.action import ActionServer, CancelResponse
 from geometry_msgs.msg import Twist, Vector3
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import CameraInfo
-from rclpy.qos import qos_profile_sensor_data
+from rclpy.qos import (qos_profile_sensor_data, QoSProfile,
+                       ReliabilityPolicy, DurabilityPolicy)
 from std_msgs.msg import String
 from std_srvs.srv import Trigger
 from apriltag_msgs.msg import AprilTagDetectionArray
@@ -54,7 +56,9 @@ from .utils import TagPose, yaw_from_quat, normalize_angle, tag_normal_angle
 from .pose_buffer import PoseBuffer
 from .geometry_planner import GeometryPlanner, ActionPlan
 from .action_executor import ActionExecutor, HeadingHold
-from .state_machine import DockingStateMachine, DockingState
+from .state_machine import (DockingStateMachine, DockingState,
+                            CODE_TAG_NOT_FOUND, CODE_VISION_NO_PROGRESS,
+                            CODE_MOTION_GATED, CODE_MOTION_STALLED)
 from .posture_mode import PostureMode
 from .charge_mode import ChargeMode
 from .dual_docking import DualTagDocking, DEFAULTS as DUAL_DEFAULTS
@@ -229,6 +233,12 @@ class DockingNode(Node):
         # 0 = 盲退 undock.backup_distance, 1 = 原地转 180°, 2 = 完成。
         # 由 _run_undock 在 UNDOCKING 态驱动, 纯里程计闭环, 不看 tag。
         self._undock_phase = 0
+        # 泊出卡在哪的自述串, 每 tick 更新; 30s 兜底超时由 state_machine 取用
+        # (getattr), 用来区分"桥门控没解开"和"指令发了但底盘不动"。
+        self._undock_note = ''
+        # 泊出超时的码也由本节点给 —— 只有它分得清这次是卡在门控 (查桥)
+        # 还是指令发了没走 (查底盘); 状态机只知道"超时了"。
+        self._undock_code = ''
 
         # Recovery-search state: remember which side the tag was last seen on
         # (sign of lat) so the angle-stepped sweep starts toward it. The node
@@ -541,6 +551,15 @@ class DockingNode(Node):
 
         self._state_pub = self.create_publisher(String, '~/state', 10)
         self._error_pub = self.create_publisher(Vector3, '~/error', 10)
+        # ~/outcome: 每次进终态发一次的"这一轮的结果" (JSON in String)。
+        # 锁存 (transient_local, depth 1) —— 上层随时订阅都能拿到最后一次结果,
+        # 不用跟 20Hz 的 ~/state 抢时间窗; 按需启停下栈随时会起会收, 这点尤其
+        # 要紧。QoS 四字段写法照 charge_mode.py 的桥订阅端, 本包既有先例。
+        self._outcome_pub = self.create_publisher(
+            String, '~/outcome',
+            QoSProfile(depth=1,
+                       reliability=ReliabilityPolicy.RELIABLE,
+                       durability=DurabilityPolicy.TRANSIENT_LOCAL))
 
         self._srv_start = self.create_service(
             Trigger, '~/start_docking', self._on_start_docking)
@@ -925,7 +944,12 @@ class DockingNode(Node):
             f'双码时效窗连续 {span:.1f}s 拒收全部检测帧 — {cause}; '
             f'两码一直被检测到但从未进入观测 (外层因此只能转圈搜索)。'
             f'排查: 降低相机/检测链路延迟, 或上调 dual.fresh_sec '
-            f'(当前 {window:.2f}s, 须 > 实测 age_ms)')
+            f'(当前 {window:.2f}s, 须 > 实测 age_ms)',
+            # 归 tag_not_found 是粗粒度分族的一处已知代价: 两码其实一直看得见,
+            # 真问题是感知链路延迟, 正确处置是查相机而不是重新引导进视野。
+            # 上面那串已自带完整排查指引, 故接受。若以后需要独立分支,
+            # 再加一族 perception_unhealthy。
+            CODE_TAG_NOT_FOUND)
 
     def _clear_dual_expiry(self):
         """任何"非过期"的帧结局都终止连续计时 —— 只有连续过期才算链路故障。"""
@@ -1010,7 +1034,8 @@ class DockingNode(Node):
                 self._adapter.publish_stop()
                 self._executor.cancel()
                 self._sm.abort_motion(
-                    self._wall_lost_reason(ids, evidence, phase))
+                    self._wall_lost_reason(ids, evidence, phase),
+                    CODE_TAG_NOT_FOUND)
             return
         # Drop NEW arrivals when full, never evict a waiting head for new frames.
         if len(self._dual_pending) >= 64:
@@ -1141,13 +1166,14 @@ class DockingNode(Node):
             reason = self._wall_stale_reason(now_ns, self._motion_phase())
             self._adapter.publish_stop()
             self._executor.cancel()
-            self._sm.abort_motion(reason)
+            self._sm.abort_motion(reason, CODE_TAG_NOT_FOUND)
         if self._dual.enabled and self._sm.state == DockingState.SEARCH_TAG:
             self._lookup_camera_offset()
             if self._dual.failure:
                 self._adapter.publish_stop()
                 self._executor.cancel()
-                self._sm.abort_motion(self._dual.failure)
+                self._sm.abort_motion(self._dual.failure,
+                                      CODE_VISION_NO_PROGRESS)
 
         # State machine evaluation
         params = self._build_params_dict()
@@ -1182,7 +1208,7 @@ class DockingNode(Node):
         # 的滞后残留不会误判。)
         if self._executor.is_active and self._posture.external_lock:
             self.get_logger().error('机动期间被外部切入静止站立 → MOTION_FAILED')
-            self._sm.abort_motion('外部锁定打断机动')
+            self._sm.abort_motion('外部锁定打断机动', CODE_MOTION_GATED)
             state = self._sm.state
 
         # On leaving the stop-and-go states (e.g. APPROACH→SEARCH_TAG re-lock,
@@ -1221,6 +1247,10 @@ class DockingNode(Node):
             self._adapter.publish_stop()
             self._executor.cancel()
             self._charge.begin(now_ns)
+        # 进终态那一沿发一次结果 (成功/失败都发)。必须在 _prev_state 被覆盖
+        # 之前算, _publish_outcome 要用它判这一轮是停泊还是泊出。
+        if self._prev_state != state and self._sm.is_terminal:
+            self._publish_outcome(state)
         self._prev_state = state
 
         # ── Per-state behaviour ───────────────────────────────────
@@ -1391,7 +1421,8 @@ class DockingNode(Node):
         if self._dual.enabled:
             self._adapter.publish_stop()
             if not self._has_odom:
-                self._sm.abort_motion('dual docking requires odometry')
+                self._sm.abort_motion('dual docking requires odometry',
+                                      CODE_MOTION_STALLED)
                 return
             self._lookup_camera_offset()
             # 步骤 1.5: 趴下前先用单码 (墙码) 把方位粗对准到 ±prealign_tolerance。
@@ -1406,12 +1437,15 @@ class DockingNode(Node):
             if self._dual.crouch and not self._dual_posture.ensure_crouch(now_ns):
                 if self._dual_posture.failure:
                     self._executor.cancel()
-                    self._sm.abort_motion('dual 姿态切换: ' + self._dual_posture.failure)
+                    self._sm.abort_motion(
+                        'dual 姿态切换: ' + self._dual_posture.failure,
+                        CODE_MOTION_GATED)
                 return
             seq = self._dual.plan_dual(tag_pose, base_type, self._planner, now_ns)
             if self._dual.failure:
                 self._executor.cancel()
-                self._sm.abort_motion(self._dual.failure)
+                self._sm.abort_motion(self._dual.failure,
+                                      CODE_VISION_NO_PROGRESS)
             elif self._dual.complete:
                 self._executor.cancel()
                 self._pending_seq = None
@@ -1428,7 +1462,9 @@ class DockingNode(Node):
                     self._dual_stand_grace_ns = now_ns + int(5.0e9)
                 elif self._dual_posture.failure:
                     self._executor.cancel()
-                    self._sm.abort_motion('dual 姿态切换: ' + self._dual_posture.failure)
+                    self._sm.abort_motion(
+                        'dual 姿态切换: ' + self._dual_posture.failure,
+                        CODE_MOTION_GATED)
                 return
             elif seq:
                 self._pending_seq = list(seq)
@@ -1510,13 +1546,16 @@ class DockingNode(Node):
                     self._straight_entered = True
                     if (bearing_err > straight_yaw_tol
                             or abs(tag_pose.lat) > entry_lat_tol):
-                        self.get_logger().error(
+                        # 同一个串既打日志又交给 fail() 记账 —— 原先只打日志,
+                        # 退满重试落 MOTION_FAILED 时上层拿到的是空原因。
+                        reason = (
                             f'直行失败：进入直行距离({tag_pose.dist:.2f}m)时误差 '
                             f'方位={math.degrees(bearing_err):.1f}° '
                             f'(门槛{math.degrees(straight_yaw_tol):.1f}°) '
                             f'横向={tag_pose.lat:+.3f}m '
                             f'(门槛±{entry_lat_tol:.3f}m)，对准过差无法入库')
-                        self._sm.fail()
+                        self.get_logger().error(reason)
+                        self._sm.fail(reason, CODE_VISION_NO_PROGRESS)
                         self._adapter.publish_stop()
                         return
                 go_straight = True
@@ -1728,6 +1767,11 @@ class DockingNode(Node):
         """
         # Case 1: 子动作执行中
         if self._executor.is_active:
+            self._undock_note = (f'phase{self._undock_phase} '
+                                 + self._executor.progress_note(self._odom_x,
+                                                                self._odom_y))
+            # 指令已经在发了, 超时就意味着里程计没跟上 → 查底盘, 不是查桥。
+            self._undock_code = CODE_MOTION_STALLED
             done = self._executor.update(
                 self._odom_x, self._odom_y, self._odom_yaw,
                 False, None,   # blind: 不看 tag
@@ -1751,6 +1795,8 @@ class DockingNode(Node):
         # Case 2: 首次进入 → 启动第一段(盲退)
         if not self._has_odom:
             self._adapter.publish_stop()
+            self._undock_note = '等里程计'
+            self._undock_code = CODE_MOTION_STALLED
             self.get_logger().warn('泊出：等待里程计...', throttle_duration_sec=1.0)
             return
         # DOCKED 按约定保持静止站立; 盲退前必须 stand_up 并等 motion_enabled,
@@ -1759,9 +1805,15 @@ class DockingNode(Node):
         # 先由 charge 管理器 stand_up 恢复运动, 它不门控时直接放行。
         if not self._charge.motion_ready(now_ns):
             self._adapter.publish_stop()
+            self._undock_note = (f'cmd_vel 被桥门控, 等 stand_up '
+                                 f'(charge={self._charge.phase_name})')
+            # 卡在门控: 盲重试没用, 得去查桥/电机泄力。
+            self._undock_code = CODE_MOTION_GATED
             return
         if not self._posture.motion_ready(now_ns):
             self._adapter.publish_stop()
+            self._undock_note = 'cmd_vel 被桥门控, 等 posture 解锁'
+            self._undock_code = CODE_MOTION_GATED
             return
         self._undock_phase = 0
         if not self._start_undock_step(base_type):
@@ -1895,7 +1947,9 @@ class DockingNode(Node):
         if (self._dual.enabled and self._search_step * abs(float(
                 self._p('search.step_angle_deg'))) >= 360.0):
             self._adapter.publish_stop()
-            self._sm.abort_motion('dual bounded wall search exhausted one revolution')
+            self._sm.abort_motion(
+                'dual bounded wall search exhausted one revolution',
+                CODE_TAG_NOT_FOUND)
             return
 
         # 停留期满仍未见到 → 先恢复运动模式再转下一步。解锁等待期间保持
@@ -2062,7 +2116,9 @@ class DockingNode(Node):
             if (stamp <= 0 or not 0 <= now-stamp <= self._dual.p('odom_fresh_sec')*1e9
                     or not all(math.isfinite(v) for v in (self._odom_x, self._odom_y, self._odom_yaw))):
                 self._adapter.publish_stop()
-                self._sm.abort_motion('dual requires fresh odometry before action start')
+                self._sm.abort_motion(
+                    'dual requires fresh odometry before action start',
+                    CODE_MOTION_STALLED)
                 return False
         if plan.kind == 'yaw':
             # Full computed turn — no undershoot, no per-step cap. The whole
@@ -2143,7 +2199,7 @@ class DockingNode(Node):
             self._maneuver_active = False
             self._dual.failure = reason
             self._dual._travel_qualification = 0
-            self._sm.abort_motion(reason)
+            self._sm.abort_motion(reason, CODE_VISION_NO_PROGRESS)
             return False
         return True
 
@@ -2399,6 +2455,52 @@ class DockingNode(Node):
         msg.data = state.name.lower()
         self._state_pub.publish(msg)
 
+    def _publish_outcome(self, state: DockingState):
+        """进终态那一沿发一次"这一轮的结果" —— 给上层应用分支用的出口。
+
+        为什么单开一个锁存话题, 而不是塞进 ~/state 或靠 action:
+        - ~/state 只发状态名, 且 supervisor/web 都按裸名消费 (还有 startswith
+          消费者), 不能改它的载荷。
+        - Trigger 服务立即返回, 失败发生在几十秒之后, 结构上带不了原因。
+        - Dock action 确实带原因, 但部署链路 (web 控制台 → supervisor 的
+          Trigger) 根本不接 action, 一个字都拿不到。
+
+        成功也发: 上层订一个话题就拿到完整"结果"语义, 不必自己再维护一份
+        终态名单 (supervisor 和前端现在各硬编码了一份)。
+        seq 是轮次号: 锁存值分不出"这一轮的"还是"上一轮残留的", 靠它分。
+        """
+        ok = self._sm.is_success
+        # 整轮耗时: start/start_undock 到终态沿 (重试不重置起点, 见
+        # state_machine.start 的注释)。现场"这次停了多久 / 是不是卡了很久"
+        # 只能靠它回答, 节点日志与 ~/outcome 各带一份。
+        elapsed_sec = round(
+            self._sm.elapsed_ns(self.get_clock().now().nanoseconds)*1e-9, 1)
+        payload = {
+            'seq': self._sm.run_seq,
+            # 这一轮是停泊还是泊出 —— 同一个 motion_failed, 上层的处置不同。
+            'op': 'undock' if state == DockingState.UNDOCKED
+                  or self._prev_state == DockingState.UNDOCKING else 'dock',
+            'state': state.name.lower(),
+            'ok': ok,
+            'code': '' if ok else self._sm.failure_code,
+            'reason': '' if ok else self._sm.failure_reason,
+            'elapsed_sec': elapsed_sec,
+            'stamp': time.time(),
+        }
+        msg = String()
+        # ensure_ascii=False: 理由串是中文, 转义了没人读得懂
+        # (与 stack_supervisor._publish_status 同一套写法)。
+        msg.data = json.dumps(payload, ensure_ascii=False)
+        self._outcome_pub.publish(msg)
+        if ok:
+            self.get_logger().info(
+                f'停泊结果: {payload["state"]} op={payload["op"]} '
+                f'seq={payload["seq"]} 耗时={elapsed_sec:.1f}s')
+        else:
+            self.get_logger().error(
+                f'停泊结果: {payload["state"]} code={payload["code"]} '
+                f'seq={payload["seq"]} 耗时={elapsed_sec:.1f}s')
+
     def _publish_error(self, ex: float, ey: float, eyaw: float):
         msg = Vector3()
         msg.x = ex
@@ -2439,6 +2541,8 @@ class DockingNode(Node):
             self._executor.cancel()
             self._reset_maneuver()
             self._undock_phase = 0
+            self._undock_note = ''
+            self._undock_code = ''
         return response
 
     # ── Action callbacks ───────────────────────────────────────────
@@ -2486,10 +2590,14 @@ class DockingNode(Node):
             goal_handle.abort()
             # 保留 state_name 前缀 (可能有 startswith/in 的消费者), 只追加理由:
             # 光一个 'motion_failed' 让调用方对失败原因一无所知。
+            # 码夹在中括号里跟在状态名后: 前缀匹配不受影响, 而 action 的调用方
+            # 也能像订 ~/outcome 的上层那样按码分支, 不必去解中文串。
             reason = self._sm.failure_reason
+            code = self._sm.failure_code
             state = self._sm.state_name.lower()
+            tail = ' '.join(x for x in (f'[{code}]' if code else '', reason) if x)
             return Dock.Result(success=False,
-                               message=f'{state}: {reason}' if reason else state)
+                               message=f'{state}: {tail}' if tail else state)
 
     def _dock_cancel_cb(self, cancel_request):
         self._sm.cancel()

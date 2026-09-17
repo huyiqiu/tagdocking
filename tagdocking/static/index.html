@@ -130,6 +130,19 @@
     margin-top: 10px; padding: 8px 10px; border-radius: 6px;
     background: #45211d; color: #ffb3ab; font-size: 12px; display: none;
   }
+  /* 失败原因: 与 .offline-note 同一套红底配色。不能直接追在 #banner .desc
+     后面 —— 那是 var(--muted) 灰色, 操作员看不出那是错误信息。
+     原因串会很长 (自带排查指引), 所以允许换行并用等宽字体。 */
+  .fail-note {
+    margin-top: 8px; padding: 8px 10px; border-radius: 6px;
+    background: #45211d; color: #ffb3ab; font-size: 12px; display: none;
+    line-height: 1.5; word-break: break-word;
+    font-family: ui-monospace, monospace;
+  }
+  .fail-note .code {
+    display: inline-block; margin-right: 6px; padding: 0 5px;
+    border-radius: 3px; background: #6b2b24; color: #ffd9d4;
+  }
 </style>
 </head>
 <body>
@@ -146,6 +159,7 @@
       <div class="name" id="state-name">—</div>
       <div class="desc" id="state-desc">等待 docking_node</div>
     </div>
+    <div class="fail-note" id="fail-note"></div>
 
     <div id="stack-row" class="stack-row">
       <span class="stack-led" id="stack-led"></span>
@@ -223,6 +237,9 @@ const DESC = {
 
 const $ = (id) => document.getElementById(id);
 let online = false;
+// 上一条已经记进日志的停泊结果轮次。render() 是 5Hz, 没有它同一次失败会被
+// 刷 5 条/秒。用 seq 而不是原因串比对: 同一个原因连续失败两次也要各记一条。
+let lastOutcomeSeq = null;
 // 栈起没起 —— 停泊按钮的确认文案要用它 (栈没起就得先等冷启动)。
 let stackUp = false;
 // 当前是满栈还是只有相机 —— camera → full 要收了重起, 视频会断, 确认框要说。
@@ -339,6 +356,8 @@ function render(st) {
     $('state-desc').textContent = d;
   }
 
+  renderOutcome(st.outcome, name);
+
   const e = st.error || {};
   const fmt = (v, u, k) => (st.error_age == null) ? '—' : (v * k).toFixed(1) + u;
   $('e-x').textContent   = fmt(e.x, 'cm', 100);
@@ -351,6 +370,39 @@ function render(st) {
   $('btn-undock').disabled = !online;
   $('btn-cancel').disabled = !online;
   $('offline-note').style.display = online ? 'none' : 'block';
+}
+
+// 失败原因 + 稳定错误码。显示门槛: 仅当 outcome 说的就是当前这个状态 ——
+// 进入下一轮 (活动态) 会自然把它隐掉, 不用引入年龄判断 (outcome 是锁存的
+// 边沿值, 年龄一直涨, 按年龄判会把刚失败几秒的结果误当过期)。
+function renderOutcome(outcome, name) {
+  const note = $('fail-note');
+  const show = outcome && outcome.ok === false && outcome.state === name;
+  // 整轮耗时 (start→终态, 重试不重置起点): 节点在 ~/outcome 里带 elapsed_sec。
+  const took = outcome && outcome.elapsed_sec != null
+    ? `（耗时 ${outcome.elapsed_sec}s）` : '';
+  // 成功结果也按轮次号记一行日志 —— 原来日志只有失败, 现场"这次停了多久"
+  // 只能翻节点日志。必须在 show 早退之前, 否则成功永远轮不到。
+  if (outcome && outcome.ok === true && outcome.seq != null
+      && outcome.seq !== lastOutcomeSeq) {
+    lastOutcomeSeq = outcome.seq;
+    log(`${outcome.op === 'undock' ? '泊出完成' : '停泊完成'}${took}`);
+  }
+  if (!show) { note.style.display = 'none'; note.textContent = ''; return; }
+  note.textContent = '';
+  if (outcome.code) {
+    const c = document.createElement('span');
+    c.className = 'code';
+    c.textContent = outcome.code;
+    note.appendChild(c);
+  }
+  note.appendChild(document.createTextNode(outcome.reason || '（无原因记录）'));
+  if (took) note.appendChild(document.createTextNode(took));
+  note.style.display = 'block';
+  if (outcome.seq != null && outcome.seq !== lastOutcomeSeq) {
+    lastOutcomeSeq = outcome.seq;
+    log(`停泊失败 [${outcome.code || '?'}] ${outcome.reason || ''}${took}`);
+  }
 }
 
 function log(msg) {

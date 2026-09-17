@@ -15,6 +15,12 @@ Error terminal states:
     TIMEOUT      — overall docking timeout exceeded
     MOTION_FAILED— commanded motion not reflected in odometry
     CANCELLED    — user cancelled the docking
+
+失败留档 (对上层应用的契约): 每一条通往错误终态的路都必须记下
+reason (人读的现场串) + code (FAILURE_CODES 里的稳定机器码), 统一经
+_record_failure() 写入, 由 docking_node 的 ~/outcome 话题发出去。
+_transition_to 有一道守卫: 进错误终态却没记账就 WARN 自述, 所以新增
+失败路径漏记会自己喊出来, 不会静默给上层一个空原因。
 """
 
 import enum
@@ -62,6 +68,31 @@ _ERROR_STATES = {
 }
 
 
+# ── 失败码 (对上层应用的稳定契约) ──────────────────────────────────
+#
+# 按**上层该怎么办**分族, 不按内部失败点分 —— 上层的 if/else 不会随我们
+# 新增一个 abort 点而爆炸。精确的现场留在 reason 串里给人读。
+#
+# 用 snake_case 字符串而非数字常量: 全仓没有任何 error_code 先例
+# (navigo 也不传 nav2 的 error_code), 而小写状态名已经是在用的机器可读
+# token (stack_supervisor.py:75-78 / index.html 的状态族都按它), 码与它同构。
+CODE_TAG_NOT_FOUND = 'tag_not_found'          # 码不在视野/丢了 → 重新引导进视野
+CODE_VISION_NO_PROGRESS = 'vision_no_progress'  # 视觉闭环修不动 → 换起始位姿
+CODE_MOTION_GATED = 'motion_gated'            # cmd_vel 被门控(泄力/锁定) → 查桥, 别盲重试
+CODE_MOTION_STALLED = 'motion_stalled'        # 底盘不响应指令 → 报警, 人工介入
+CODE_TIMEOUT = 'timeout'                      # 整体超时 → 可直接重试
+CODE_CANCELLED = 'cancelled'                  # 用户取消 → 不算故障
+
+# 守卫兜底: 进了错误终态却没人记账。**不是**对外承诺的一族 ——
+# 它出现就意味着有个 abort 点漏了 code, 见 _transition_to 的 WARN。
+CODE_UNSPECIFIED = 'unspecified'
+
+FAILURE_CODES = frozenset({
+    CODE_TAG_NOT_FOUND, CODE_VISION_NO_PROGRESS, CODE_MOTION_GATED,
+    CODE_MOTION_STALLED, CODE_TIMEOUT, CODE_CANCELLED,
+})
+
+
 class DockingStateMachine:
     """Manages state transitions, timeouts, and docking logic.
 
@@ -90,6 +121,14 @@ class DockingStateMachine:
         # action 调用的客户端连一个字都拿不到 (只有 'motion_failed')。纯诊断,
         # 没有任何判据读它。
         self._abort_reason = ''
+        # 失败码: reason 是给人读的自由串, code 是给上层应用分支用的稳定契约
+        # (FAILURE_CODES)。两者同时记, 缺一不可 —— 只有串上层没法可靠分支,
+        # 只有码现场无从下手。
+        self._abort_code = ''
+        # 第几次停泊/泊出。上层靠它区分"这是新一次的结果"还是"上次的残留" ——
+        # outcome 话题是锁存的, 不带轮次号就分不出来 (墙上时钟的年龄判不出:
+        # 锁存值年龄一直涨, 每 tick 发布则恒为 ~0.05s, 两种都没用)。
+        self._run_seq = 0
 
         # Final servo stability
         self._stable_since_ns = 0
@@ -159,6 +198,7 @@ class DockingStateMachine:
             return False
 
         self._retry_count = 0   # 用户主动启动: 重试计数清零
+        self._begin_run()
         self._transition_to(DockingState.SEARCH_TAG)
         # 每次用户触发都是一次全新的停泊: 重置整体超时起点。
         # (重试走 retry_search(), 不动 _docking_start_ns, 故同一次停泊内的
@@ -178,12 +218,24 @@ class DockingStateMachine:
             self._node.get_logger().warn(
                 f'无法泊出：停泊进行中({self._state.name})')
             return False
+        self._begin_run()
         self._transition_to(DockingState.UNDOCKING)
         # 泊出是一次独立操作: 重置整体超时起点, 否则 UNDOCKING 也受全局超时
         # (_ACTIVE_STATES) 管辖, 而 _docking_start_ns 还停留在上次停泊的 t0,
         # 隔一阵再触发泊出会立刻 elapsed>timeout_sec 落 TIMEOUT。
         self._docking_start_ns = self._state_start_ns
         return True
+
+    def _begin_run(self) -> None:
+        """新一轮停泊/泊出的开场: 轮次号自增 + 上一轮的失败留档清零。
+
+        必须在这里清, 不能只靠 reset() —— reset() 包里没有任何节点调用过
+        (只有测试调), 所以上一次的失败原因会一路活到下一次, 被当成这一次的
+        原因报给上层。轮次号让锁存的 outcome 能被认出是哪一轮的。
+        """
+        self._run_seq += 1
+        self._abort_reason = ''
+        self._abort_code = ''
 
     def finish_dual(self):
         """Called only after controller-confirmed settled finish and zero/cancel."""
@@ -197,9 +249,12 @@ class DockingStateMachine:
 
     def cancel(self):
         """User cancel — transition to CANCELLED."""
+        # 记账: 取消也是一种终态结果, 上层要能分清"取消"和"真故障"
+        # (cancelled 那一族的约定就是"不算故障")。
+        self._record_failure('用户取消停泊', CODE_CANCELLED)
         self._transition_to(DockingState.CANCELLED)
 
-    def fail(self, reason: str = ''):
+    def fail(self, reason: str = '', code: str = CODE_VISION_NO_PROGRESS):
         """节点主动报失败 — 可重试的失败(如直行阶段对准过差)。
 
         若还有重试次数, 转 RETRYING: 节点盲退一段距离后由 retry_search() 转
@@ -217,14 +272,35 @@ class DockingStateMachine:
                 f'→ 倒车后重新锁定')
             self._transition_to(DockingState.RETRYING)
         else:
+            # 只有退满重试才是终态, 这时才记账 —— 中途的可重试失败不该留下
+            # 失败留档 (那一轮可能最后是成功的)。
             self._node.get_logger().error(
                 f'停靠失败且已达最大重试次数({self._max_retries})')
+            self._record_failure(
+                reason or f'停靠失败且已达最大重试次数({self._max_retries})',
+                code)
             self._transition_to(DockingState.MOTION_FAILED)
 
     @property
     def failure_reason(self) -> str:
-        """最后一次 abort_motion 的理由, 供 action 结果回传。"""
+        """最后一次失败的理由 (人读), 供 action 结果与 outcome 话题回传。"""
         return getattr(self, '_abort_reason', '')
+
+    @property
+    def failure_code(self) -> str:
+        """最后一次失败的码 (机器读, 见 FAILURE_CODES); 未失败时为空串。"""
+        return getattr(self, '_abort_code', '')
+
+    @property
+    def run_seq(self) -> int:
+        """第几次停泊/泊出 (start/start_undock 各自 +1)。"""
+        return getattr(self, '_run_seq', 0)
+
+    def _record_failure(self, reason: str, code: str) -> None:
+        """失败留档的唯一入口 (reason + code 一起写, 不许只写一半)。"""
+        if reason:
+            self._abort_reason = reason
+        self._abort_code = code or CODE_UNSPECIFIED
 
     def _wall_loss_reason(self, params) -> str:
         """双码外层丢码看门狗的失败串 —— 开头四个字必须是"墙码丢失"。
@@ -262,17 +338,20 @@ class DockingStateMachine:
         return head + '; ' + (evidence
                               or '证据不可得 (节点未提供取证, 只能翻 dual detection <reason> 日志)')
 
-    def abort_motion(self, reason: str = ''):
+    def abort_motion(self, reason: str = '', code: str = CODE_UNSPECIFIED):
         """系统级失败 — 直接落 MOTION_FAILED, 不再重试。
 
         与 fail() 的区别: fail() 在 RETRYING 态再转 RETRYING 是 no-op
         (_transition_to 对同状态直接返回), 会把节点卡死在倒车步; 而无法
         恢复运动模式 (stand_up 重试耗尽) / 被外部锁定打断机动这类系统级
         失败, 倒车重试毫无意义且同样发不出 cmd_vel, 必须直落终态。
+
+        code 默认 CODE_UNSPECIFIED 而不是某个具体族: 漏传要能被 _transition_to
+        的守卫抓出来, 默认成一个像样的码只会把漏传藏起来。
         """
         if reason:
-            self._abort_reason = reason
             self._node.get_logger().error(f'运动中止：{reason}')
+        self._record_failure(reason, code)
         self._transition_to(DockingState.MOTION_FAILED)
 
     def retry_search(self):
@@ -293,6 +372,7 @@ class DockingStateMachine:
         self._align_hold_count = 0
         self._tag_lost_count = 0
         self._abort_reason = ''
+        self._abort_code = ''
         self._stable_since_ns = 0
         self._retry_count = 0
 
@@ -336,6 +416,10 @@ class DockingStateMachine:
             if overall_sec > params.get('timeout_sec', 120.0):
                 self._node.get_logger().error(
                     f'整体超时（{overall_sec:.0f}s）')
+                self._record_failure(
+                    f'整体超时 {overall_sec:.0f}s > timeout_sec='
+                    f'{params.get("timeout_sec", 120.0):.0f}s '
+                    f'(卡在 {state.name})', CODE_TIMEOUT)
                 self._transition_to(DockingState.TIMEOUT)
                 return self._state
 
@@ -350,7 +434,8 @@ class DockingStateMachine:
                 else:
                     self._tag_lost_count = 0
                 if self._tag_lost_count * 0.05 > params.get('tag', {}).get('tag_loss_timeout_sec', 2.5):
-                    self.abort_motion(self._wall_loss_reason(params))
+                    self.abort_motion(self._wall_loss_reason(params),
+                                      CODE_TAG_NOT_FOUND)
                 return self._state
 
             # Tag lost during a vision state → try to re-acquire rather than
@@ -384,6 +469,10 @@ class DockingStateMachine:
             # Motion failure check
             if motion_stalled:
                 self._node.get_logger().error('运动卡死 — MOTION_FAILED')
+                self._record_failure(
+                    f'运动卡死: 指令已发但里程计不动 (卡在 {state.name}) —— '
+                    f'检查底盘是否响应 /cmd_vel、里程计话题是否正确',
+                    CODE_MOTION_STALLED)
                 self._transition_to(DockingState.MOTION_FAILED)
                 return self._state
 
@@ -410,15 +499,28 @@ class DockingStateMachine:
             retry_timeout = params.get('retry', {}).get('timeout_sec', 15.0)
             if self.state_elapsed_ns(now_ns) * 1e-9 > retry_timeout:
                 self._node.get_logger().error('重试倒车超时 — MOTION_FAILED')
+                self._record_failure(
+                    f'重试倒车超时 {retry_timeout:.0f}s: 里程计不走 '
+                    f'(底盘卡死/失联), 不再重试',
+                    CODE_MOTION_STALLED)
                 self._transition_to(DockingState.MOTION_FAILED)
 
         elif state == DockingState.UNDOCKING:
             # 泊出超时保护: 里程计不走(底盘卡死/失联)会卡在 UNDOCKING,
-            # 直接落 MOTION_FAILED 终态。
+            # 直接落 MOTION_FAILED 终态。带上节点每 tick 记的 _undock_note,
+            # 区分"卡在桥门控没解开"和"指令发了但底盘不动"——
+            # 光一个 motion_failed 现场无从下手。
             undock_timeout = params.get('undock', {}).get('timeout_sec', 30.0)
             if self.state_elapsed_ns(now_ns) * 1e-9 > undock_timeout:
-                self._node.get_logger().error('泊出超时 — MOTION_FAILED')
-                self._transition_to(DockingState.MOTION_FAILED)
+                note = getattr(self._node, '_undock_note', '')
+                # 码同样由节点给: 它才知道这次是卡在门控 (motion_gated,
+                # 查桥别盲重试) 还是指令发了没走 (motion_stalled, 查底盘)。
+                # 两者的上层处置完全不同, 合成一个码等于没分。
+                code = getattr(self._node, '_undock_code', '') \
+                    or CODE_MOTION_STALLED
+                self.abort_motion(
+                    f'泊出超时 {undock_timeout:.0f}s'
+                    + (f' — {note}' if note else ''), code)
 
         elif state in _ERROR_STATES or state in _SUCCESS_STATES:
             pass  # terminal states
@@ -441,6 +543,10 @@ class DockingStateMachine:
         # Per-state timeout
         if self.state_elapsed_ns(now_ns) * 1e-9 > search_timeout:
             self._node.get_logger().error('搜索超时 — 未找到二维码')
+            self._record_failure(
+                f'搜索超时 {search_timeout:.0f}s 未找到二维码 —— '
+                f'检查 dock_tag_id / 光照 / tag.size, 或先把机器人导引进视野',
+                CODE_TAG_NOT_FOUND)
             self._transition_to(DockingState.TIMEOUT)
             return
 
@@ -510,6 +616,10 @@ class DockingStateMachine:
         # Timeout
         if self.state_elapsed_ns(now_ns) * 1e-9 > approach_timeout:
             self._node.get_logger().error('接近超时')
+            self._record_failure(
+                f'接近超时 {approach_timeout:.0f}s: 码看得见但走不到位 —— '
+                f'换个起始位姿重试',
+                CODE_VISION_NO_PROGRESS)
             self._transition_to(DockingState.TIMEOUT)
 
     def _eval_final_servo(self, tag_visible, tag_pose, now_ns,
@@ -579,8 +689,19 @@ class DockingStateMachine:
                     f'超时且位姿超差 (距离={error_dist:.3f}m '
                     f'横向={error_lat:.3f}m 航向={math.degrees(error_yaw):.1f}°) '
                     f'→ 重试')
-                self.fail()
+                self.fail(
+                    f'FINAL_SERVO 超时 {final_timeout:.0f}s 且位姿超差 '
+                    f'(距离={error_dist:.3f}m 容差={pos_tol:.3f}m '
+                    f'横向={error_lat:.3f}m '
+                    f'航向={math.degrees(error_yaw):.1f}° 容差={yaw_tol_deg:.0f}°)',
+                    CODE_VISION_NO_PROGRESS)
                 return
+            # 码也看不见了 —— 近场出画/丢码, 处置是退开重新引导, 与"修不动"
+            # 不是一件事, 故归 tag_not_found 而非 vision_no_progress。
+            self._record_failure(
+                f'FINAL_SERVO 超时 {final_timeout:.0f}s 且二维码不可见 '
+                f'(近场出画/丢码) —— 退开重新引导进视野',
+                CODE_TAG_NOT_FOUND)
             self._transition_to(DockingState.TIMEOUT)
 
     # ── Internal ────────────────────────────────────────────────────
@@ -591,6 +712,18 @@ class DockingStateMachine:
         old = self._state
         self._state = new_state
         self._state_start_ns = self._node.get_clock().now().nanoseconds
+
+        # 进错误终态必须有记账 —— 否则上层收到的是个光秃秃的状态名, 与这次
+        # 改动要解决的问题原封不动。漏了就自己喊出来 (以后新增失败路径忘记
+        # 传 code 会在这里现形, 而不是静默给上层一个空原因)。
+        if new_state in _ERROR_STATES and not self._abort_code:
+            self._abort_code = CODE_UNSPECIFIED
+            if not self._abort_reason:
+                self._abort_reason = f'{new_state.name} (失败路径未记账)'
+            self._node.get_logger().warn(
+                f'未记账的失败路径: {old.name} → {new_state.name} —— '
+                f'该处应调 abort_motion(reason, code=...) 或 _record_failure(), '
+                f'请给它补一个 FAILURE_CODES 里的码')
 
         # Reset per-state tracking
         self._search_tag_hold_start_ns = 0

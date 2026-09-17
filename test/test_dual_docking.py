@@ -263,6 +263,34 @@ def test_feedback_failure_names_which_criterion_fired_and_shows_the_trail():
     assert feed_corrections(controller(), [.9, .6, .3, .1]) == ''
 
 
+def test_window_watchdog_spares_an_already_aligned_pose():
+    """看门狗不杀已对准的位姿 —— 2026-09-17 现场: 三步修正净改善 -0.44 判死
+    时, 位姿其实已过 aligned() 全部门槛 (bearing -2.26/-2.58°, theta +2.00°,
+    e +8mm, 全在 3°/20mm 内), 09-11 现场的同款结论"此时直行即可"。豁免必须
+    盖住两条支路: 连败支路排在窗口之前, 不放进豁免的话"每步都坏但落点已
+    对准"照样被判死。放行后窗口复位重新武装; 位姿一旦不对准, 原判据原样
+    生效。"""
+    c = controller()
+    warns = []
+    c._node.get_logger = lambda: SimpleNamespace(
+        info=lambda *a, **kw: None, error=lambda *a, **kw: None,
+        warn=lambda *a, **kw: warns.append(a[0]))
+    frames(c, depth=1.8)                 # x=0: 两码 bearing/theta/e 全在门槛内
+    assert c.aligned(c.wall, c.pile)
+    # 窗口支路: 3 步净改善 -1.0 (最后一步单步是好的), 本应判死 → 放行 + 复位
+    assert feed_corrections(c, [1.0, 1.7, 2.4, 2.0]) == ''
+    assert c.feedback_anchor == 2.0 and c.feedback_count == 0
+    # 连败支路: 接着每步都坏, bad 计数到 3, 本应判死 → 同样放行
+    assert feed_corrections(c, [2.0, 2.5, 3.0, 3.5]) == ''
+    assert len(warns) == 2, f'每次豁免都要留一句自述日志, 实际 {warns}'
+    assert '放行' in warns[0] and '对准' in warns[0], '豁免串要自带证据'
+    # 位姿一旦不对准, 原判据原样生效 (最后一步好 → 走窗口支路)
+    frames(c, x=.12, pile_x=-.12, start=13.)
+    assert not c.aligned(c.wall, c.pile)
+    why = feed_corrections(c, [3.5, 4.2, 4.9, 4.0])
+    assert '窗口判据' in why and '连败判据' not in why
+
+
 # ── 墙码丢失取证 ─────────────────────────────────────────────────────
 
 def test_wall_loss_evidence_does_not_confuse_pair_frames_with_wall_frames():
