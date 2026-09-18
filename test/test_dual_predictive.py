@@ -7,7 +7,7 @@ import pytest
 from tagdocking.dual_docking import predict, geometry, DualTagDocking
 from tagdocking.dual_camera import CameraModel
 from tagdocking.dual_feedback import ActionWatch
-from tagdocking.geometry_planner import ActionPlan
+from tagdocking.action_executor import ActionPlan
 from test_dual_docking import Node, controller, frames, plan
 
 

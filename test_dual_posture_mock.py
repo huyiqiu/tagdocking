@@ -27,7 +27,7 @@ import yaml
 from tagdocking.dual_docking import DEFAULTS, DualTagDocking
 from tagdocking.dual_feedback import ActionWatch
 from tagdocking.charge_mode import ChargeMode
-from tagdocking.geometry_planner import ActionPlan
+from tagdocking.action_executor import ActionPlan
 from tagdocking.state_machine import (DockingStateMachine, DockingState,
                                       FAILURE_CODES, CODE_MOTION_GATED,
                                       CODE_MOTION_STALLED)

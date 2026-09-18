@@ -13,7 +13,7 @@ from tagdocking.state_machine import (
     CODE_UNSPECIFIED)
 from tagdocking.utils import TagPose
 from tagdocking.action_executor import HeadingHold
-from tagdocking.geometry_planner import ActionPlan as RealActionPlan
+from tagdocking.action_executor import ActionPlan as RealActionPlan
 from test_dual_docking import Node, controller, frames, plan
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -217,8 +217,7 @@ def intake():
     n._sm = NS(state=DockingState.APPROACH)
     n._p = lambda name: {'tag.id': 0, 'tag.frame': 'wall',
         'camera_frame': 'optical', 'base.type': 'omni',
-        'dock_target.lateral_offset': 0., 'dock_target.yaw_offset_deg': 0.,
-        'tag.fresh_timeout_sec': 2.0}[name]
+        'dock_target.lateral_offset': 0., 'dock_target.yaw_offset_deg': 0.}[name]
     n.now = int(20e9)
     n.get_clock = lambda: NS(now=lambda: NS(nanoseconds=n.now))
     n.logs, n.queries, n.events = [], [], []
@@ -306,17 +305,6 @@ def test_dual_freshness_real_pose_buffer(intake, age, valid):
     assert (pose is not None) == valid
     if pose:
         assert pose.stamp_ns == stamp
-
-
-def test_single_pose_latency_unchanged(intake):
-    n = intake
-    n._dual.enabled = False
-    n._last_detection_ns = n.now
-    n._pose_buffer.add(TagPose(1., 0., 0., n.now, 0.))
-    n.now += 200_000_000
-    assert n._tag_fresh()  # Original independent single-tag freshness rule.
-    assert n._get_latest_pose() is None
-    assert n._pose_buffer.max_latency_ns == 150_000_000
 
 
 def test_wait_does_not_invalidate_accepted_pose_and_expiry_does(intake):
@@ -517,7 +505,7 @@ def test_dual_fixed_key_log_suppression_and_stage_change():
 @pytest.mark.parametrize('busy', [True,False])
 def test_executor_rejected_start_does_not_commit_qualification(busy):
     import math
-    from tagdocking.geometry_planner import ActionPlan
+    from tagdocking.action_executor import ActionPlan
     cls = method_class('docking_node.py','DockingNode',{'math':math})
     n = cls.__new__(cls)
     n._dual = controller()
@@ -552,7 +540,7 @@ def test_actual_camera_callback_validates_and_caches_original_stamp():
 
 def prealign_node(**params):
     """真实 _dual_prealign 方法体 + 假 transport; 不启动节点、不调服务。"""
-    from tagdocking.geometry_planner import ActionPlan
+    from tagdocking.action_executor import ActionPlan
     env = {'math': __import__('math')}
     cls = method_class('docking_node.py', 'DockingNode', env)
     env['ActionPlan'] = ActionPlan          # method_class 默认把它桩成 object

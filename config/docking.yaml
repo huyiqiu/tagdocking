@@ -1,39 +1,15 @@
 docking_node:
   ros__parameters:
-    # ── Camera / Timing ──
-    # 自适应位姿时效窗口: 实际取 max(max_latency_ms, 实测检测间隔 × latency_interval_margin)。
-    # 程序自动适应相机真实帧率 (6Hz→窗口~500ms, 30Hz→窗口~100ms 但受下限保护),
-    # 走停模式下 6Hz 足够, 无需追求 30fps。
-    camera.max_latency_ms: 150                # ms — 时效窗口下限 (高帧率时生效)
-    camera.latency_interval_margin: 3.0       # 窗口 = 检测间隔 × 此值 (容忍 ~2 帧丢失)
-    camera.expected_fps: 30
-    # 相机光学中心相对底盘中心线的横向偏移 (+y, + = 相机偏左), 用于补偿
-    # base→camera 静态 TF 的 mount.y 未含此偏移的情况: 不补的话量测 lat 会
-    # 系统性偏小该值 → 节点认为"正对"时底盘中心实际在 tag 法线右该值处,
-    # 停泊偏右、左腿撞桩。此值加回 raw_lat 后规划器在直行前触发横移修正
-    # (量测驱动每停重测, 非一次性盲移 —— 盲移在 SEARCH 抖动重入会叠加)。
-    #
-    # 当前相机 (odin1 RTSP) 光心与底盘中心线齐平, 故为 0。3cm 那个值是为
-    # **上一个相机**配的, 留在这里等于凭空注入一条假横偏 (raw_lat 被加大
-    # 3cm → 节点以为底盘偏左 → 持续往右修 → 停泊系统性偏右 3cm)。
-    # 换装偏心相机时按实测填。
-    # 作用域: 只在单码路径生效 (_lookup_tag_pose 里 raw_lat 的唯一赋值点),
-    # 双码路径完全不经过它。
-    camera.lateral_offset_m: 0.0
-
     # ── Tag Identification ──
     tag.family: "36h11"
     tag.size: 0.15                            # m — tag edge length
     tag.frame: "tag36h11:0"                   # TF frame name
     tag.id: 0                                 # tag ID to dock to
-    tag.fresh_timeout_sec: 2.0                # tag considered stale after N seconds (6fps + 转向盲区, 放宽避免误判 TAG_LOST)
-    tag.tag_loss_timeout_sec: 2.5             # s — 接近中连续丢 tag 超此时长才回 SEARCH_TAG (检测流实测有 1.6~3s 空档, 1s 必抖动)
-                                              #   仅单码路径退回 SEARCH_TAG; 双码路径到此直落 MOTION_FAILED, 不搜索不重试。
+    tag.tag_loss_timeout_sec: 2.5             # s — 接近中连续丢墙码超此时长才判失败 (检测流实测有 1.6~3s 空档, 1s 必抖动)
+                                              #   到时直落 MOTION_FAILED, 不搜索不重试。
                                               #   且预算会被 dual.settle_sec(1.5s) 停稳窗结构性吃掉一截 (窗内每帧按设计拒收,
                                               #   计数器却照涨), 2.5s 实测只剩 ~0.93s 真实宽限 —— 比上面那个 1.6~3s 空档还短。
                                               #   失败串会把这笔账算出来 (见「墙码丢失 — 外层丢码看门狗预算耗尽」)。
-    tag.ema_alpha: 0.5                        # EMA smoothing factor (0=heavier, 1=raw)
-    tag.max_pose_jump_m: 0.3                  # reject single-frame jumps > N meters
 
     # ── TF Frames ──
     camera_frame: "camera_color_optical_frame"
@@ -75,11 +51,7 @@ docking_node:
     charge.service_wait_sec: 1.0              # s — 无桥宽限, 超时降级告警 (DOCKED 仍为成功)
 
     # ── Stop-and-Go Parameters ──
-    stopgo.lateral_threshold: 0.05           # m — 左右横偏容许 ±5cm, 超过才转向对准
-    stopgo.yaw_threshold_deg: 10.0           # deg — 角度容许 ±10°, 超过才转向
-    stopgo.tune_angle: 0.0                   # rad — oblique correction (diff-drive), 0=disabled
-    stopgo.jog_min: 0.05                     # m — minimum jog distance per step
-    stopgo.jog_max: 0.20                     # m — maximum jog distance per step (运行期可调: launch 传 jog_max:=0.4 或 ros2 param set <节点> stopgo.jog_max; 0.15 太碎: 每次起停切换 4~6s 开销; 步长放大依赖 odom_scale 准确, VIO 下标定为 1.0)
+    stopgo.yaw_threshold_deg: 10.0           # deg — ActionExecutor ctor 转向门槛
     stopgo.jog_linear_rate: 0.08             # m/s — constant speed during forward jog
     stopgo.jog_angular_rate: 0.3             # rad/s — constant speed during turn
     # 必须 > l1w_control 的 min_angular_z 死区 (0.10), 同 lateral_rate 的道理。
@@ -202,7 +174,7 @@ docking_node:
     final_straight.far_yaw_threshold_deg: 15.0        # deg — 远场粗对准方位门槛: dist > tighten_distance 时方位 ≤ 此值即前进, 不做微调/横移 (远场 normal 不可靠不宜微调)
     final_straight.far_lateral_m: 0.20                # m — 远场粗对准横向门槛: dist > tighten_distance 时 |lat| ≤ 此值即前进; 远场只要求大方向对, 不消横向偏 (走到近场再说)
 
-    # ── Dual optical stop/look docking (single-tag parameters above unchanged) ──
+    # ── Dual optical stop/look docking ──
     # All distances below are optical z (not base x or Euclidean range).
     # Standing-only flow: 1.8m standoff -> dual corrections after every jog
     # -> qualified near pile loss -> heading locked -> straight run with
@@ -232,8 +204,7 @@ docking_node:
     # (reverse_step 早就调到 0.10 却从未生效); 硬上限已拆除, 现在真正生效。
     # 10cm: 1.8→0.5m 的 1.3m 由 26 步减半到 13 步 (每步起停+停稳+重测 ~2.9s,
     # 开销远大于位移本身)。精度不变 —— 终点步仍按剩余距离收缩, dock_tolerance
-    # 仍是 0.02。可见性由 visible() 逐段采样保护 (jog_max 只闸单码规划器,
-    # 对双码无 clamp, 双码真实上限就是本参数)。
+    # 仍是 0.02。可见性由 visible() 逐段采样保护, 双码真实上限就是本参数。
     # 后退预算按距离守, 不按步数: reverse_limit 0.80m 不变 → 16 步自然降为
     # 8 步 (reverse_count 退化为不起作用的天花板), 站位账 1.00m → 10 步。
     dual.forward_step: 0.10
@@ -366,13 +337,8 @@ docking_node:
     # 现场 3° 转向曾在起步 108ms 被判 opposite direction 而中止, 即此瞬态。
     dual.action_startup_sec: 0.6                # s — 起步瞬态宽限, 期间不判反向
 
-    # ── Docking Tolerance (单码遗留, 仅剩声明; 随单码路径一并删除) ──
-    tolerance.position_m: 0.05                # m — 前后 ±5cm 视为到位
-    tolerance.yaw_deg: 10.0                   # degrees — ±10° 视为对准
-
-    # 静止站立使每个停看点多花 ~1.5-2.5s (锁定+settle+稳定帧+解锁), 一次接近
-    # 10-15 停 → +20-40s, 超时相应上调 (120→180); 双码站立流程 (1.8m 站位后退
-    # + 1.3m 直行 ≈ 26 步 × ~2.9s) 再上调 (180→300)。
+    # 双码站立流程 (1.8m 站位后退 + 1.3m 直行 ≈ 26 步 × ~2.9s) 远超 120s 的
+    # 旧值, 上调到 300。
     timeout_sec: 300.0                        # overall docking timeout
 
     # ── Undock (泊出) ──

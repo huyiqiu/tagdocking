@@ -336,7 +336,7 @@ def _exit_scene(pile_x=0.015, pile_y=1.35):
     y=1.35 → 桩码底边 B=7px (<required 10px), 左右边 784px 宽裕;
     px=0.015 → e=-30mm (严格门外, 放行容差内), bearing/theta 0.95° 均合格。
     """
-    from tagdocking.geometry_planner import ActionPlan
+    from tagdocking.action_executor import ActionPlan
     c = controller()
     c.stage = 'approach'
     c.wall, c.pile = (0.0, -0.2, 1.8), (pile_x, pile_y, 0.9)

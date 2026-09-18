@@ -7,7 +7,7 @@ The historical parallax solver is retained below for offline compatibility.
 import math
 from dataclasses import replace
 
-from .geometry_planner import ActionPlan
+from .action_executor import ActionPlan
 
 
 DEFAULTS = {
@@ -23,11 +23,8 @@ DEFAULTS = {
     # ~2.9s ≈ 75s, 开销远大于位移本身; 10cm 减半到 13 步。
     # 精度不受影响: 终点步仍按 remaining 收缩 (见 _advance), dock_tolerance 不变。
     # 放大步长不牺牲可见性: visible() 逐段采样整条轨迹 (_emit 对一切计划
-    # 过这把尺), 会否掉把 tag 甩出视野的大步。曾写"stopgo.jog_max (0.20)
-    # 是执行器侧的硬闸" —— 错: jog_max 的 clamp 全部在单码 GeometryPlanner
-    # (geometry_planner.py 的 plan/plan_sequence/plan_straight), 执行器
-    # start_jog 对任何距离都不钳制, 双码从来不受它管。双码真实上限就是
-    # 本参数 (区外) 与纯直行区的"一次走完"。
+    # 过这把尺), 会否掉把 tag 甩出视野的大步。双码真实上限就是本参数
+    # (区外) 与纯直行区的"一次走完"。
     # 后退预算按距离而非步数守: reverse_limit 0.80m 不变, 步数自然从 16 掉到
     # 8 (reverse_count 退化为不起作用的天花板), 站位账 1.00m → 10 步。
     # 横移步长是同一个病的第三处: 候选枚举里写死 min(.03, lateral_step), 于是

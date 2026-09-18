@@ -324,7 +324,7 @@ class DockingStateMachine:
 
         Args:
             tag_pose: Latest valid TagPose from pose buffer, or None.
-            tag_visible: True if tag is fresh (within tag_fresh_timeout_sec).
+            tag_visible: True if tag is fresh (dual.fresh_sec 时效窗内).
             motion_stalled: True if motion stalled (handled by action_executor now).
             now_ns: Current ROS time in nanoseconds.
             params: Dict of all relevant parameters (see _get_params_keys).

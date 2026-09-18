@@ -52,10 +52,9 @@ from std_srvs.srv import Trigger
 from apriltag_msgs.msg import AprilTagDetectionArray
 import tf2_ros
 
-from .utils import TagPose, yaw_from_quat, normalize_angle, tag_normal_angle
+from .utils import TagPose, yaw_from_quat, normalize_angle
 from .pose_buffer import PoseBuffer
-from .geometry_planner import GeometryPlanner, ActionPlan
-from .action_executor import ActionExecutor, HeadingHold
+from .action_executor import ActionExecutor, HeadingHold, ActionPlan
 from .state_machine import (DockingStateMachine, DockingState,
                             CODE_TAG_NOT_FOUND, CODE_VISION_NO_PROGRESS,
                             CODE_MOTION_GATED, CODE_MOTION_STALLED)
@@ -87,14 +86,15 @@ class DockingNode(Node):
         self._tf_spin = threading.Thread(target=self._spin_tf_receiver, daemon=True)
         self._tf_spin.start()
 
+        # 双二维码对准管理器: 仅依赖参数, 先于 PoseBuffer 创建 (时效窗取
+        # dual.fresh_sec)。
+        self._dual = DualTagDocking(self)
+
         # ── Pose buffer ───────────────────────────────────────────
         self._pose_buffer = PoseBuffer(
             max_size=self._p('pose_buffer.size'),
-            max_latency_ns=int(self._p('camera.max_latency_ms') * 1_000_000))
+            max_latency_ns=int(self._dual.p('fresh_sec') * 1_000_000))
 
-        # 双二维码对准管理器: 仅依赖参数, 必须先于规划器创建以提供目标距离。
-        # dual.enable=false 时全程旁路, 行为同单码方案。
-        self._dual = DualTagDocking(self)
         # FIFO, not a latest-only slot: delayed TF must get a chance to arrive.
         self._dual_pending = []
         self._dual_received_ns = 0
@@ -106,9 +106,9 @@ class DockingNode(Node):
         self._dual_reject_count = {}
         self._dual_info = {}
         self._dual_watch = None
-        # 连续"过期"帧的起点与最大观测延迟: 双码用固定 dual.fresh_sec 时效窗
-        # (不走单码的自适应窗), 链路延迟一旦长期超窗, 每帧都被静默丢弃, 外层
-        # 只看到"从未见过 tag"而一直转圈搜索。攒够一段时间就明确报错。
+        # 连续"过期"帧的起点与最大观测延迟: 双码用固定 dual.fresh_sec 时效窗,
+        # 链路延迟一旦长期超窗, 每帧都被静默丢弃, 外层只看到"从未见过 tag"而
+        # 一直转圈搜索。攒够一段时间就明确报错。
         self._dual_expired_since_ns = 0
         self._dual_expired_worst_ms = 0.0
         # 趴下前的单码粗对准 (见 _dual_prealign): 双码枚举的步长上限只有几度,
@@ -116,18 +116,6 @@ class DockingNode(Node):
         self._dual_prealigned = False
         self._dual_prealign_steps = 0
         self._dual_prealign_active = False
-
-        # ── Geometry planner (normal-line alignment) ──────────────
-        self._planner = GeometryPlanner(
-            target_distance=self._dual.effective_dock_distance(),
-            lateral_threshold=self._p('stopgo.lateral_threshold'),
-            yaw_threshold=math.radians(self._p('stopgo.yaw_threshold_deg')),
-            tune_angle=self._p('stopgo.tune_angle'),
-            jog_min=self._p('stopgo.jog_min'),
-            jog_max=self._p('stopgo.jog_max'),
-            position_tol=self._p('tolerance.position_m'),
-            base_type=self._p('base.type'),
-        )
 
         # ── Action executor (odometry dead-reckoning) ─────────────
         self._executor = ActionExecutor(
@@ -161,24 +149,10 @@ class DockingNode(Node):
         self._dock_tag_id = 0
         self._camera_frame = ''
 
-        # Filtered pose
-        self._filtered_dist: float | None = None
-        self._filtered_lat: float | None = None
-        self._filtered_yaw: float | None = None
-        self._filtered_normal: float | None = None
-        self._normal_sin = 0.0
-        self._normal_cos = 0.0
-        self._filter_init = False
-        self._ema_alpha = 0.5
-        self._max_pose_jump_m = 0.3
-        self._jump_reject_count = 0
-        self._max_jump_rejections = 10
-
-        # Latest raw values
+        # Latest raw wall-tag values (dual 路径在墙码被采纳时写入, 供
+        # executor.update 的视觉早停与状态发布消费)。
         self._raw_dist: float | None = None
         self._raw_lat: float | None = None
-        self._raw_yaw: float | None = None
-        self._raw_normal: float | None = None
         self._last_detection_ns = 0
         self._tf_fail_count = 0
         self._det_msg_count = 0         # /detections 消息总数 (搜索停留日志诊断: 检测流是否活着)
@@ -199,22 +173,10 @@ class DockingNode(Node):
         # incremental aim-and-go that lost the tag at the FOV edge.
         self._maneuver_queue: list = []
         self._maneuver_active = False
-        self._maneuver_iters = 0
-        # 直行入口检查锁存：首次跨入直行距离的停看点判一次方位门槛，
-        # 直行途中每停复测不再判（bearing=atan2(lat,dist) 随 dist 缩小自然
-        # 变大, 复判会把入口合格的进入在中途误杀成后退重试）。dist 退出
-        # 直行区（重试倒车/搜索后）重新武装。_reset_maneuver 时清零。
-        self._straight_entered = False
         # 检测冻结标志：机动（盲转/盲走）期间为 True，此时 _on_detections 直接
         # 丢弃所有帧（运动模糊、视野边缘的坏帧绝不能污染规划用的位姿）。停稳
         # settle 结束后解冻，并清空滤波/缓冲，强制下一次规划只用停稳后的新鲜帧。
         self._frozen = False
-        # Each iteration advances at most jog_max (stopgo.jog_max, runtime-tunable)
-        # so covering a metre-plus approach plus refinement turns needs a
-        # generous ceiling. This is only a runaway backstop — normal docking
-        # converges (drive shrinks, no more clamping) well before it. APPROACH's
-        # own timeout bounds wall-clock independently.
-        self._max_maneuver_iters = 40
 
         # ── Undock (泊出) sub-phase ──────────────────────────────────
         # 0 = 盲退 undock.backup_distance, 1 = 原地转 180°, 2 = 完成。
@@ -235,15 +197,6 @@ class DockingNode(Node):
         self._search_step = 0
         self._search_detect_start = 0
         self._search_direction = 1.0
-
-        # Adaptive detection-rate tracking. The pose-buffer staleness window is
-        # derived from the measured inter-detection interval, so the controller
-        # self-tunes to whatever rate the camera actually delivers (6 Hz or
-        # 30 Hz). In stop-and-go 6 Hz is plenty; we just must not discard a
-        # pose as "stale" faster than a new one can arrive.
-        self._det_interval_ns: float | None = None   # EMA of gaps between detections
-        self._latency_floor_ns = int(self._p('camera.max_latency_ms') * 1_000_000)
-        self._latency_margin = self._p('camera.latency_interval_margin')
 
         # Odometry (updated in callback)
         self._odom_x = 0.0
@@ -280,28 +233,12 @@ class DockingNode(Node):
 
     def _declare_params(self):
         """Declare all ROS2 parameters with defaults."""
-        # Camera / timing
-        self.declare_parameter('camera.max_latency_ms', 200)
-        self.declare_parameter('camera.expected_fps', 30)
-        # Adaptive staleness: window = measured detection interval × this margin,
-        # clamped to be at least max_latency_ms. Tolerates a few dropped frames.
-        self.declare_parameter('camera.latency_interval_margin', 3.0)
-        # 相机安装横向偏移补偿: 相机光学中心装在底盘中心线左 lateral_offset_m 处
-        # (+y, + = 相机偏左), base→camera 静态 TF 的 mount.y 未含此偏移 → 量测 lat
-        # 系统性偏小该值 → 节点认为"正对"时底盘中心实际在 tag 法线右该值处, 停泊
-        # 整体偏右、左腿撞桩。加回后 raw_lat 反映真实横向, 规划器据此左移修正。
-        # 必须量测驱动每停重测, 不能一次性盲移(SEARCH 抖动重入会叠加)。
-        self.declare_parameter('camera.lateral_offset_m', 0.0)
-
         # Tag
         self.declare_parameter('tag.family', '36h11')
         self.declare_parameter('tag.size', 0.16)
         self.declare_parameter('tag.frame', 'tag36h11:0')
         self.declare_parameter('tag.id', 0)
-        self.declare_parameter('tag.fresh_timeout_sec', 1.0)
         self.declare_parameter('tag.tag_loss_timeout_sec', 2.5)
-        self.declare_parameter('tag.ema_alpha', 0.5)
-        self.declare_parameter('tag.max_pose_jump_m', 0.3)
 
         # TF
         self.declare_parameter('camera_frame', 'camera_color_optical_frame')
@@ -316,10 +253,6 @@ class DockingNode(Node):
         # Base
         self.declare_parameter('base.type', 'diff_drive')
         self.declare_parameter('base.cmd_vel_topic', 'cmd_vel')
-
-        # Tolerance (单码遗留: GeometryPlanner ctor / Case 3 仍读, 随其一并删除)
-        self.declare_parameter('tolerance.position_m', 0.03)
-        self.declare_parameter('tolerance.yaw_deg', 3.0)
 
         self.declare_parameter('timeout_sec', 120.0)
 
@@ -378,7 +311,7 @@ class DockingNode(Node):
         self.declare_parameter('final_straight.far_lateral_m', 0.20)
         # 近场横移修正 / 捷径的横向门槛 (比入口 entry_lateral_m 更紧): 量测补偿
         # 加回 3cm 偏置后, 近场横移修正需在直行前把真实横向压到此值内, 否则左腿
-        # 仍会撞桩。0.02 < 阶段1 stopgo.lateral_threshold(0.05), 保证规划器会滑。
+        # 仍会撞桩。
         self.declare_parameter('final_straight.lateral_threshold_m', 0.02)
 
         # ── Dual-tag docking (双二维码对准, 默认关闭) ────────────────
@@ -409,11 +342,7 @@ class DockingNode(Node):
         self.declare_parameter('dual.pile_fresh_timeout_sec', 2.0)
 
         # Stop-and-go params
-        self.declare_parameter('stopgo.lateral_threshold', 0.04)
         self.declare_parameter('stopgo.yaw_threshold_deg', 3.0)
-        self.declare_parameter('stopgo.tune_angle', 0.0)
-        self.declare_parameter('stopgo.jog_min', 0.05)
-        self.declare_parameter('stopgo.jog_max', 0.50)
         self.declare_parameter('stopgo.jog_linear_rate', 0.08)
         self.declare_parameter('stopgo.jog_angular_rate', 0.3)
         # 转向角速度下限 — 必须 > l1w_control 的 min_angular_z 死区 (0.10)。
@@ -556,32 +485,14 @@ class DockingNode(Node):
 
     def _on_detections(self, msg: AprilTagDetectionArray):
         """Store detection timestamps; actual TF query happens in control loop."""
-        # 计数无条件递增 (冻结/终态早退之前): 停留日志用它区分"检测流断了"
+        # 计数无条件递增 (冻结早退之前): 停留日志用它区分"检测流断了"
         # 和"tag 不在视野" —— 前者计数不涨, 后者只有有效检测归零。
         self._det_msg_count += 1
         # 机动期间冻结检测：盲转/盲走过程中相机帧运动模糊、二维码常在视野边缘，
-        # 这些坏帧一律丢弃，绝不更新 _filtered_*、_pose_buffer 或 _last_detection_ns。
+        # 这些坏帧一律丢弃，绝不更新 _pose_buffer 或 _last_detection_ns。
         # 规划器因此只会读到小车停稳后新采的帧。
         if self._dual.enabled:
             self._on_dual_detections(msg)
-            return
-        if self._frozen:
-            return
-
-        state = self._sm.state
-        if state in (DockingState.DOCKED, DockingState.TIMEOUT,
-                     DockingState.MOTION_FAILED, DockingState.CANCELLED):
-            return
-
-        dock_id = int(self._p('tag.id'))
-        tag_frame = self._p('tag.frame')
-
-        for det in msg.detections:
-            if det.id == dock_id:
-                self._tag_frame = tag_frame
-                self._dock_tag_id = dock_id
-                self._lookup_tag_pose()
-                break
 
     def _on_odom(self, msg: Odometry):
         self._odom_x = msg.pose.pose.position.x
@@ -589,125 +500,6 @@ class DockingNode(Node):
         self._odom_yaw = yaw_from_quat(msg.pose.pose.orientation)
         self._has_odom = True
         self._odom_stamp_ns = msg.header.stamp.sec*1000000000+msg.header.stamp.nanosec
-
-    # ── TF tag pose lookup ─────────────────────────────────────────
-
-    def _lookup_tag_pose(self):
-        """Query TF for tag pose in base_link frame.
-
-        Converts from camera optical frame (z-forward, x-right) to
-        base_link convention (x-forward, y-left, REP-103).
-
-        Results are EMA-filtered and stored in self._raw_* and self._filtered_*.
-        """
-        base_frame = self._p('base_frame')
-        measure_frame = self._p('measure_frame')
-
-        src_frame = measure_frame if measure_frame else base_frame
-
-        if not self._tag_frame:
-            return False
-
-        try:
-            t = self._tf_buffer.lookup_transform(
-                src_frame, self._tag_frame,
-                rclpy.time.Time(seconds=0),
-                rclpy.duration.Duration(seconds=0))
-            # timeout=0: 非阻塞查最新值。TF 接收在专用线程持续供数, buffer
-            # 里已有即秒回; 控制循环回调里绝不能忙等 (会把执行器占死)。
-        except (tf2_ros.LookupException, tf2_ros.ConnectivityException,
-                tf2_ros.ExtrapolationException):
-            self._tf_fail_count += 1
-            return False
-
-        self._tf_fail_count = 0
-
-        # TF 查询 src_frame→tag 的结果已经是 src_frame 坐标系的表示。
-        # base_link 遵循 REP-103: x=前, y=左, z=上。
-        # 直接取 x 为距离, y 为横向，不需要做光学坐标系转换。
-        raw_dist = t.transform.translation.x
-        raw_lat = t.transform.translation.y
-        # 相机安装横向偏移补偿: camera.lateral_offset_m = +0.03 表示相机偏底盘
-        # 中心线左 3cm (base_link 的 +y), 静态 TF mount.y 未含此偏移 → raw_lat
-        # 系统性偏小 0.03m → 加回后 lat 反映底盘中心到 tag 法线的真实横向, 规划器
-        # 据此在直行前触发左移修正 (而非盲移 3cm, 盲移在 SEARCH 抖动重入会叠加)。
-        raw_lat += float(self._p('camera.lateral_offset_m'))
-
-        # Tag yaw = 方位角 (bearing): 机器人需要转多少弧度才能正对 Tag。
-        # atan2(lat, dist) 是 tag 在机器人坐标系中的方向角，正=左边。
-        tag_yaw_raw = math.atan2(raw_lat, raw_dist) if raw_dist > 0.001 else 0.0
-
-        # Tag OUTWARD-NORMAL direction (rad, base_link ground plane). Needed for
-        # the turn-drive-turn maneuver: the robot must reach the tag's normal
-        # line and face the tag squarely, which requires the tag's orientation,
-        # not just the bearing. Self-corrects the solvePnP flip ambiguity.
-        tag_normal_raw = tag_normal_angle(t.transform.rotation, raw_dist, raw_lat)
-
-        # Jump rejection
-        if self._filter_init:
-            jump_d = abs(raw_dist - self._filtered_dist) > self._max_pose_jump_m
-            jump_l = abs(raw_lat - self._filtered_lat) > self._max_pose_jump_m
-            if jump_d or jump_l:
-                self._jump_reject_count += 1
-                if self._jump_reject_count >= self._max_jump_rejections:
-                    self._filtered_dist = raw_dist
-                    self._filtered_lat = raw_lat
-                    self._jump_reject_count = 0
-                return False
-            else:
-                self._jump_reject_count = 0
-
-        # EMA filtering
-        alpha = self._ema_alpha
-        if self._filter_init:
-            self._filtered_dist = alpha * raw_dist + (1.0 - alpha) * self._filtered_dist
-            self._filtered_lat = alpha * raw_lat + (1.0 - alpha) * self._filtered_lat
-            self._filtered_yaw = alpha * tag_yaw_raw + (1.0 - alpha) * self._filtered_yaw
-            # Circular EMA for the normal (wraps at ±pi): filter the sin/cos.
-            self._normal_sin = alpha * math.sin(tag_normal_raw) + (1.0 - alpha) * self._normal_sin
-            self._normal_cos = alpha * math.cos(tag_normal_raw) + (1.0 - alpha) * self._normal_cos
-            self._filtered_normal = math.atan2(self._normal_sin, self._normal_cos)
-        else:
-            self._filtered_dist = raw_dist
-            self._filtered_lat = raw_lat
-            self._filtered_yaw = tag_yaw_raw
-            self._normal_sin = math.sin(tag_normal_raw)
-            self._normal_cos = math.cos(tag_normal_raw)
-            self._filtered_normal = tag_normal_raw
-            self._filter_init = True
-
-        self._raw_dist = raw_dist
-        self._raw_lat = raw_lat
-        self._raw_yaw = tag_yaw_raw
-        self._raw_normal = tag_normal_raw
-
-        now_ns = self.get_clock().now().nanoseconds
-        # Track the inter-detection interval and adapt the staleness window.
-        if self._last_detection_ns != 0:
-            gap = now_ns - self._last_detection_ns
-            # Ignore huge gaps (tag was out of view): they are not the frame
-            # rate, only genuine consecutive detections estimate the cadence.
-            if 0 < gap < 2_000_000_000:  # < 2s
-                if self._det_interval_ns is None:
-                    self._det_interval_ns = float(gap)
-                else:
-                    self._det_interval_ns = 0.3 * gap + 0.7 * self._det_interval_ns
-                # Window = a few detection intervals, never below the floor,
-                # so one dropped frame at low rate does not orphan the buffer.
-                adaptive = self._det_interval_ns * self._latency_margin
-                self._pose_buffer.set_max_latency_ns(
-                    max(self._latency_floor_ns, int(adaptive)))
-        self._last_detection_ns = now_ns
-
-        stamp = self._last_detection_ns
-        pose = TagPose(dist=self._filtered_dist, lat=self._filtered_lat,
-                       yaw=self._filtered_yaw, normal=self._filtered_normal,
-                       stamp_ns=stamp)
-        self._pose_buffer.add(pose)
-        # Remember the side the tag was last seen on, to bias recovery search.
-        if abs(self._filtered_lat) > 1e-3:
-            self._last_seen_lat = self._filtered_lat
-        return True
 
     def _spin_tf_receiver(self):
         """TF 接收线程: 退出/关闭时的异常就地吞掉。
@@ -1065,15 +857,9 @@ class DockingNode(Node):
                 self._dual_diagnostic('rejected observation', stamp, now)
 
     def _tag_fresh(self) -> bool:
-        """Check if tag detection is within freshness window."""
-        if self._dual.enabled:
-            return self._dual.fresh(self.get_clock().now().nanoseconds,
-                                    self._last_detection_ns)
-        if self._last_detection_ns == 0:
-            return False
-        timeout_ns = int(self._p('tag.fresh_timeout_sec') * 1e9)
-        now_ns = self.get_clock().now().nanoseconds
-        return (now_ns - self._last_detection_ns) < timeout_ns
+        """检测是否新鲜 (双码: dual.fresh_sec 时效窗)。"""
+        return self._dual.fresh(self.get_clock().now().nanoseconds,
+                                self._last_detection_ns)
 
     def _get_latest_pose(self):
         """Get latest valid pose from buffer (with latency check)."""
@@ -1152,7 +938,6 @@ class DockingNode(Node):
         stopgo_states = (DockingState.APPROACH,)
         if (self._prev_state in stopgo_states and state not in stopgo_states):
             self._executor.cancel()
-            self._planner.reset()
             self._reset_maneuver()
         # 出 UNDOCKING: 终止可能还在跑的盲退/盲转, 清掉 _frozen, 否则下一次
         # 停泊会带着冻结态启动、丢弃所有检测帧。
@@ -1343,7 +1128,8 @@ class DockingNode(Node):
             # 20.4°, 双码要 ~30 步 × 2.4s ≈ 70s, 顶着观测超时走。
             if not self._dual_prealign(tag_visible, tag_pose, base_type, now_ns):
                 return
-            seq = self._dual.plan_dual(tag_pose, base_type, self._planner, now_ns)
+            # (plan_dual 收 planner 参但从不触碰; GeometryPlanner 已删)
+            seq = self._dual.plan_dual(tag_pose, base_type, None, now_ns)
             if self._dual.failure:
                 self._executor.cancel()
                 self._sm.abort_motion(self._dual.failure,
@@ -1356,229 +1142,6 @@ class DockingNode(Node):
             elif seq:
                 self._pending_seq = list(seq)
                 self._launch_pending_seq(base_type, now_ns)
-            return
-
-        # ── Case 3: idle & settled — measure and plan a fresh sequence ─
-        if not tag_visible or tag_pose is None:
-            self._adapter.publish_stop()
-            self.get_logger().info(
-                f'走停：空闲停车（二维码可见={tag_visible}, '
-                f'位姿={"无" if tag_pose is None else "有"}）',
-                throttle_duration_sec=1.0)
-            return
-
-        if self._maneuver_iters >= self._max_maneuver_iters:
-            self.get_logger().warn(
-                f'走停：已达最大机动迭代次数（{self._max_maneuver_iters}），'
-                '停止；最后位姿已在可达范围内')
-            self._adapter.publish_stop()
-            return
-
-        yaw_tol = math.radians(self._p('tolerance.yaw_deg'))
-
-        # ── 两阶段停泊门控 ──────────────────────────────────────
-        # 阶段1(带角度修正)为默认：用 plan_sequence 转向对准+前进, 尽量对准。
-        # 阶段2(纯直行, 不修 yaw/横向)：dist ≤ start_distance 即无条件激活——
-        # 进入直行距离后像停车入库, 不再打方向(再往前已无空间调位姿)。
-        # 入口检查只在首次跨入直行距离的停看点判一次（入口包络）：方位误差超
-        # yaw_threshold_deg 或 |横向| 超 entry_lateral_m 都算对准过差、入库会
-        # 撞偏 → fail() 重试 —— 直行阶段不修横向, 入口横向误差会一路带到终点。
-        # 直行途中每停复测不判 —— bearing=atan2(lat,dist), lat 固定时随
-        # dist 缩小自然变大, 复判会把入口合格的进入在中途误杀成后退重试,
-        # 与"直行阶段不再调角、不后退重试"的语义矛盾。dist 退出直行区
-        # (重试倒车/搜索后) 重新武装, 下一次接近仍有入口门槛。
-        # start_distance ≤ target_distance 视为误配置, 静默回退单阶段。
-        straight_enabled = self._p('final_straight.enable')
-        straight_start = self._p('final_straight.start_distance')
-        straight_yaw_tol = math.radians(self._p('final_straight.yaw_threshold_deg'))
-        entry_lat_tol = float(self._p('final_straight.entry_lateral_m'))
-        # 近场横移修正 / 捷径门槛 (比入口 entry_lat_tol 更紧, 默认 0.02): 量测
-        # 补偿加回相机 3cm 偏置后, 入口 0.03 的横向容差会让真实 0.03m 偏移被捷径
-        # 放行直行、左腿撞桩 —— 近场修正与捷径改用此更紧值, 入口检查仍用宽值。
-        lat_threshold_m = float(self._p('final_straight.lateral_threshold_m'))
-        two_phase = straight_enabled and straight_start > target_distance
-        # 近场收紧边界: dist ≤ 此值时阶段1 修正门槛收紧到入口包络。误配
-        # tighten < start 时钳到 start —— 收紧一直生效到直行区边界, 不留缝。
-        tighten_dist = max(float(self._p('final_straight.tighten_distance')),
-                           straight_start)
-
-        # 方位误差用车体朝向(bearing=atan2(lat,dist))，不用方阵误差(square_err)。
-        # square_err 依赖 tag 法线(normal)，而 normal 是 AprilTag 最不可靠的自由度
-        # ——近场时在 ±180° 附近抖动，经 ±π 归一化后误差被放大到 4~5°，即使车已
-        # 正对标签(方位角<1°)也会误判超差。bearing 只取决于标签在画面中的位置，稳定可靠。
-        bearing = math.atan2(tag_pose.lat, tag_pose.dist)
-        bearing_err = abs(normalize_angle(bearing))
-
-        go_straight = False
-        if two_phase:
-            if tag_pose.dist <= straight_start:
-                # 进入直行距离 → 无条件直行（不再调角）。
-                # 入口检查只判一次（首次跨入的停看点, _straight_entered 锁存）。
-                if not self._straight_entered:
-                    self._straight_entered = True
-                    if (bearing_err > straight_yaw_tol
-                            or abs(tag_pose.lat) > entry_lat_tol):
-                        # 同一个串既打日志又交给 abort_motion 记账 —— 原先只打
-                        # 日志, 落 MOTION_FAILED 时上层拿到的是空原因。
-                        reason = (
-                            f'直行失败：进入直行距离({tag_pose.dist:.2f}m)时误差 '
-                            f'方位={math.degrees(bearing_err):.1f}° '
-                            f'(门槛{math.degrees(straight_yaw_tol):.1f}°) '
-                            f'横向={tag_pose.lat:+.3f}m '
-                            f'(门槛±{entry_lat_tol:.3f}m)，对准过差无法入库')
-                        self.get_logger().error(reason)
-                        self._sm.abort_motion(reason, CODE_VISION_NO_PROGRESS)
-                        self._adapter.publish_stop()
-                        return
-                go_straight = True
-            else:
-                # 直行区外（接近初期 / 重试倒车后）→ 重新武装入口检查。
-                # 已达入口包络的直行捷径只在近场 (dist ≤ tighten_distance) 启用:
-                # 远场交给 plan() 粗对准 (far_* 门槛, normal=None 不做法线对准/
-                # 横移) —— 大方向对齐后纯前进逼近, 走进近场再精调, 不带大误差
-                # 直冲直行区。
-                self._straight_entered = False
-                if (tag_pose.dist <= tighten_dist
-                        and bearing_err <= straight_yaw_tol
-                        and abs(tag_pose.lat) <= lat_threshold_m):
-                    # 方位(bearing)+横向都已在收紧门槛内 → 直接直行, 不再摆头。
-                    # 不查法线: normal 是 AprilTag 最不可靠的自由度(近场 ±180°
-                    # 抖动, 实测已对正标签仍被算成 ~8° 偏角), 入口门控同理只用
-                    # bearing+横向。方位只依赖标签在画面中的位置, 稳定可靠。
-                    go_straight = True
-
-        # 走停步长运行期可调: ros2 param set <节点> stopgo.jog_max 0.5 即时生效,
-        # 无需重启 —— 每次规划前把当前参数同步进规划器 (launch 也可传 jog_max:=)。
-        # 修正容差按远/近区分 (two_phase 启用时):
-        #   远场 (dist > tighten_distance): 放宽到 far_*, 只做大尺度粗对准+前进,
-        #     不做法线对准/横移 (plan() 传 normal=None)。1.5m 处 normal 噪声
-        #     ±10° 被 dist 放大成 ±0.3m 横移噪声, 是反复/反向横移的根源。
-        #   近场 (dist ≤ tighten_distance): 收紧到入口包络, 做"对齐法线→
-        #     垂直偏距横移→直行"。法线转向门槛钳在 normal_turn_min_deg(6°)
-        #     之上 (低于噪声下限会摆头); 横移量由规划器改用垂直偏距
-        #     dist·sin(n)−lat·cos(n), 航向残余在门槛内也移向正确的线
-        #     (按画面 lat 横移在航向未转正时会反向, 见 plan() 内注释)。
-        # two_phase 关闭时退回到原单阶段 stopgo 值 (legacy)。
-        near_field = two_phase and tag_pose.dist <= tighten_dist
-        stopgo_lat = self._p('stopgo.lateral_threshold')
-        stopgo_yaw = math.radians(self._p('stopgo.yaw_threshold_deg'))
-        if two_phase:
-            if near_field:
-                # 法线转向门槛钳到噪声下限之上 (见参数声明处): 低于噪声下限的
-                # 门槛让转向决策追二义性双峰抖动, 摆头不止、横移触发不了。
-                normal_turn_thr = math.radians(max(
-                    self._p('final_straight.normal_yaw_threshold_deg'),
-                    self._p('final_straight.normal_turn_min_deg')))
-                lat_thr, yaw_thr, bear_thr = (
-                    lat_threshold_m, normal_turn_thr, straight_yaw_tol)
-            else:
-                lat_thr = float(self._p('final_straight.far_lateral_m'))
-                yaw_thr = bear_thr = math.radians(
-                    self._p('final_straight.far_yaw_threshold_deg'))
-        else:
-            lat_thr, yaw_thr, bear_thr = stopgo_lat, stopgo_yaw, stopgo_yaw
-        self._planner.set_tolerances(
-            lateral_threshold=lat_thr,
-            yaw_threshold=yaw_thr,
-            bearing_yaw_threshold=bear_thr)
-        # 直行区外的前进步长钳到"恰好停在区界": 跨界盲走越短, 入口检查拿到
-        # 的量测越新鲜 (最低保 jog_min, 防 plan_straight 的 drive ≤ jog_min/2
-        # 判 done 原地打转)。
-        jog_max_eff = self._p('stopgo.jog_max')
-        if two_phase and tag_pose.dist > straight_start:
-            jog_max_eff = min(jog_max_eff,
-                              max(tag_pose.dist - straight_start,
-                                  self._p('stopgo.jog_min')))
-        self._planner.set_jog_limits(
-            jog_min=self._p('stopgo.jog_min'),
-            jog_max=jog_max_eff)
-
-        if go_straight:
-            seq = self._planner.plan_straight(tag_pose.dist)
-        elif self._is_omni(base_type):
-            # Omni：逐帧小步规划。两阶段模式下:
-            #   远场 (dist > tighten_distance): normal=None, plan() 走纯方位
-            #     (bearing) 对准+前进(pure pursuit), 不做法线对准/横移 —— 避免
-            #     1.5m 处 normal 噪声放大成反复/反向横移。
-            #   近场 (dist ≤ tighten_distance) / 单阶段: 传 normal, 走"对齐
-            #     法线 → 按垂直偏距横移 → 直行"。
-            # 不用 plan_sequence 的法线盲机动：其 standoff 点 A = tag + d_target·n
-            # 在 dist ≈ d_target 时贴在机器人脚下, turn1=atan2(A) 对厘米级测量
-            # 噪声极敏感（实测 dock_distance=1.2 @ dist=1.28 规划出 ±44° 小挪
-            # 动）；且大角度盲转的腿式滑移让真实位移超出里程计判停值，下一轮
-            # 测量突变（dist 跌破 d_target → A 翻到身后 → 转 124° 往回走），
-            # 正反馈打转。
-            # 横移按画面 lat 平移只在车头与法线平行时才等价于"平移到法线上"：
-            # lat = 真实垂直偏距 − dist·sin(残余航向误差)，航向没转正时按 lat
-            # 横移会把 tag 挪到画面正中、车体却离法线更远 (2026-09 实测反向
-            # 横移)。故 omni 顺序：先原地转齐法线 (转角 = normal+π, 仍受
-            # max_turn_step 逐步钳制+停稳重测)；横移量由规划器改用垂直偏距
-            # dist·sin(n)−lat·cos(n) —— 航向残余 ≤ 门槛也移向正确的线；残余
-            # 航向在移正后再由 aim-and-go 的 bearing 转向收掉 (在法线上
-            # bearing = −航向误差, 转齐 bearing 即同时转正航向)，最后直线前进。
-            align_norm = (not two_phase) or near_field
-            step = self._planner.plan(tag_pose.dist, tag_pose.lat, bearing,
-                                      normal=(tag_pose.normal if align_norm else None))
-            if step.kind == 'yaw':
-                # 大角度对准按 max_turn_step 分批：每步停稳重测，避免一次
-                # 大盲转的滑移污染下一轮测量。
-                step.turn_angle = math.copysign(
-                    min(abs(step.turn_angle), self._p('stopgo.max_turn_step')),
-                    step.turn_angle)
-            seq = [step]
-        else:
-            seq = self._planner.plan_sequence(
-                tag_pose.dist, tag_pose.lat, tag_pose.normal, yaw_tol=yaw_tol)
-
-        # 移动前打印：二维码相对位姿 + 完整规划路径，仅凭日志即可诊断丢标问题。
-        # bearing = 指向二维码的方向；normal = 二维码朝外法线方向；
-        # 每一步以带符号量显示（转向单位度，前进单位米）。
-        bearing_deg = math.degrees(math.atan2(tag_pose.lat, tag_pose.dist))
-        steps = []
-        for p in seq:
-            if p.kind == 'yaw':
-                steps.append(f'转 {math.degrees(p.turn_angle):+.1f}°')
-            elif p.kind == 'forward':
-                if abs(p.lateral_distance) > 1e-4:
-                    steps.append(f'横移 {p.lateral_distance:+.3f}m')
-                else:
-                    steps.append(f'前进 {p.jog_distance:+.3f}m')
-            else:
-                steps.append(p.kind)
-        if go_straight:
-            # 直行阶段只关注距离: 决策 = plan_straight(dist), 角度/航向完全不
-            # 参与判断, 日志同步精简 —— 不打方位/法线/门槛字段 (直行语境里
-            # bearing 随 dist 缩小自然变大, 打出来只会误导"直行还在管角度")。
-            # 保留距离+路径: [done] 逐秒重复是"规划说到位而状态机不收"的
-            # 唯一现场证据, 必须可见。
-            self.get_logger().info(
-                f'走停 直线阶段 iter={self._maneuver_iters}: '
-                f'距离={tag_pose.dist:.3f}m → 目标={target_distance:.3f}m '
-                f'| 路径 [{", ".join(steps)}]', throttle_duration_sec=1.0)
-        else:
-            self.get_logger().info(
-                f'走停 规划 iter={self._maneuver_iters}: '
-                f'二维码 距离={tag_pose.dist:.3f}m 横向={tag_pose.lat:+.3f}m '
-                f'方位={bearing_deg:+.1f}° 法线={math.degrees(tag_pose.normal):+.1f}° '
-                f'| 原始 距离={self._raw_dist:.3f} 横向={self._raw_lat:+.3f} '
-                f'法线={math.degrees(self._raw_normal):+.1f}° '
-                f'| 方位误差={math.degrees(bearing_err):.1f}°'
-                f'(失败门槛{math.degrees(straight_yaw_tol):.1f}°) '
-                f'| 路径 [{", ".join(steps)}]', throttle_duration_sec=1.0)
-
-        if len(seq) == 1 and seq[0].kind == 'done':
-            self._adapter.publish_stop()
-            # Leave APPROACH→FINAL_SERVO/DOCKED to the state machine (it checks
-            # the same tolerance on tag_pose).
-            # 容差内: 保持静止站立 (不发 stand_up), 由 FINAL_SERVO→DOCKED
-            # 确认 —— 到位后狗不喘、姿态最稳。
-            return
-
-        # 规划完成 → 暂存待发, 由 _launch_pending_seq 在恢复运动模式
-        # (motion_enabled=True) 后原样启动 —— 解锁等待期间不再重测/重规划,
-        # 上面的规划日志因此每停只打一次。
-        self._pending_seq = list(seq)
-        if not self._launch_pending_seq(base_type, now_ns):
             return
 
     def _run_undock(self, base_type: str, now_ns: int):
@@ -1901,7 +1464,6 @@ class DockingNode(Node):
         self._maneuver_active = True
         self._frozen = True          # 开始盲动：冻结检测，运动期丢弃所有帧
         self._discard_dual_pending()
-        self._maneuver_iters += 1
         self._start_next_maneuver_step(base_type)
         return False
 
@@ -2067,7 +1629,6 @@ class DockingNode(Node):
         强制下一次规划只用停稳解冻后新采的新鲜帧 (EMA 重新播种)。
         """
         self._frozen = False
-        self._filter_init = False          # EMA 重新播种（首帧新鲜帧作种子）
         self._last_detection_ns = 0        # _tag_fresh() 归零，等待新帧
         if hasattr(self, '_dual_live_wall_ns'):
             del self._dual_live_wall_ns    # 新锁定回退到本窗口 dual.stamp，绝不沿用旧任务
@@ -2087,10 +1648,8 @@ class DockingNode(Node):
         """
         self._maneuver_queue = []
         self._maneuver_active = False
-        self._maneuver_iters = 0
         self._pending_seq = None
         self._reset_visual_state()
-        self._straight_entered = False
         self._dual_watch = None
         self._dual_diag_ns.clear()
         self._dual_reject_last = None
@@ -2287,7 +1846,6 @@ class DockingNode(Node):
         response.message = f'state={self._sm.state_name}' if ok else 'already active'
         if not ok:
             return response
-        self._planner.reset()
         self._executor.cancel()
         self._reset_maneuver()
         self._charge.reset()
@@ -2295,7 +1853,6 @@ class DockingNode(Node):
 
     def _on_cancel_docking(self, request, response):
         self._sm.cancel()
-        self._planner.reset()
         self._executor.cancel()
         self._reset_maneuver()
         self._adapter.publish_stop()
@@ -2308,7 +1865,6 @@ class DockingNode(Node):
         response.success = ok
         response.message = f'state={self._sm.state_name}' if ok else 'docking active'
         if ok:
-            self._planner.reset()
             self._executor.cancel()
             self._reset_maneuver()
             self._undock_phase = 0
@@ -2327,7 +1883,6 @@ class DockingNode(Node):
             goal_handle.abort()
             return Dock.Result(success=False, message='already active')
 
-        self._planner.reset()
         self._executor.cancel()
         self._reset_maneuver()
         self._charge.reset()
@@ -2338,7 +1893,6 @@ class DockingNode(Node):
             if goal_handle.is_cancel_requested:
                 goal_handle.canceled()
                 self._sm.cancel()
-                self._planner.reset()
                 self._executor.cancel()
                 self._reset_maneuver()
                 self._adapter.publish_stop()
@@ -2372,7 +1926,6 @@ class DockingNode(Node):
 
     def _dock_cancel_cb(self, cancel_request):
         self._sm.cancel()
-        self._planner.reset()
         self._executor.cancel()
         self._reset_maneuver()
         self._adapter.publish_stop()
