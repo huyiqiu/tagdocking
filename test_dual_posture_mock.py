@@ -132,7 +132,6 @@ def load_params(profile=None):
     with open(os.path.join(ROOT, 'config', 'docking.yaml')) as f:
         doc = yaml.safe_load(f)
     params = dict(doc['docking_node']['ros__parameters'])
-    params['dual.enable'] = True
     # yaml 缺省的 dual.* 回填 DEFAULTS (与节点 declare_parameter 语义一致)
     for k, v in DEFAULTS.items():
         params.setdefault('dual.' + k, v)
@@ -232,7 +231,7 @@ def run(d, world, pose, t, until=None, max_ticks=1200, pile_on=True,
     actions, complete = [], False
     for _ in range(max_ticks):
         world.observe_tick(d, pose, t, pile_on, hide_pile_below)
-        seq = d.plan_dual(None, 'omni', None, int(t))
+        seq = d.plan_dual(None, int(t))
         if d.failure:
             break
         if seq and seq[0].kind == 'done':
@@ -341,7 +340,7 @@ def t6_overshoot(params):
     for i in range(4):
         stamp = t + i*int(2e8)
         d.observe(stamp, stamp, wall, None, pile_missing=True)
-    seq = d.plan_dual(None, 'omni', None, t + int(6e8))
+    seq = d.plan_dual(None, t + int(6e8))
     check('T6a locked 墙码z跳近豁免overshoot',
           not d.failure and seq and seq[0].jog_distance < 0,
           f'failure={d.failure!r} jog={seq[0].jog_distance if seq else None}')
@@ -352,7 +351,7 @@ def t6_overshoot(params):
     for i in range(4):
         stamp = t2 + i*int(2e8)
         d2.observe(stamp, stamp, wall, None, pile_missing=True)
-    seq2 = d2.plan_dual(None, 'omni', None, t2 + int(6e8))
+    seq2 = d2.plan_dual(None, t2 + int(6e8))
     check('T6b 非locked命中overshoot fail',
           seq2 is None and 'overshoot' in d2.failure,
           f'failure={d2.failure!r}')
@@ -402,7 +401,7 @@ def t9_standing_end_to_end(params):
     for _ in range(900):
         stage_before = d.stage
         world.observe_tick(d, pose, t, hide_pile_below=1.45)
-        seq = d.plan_dual(None, 'omni', None, t)
+        seq = d.plan_dual(None, t)
         if d.failure:
             break
         if seq and seq[0].kind == 'done':

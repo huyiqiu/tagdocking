@@ -19,13 +19,9 @@ docking_node:
     # camera optical frame (dist=tz, lat=-tx).
     measure_frame: ""
 
-    # ── Base Type ──
-    #   "diff_drive" — unicycle control (vx + wz only)
-    #   "omni"       — full 3-DOF (vx, vy, wz) via cmd_vel
-    #   "quadruped"  — SDK move(vx, vy, yaw_rate) callback
-    # 机器狗 (ZSL-1) 是全向底盘, 用 omni: 横向偏差直接横移修正,
+    # ── Base ──
+    # 机器狗 (ZSL-1) 是全向底盘: 横向偏差直接横移修正,
     # 经 l1w_control 的 /cmd_vel (vx/vy/wz) 下发。
-    base.type: "omni"
     base.cmd_vel_topic: "cmd_vel"
     # 狗模式服务/状态话题前缀 (zsibot_l1_control, 节点名 l1w_control):
     # <prefix>/static_stand、<prefix>/stand_up、<prefix>/posture_state、
@@ -159,7 +155,6 @@ docking_node:
     # Standing-only flow: 1.8m standoff -> dual corrections after every jog
     # -> qualified near pile loss -> heading locked -> straight run with
     # wall-bearing micro-correction -> 0.50m parked, then request passive.
-    dual.enable: false
     dual.wall_tag_size: 0.15
     dual.pile_tag_id: 51                       # must differ from tag.id
     dual.pile_tag_size: 0.05
@@ -172,7 +167,6 @@ docking_node:
     dual.dock_distance: 0.50
     dual.align_tolerance_deg: 3.0              # each optical bearing, not their average
     dual.align_hold_sec: 0.5                   # same settled window, unique frames
-    dual.pile_fresh_timeout_sec: 2.0           # deprecated; dual.fresh_sec now governs both tags
     dual.observation_distance: 1.8
     # 观察窗 obs±tol 同时是 observe 阶段的"站位守卫"门槛 (见 README 6.5b):
     # 墙码 z 一旦掉到下沿 (1.7m) 以下, 无论是否已对准, 先后退拉回再纠偏。

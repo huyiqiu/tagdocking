@@ -32,8 +32,8 @@ class OmniAdapter(BaseAdapter):
         self._publisher.publish(msg)
 
     def publish_arc(self, linear_rate: float, angular_rate: float):
-        """Turn while creeping forward (arc). Omni can rotate in place freely,
-        but this keeps a uniform adapter interface with diff-drive."""
+        """Turn while creeping forward (arc). Only used when heading-hold is
+        engaged during the long continuous straight leg."""
         msg = Twist()
         msg.linear.x = float(linear_rate)
         msg.angular.z = float(angular_rate)

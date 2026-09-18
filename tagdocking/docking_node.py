@@ -219,7 +219,7 @@ class DockingNode(Node):
         self._install_signal_handlers()
 
         self.get_logger().info(
-            f'停靠节点就绪 | 底盘={self._p("base.type")} | 走停模式')
+            '停靠节点就绪 | 双码停泊 | 走停模式 | 底盘=omni (/cmd_vel)')
 
     # ── Parameter helpers ──────────────────────────────────────────
 
@@ -238,7 +238,6 @@ class DockingNode(Node):
         self.declare_parameter('measure_frame', '')
 
         # Base
-        self.declare_parameter('base.type', 'diff_drive')
         self.declare_parameter('base.cmd_vel_topic', 'cmd_vel')
 
         self.declare_parameter('timeout_sec', 120.0)
@@ -291,11 +290,9 @@ class DockingNode(Node):
         # 仍会撞桩。
         self.declare_parameter('final_straight.lateral_threshold_m', 0.02)
 
-        # ── Dual-tag docking (双二维码对准, 默认关闭) ────────────────
-        # enable=false 时全程旁路: 节点行为与单码方案完全一致。
+        # ── Dual-tag docking (双二维码对准, 唯一方案) ────────────────
         for name, default in DUAL_DEFAULTS.items():
             self.declare_parameter('dual.' + name, default)
-        self.declare_parameter('dual.enable', False)
         self.declare_parameter('dual.camera_info_topic', '/camera_sync/camera_info')
         self.declare_parameter('dual.projection_mode', 'raw')
         # 墙码边长 (36h11:0, apriltag 节点按此解 PnP; launch 侧同步透传)
@@ -315,8 +312,6 @@ class DockingNode(Node):
         # 对准判据: 两码方位 (base_link 系 bearing) 同时 ≤ ±tol 保持 hold
         self.declare_parameter('dual.align_tolerance_deg', 3.0)
         self.declare_parameter('dual.align_hold_sec', 0.5)
-        # 桩码量测新鲜窗口 (超时视为桩码不可见 → 墙码单码修正)
-        self.declare_parameter('dual.pile_fresh_timeout_sec', 2.0)
 
         # Stop-and-go params
         self.declare_parameter('stopgo.jog_linear_rate', 0.08)
@@ -398,9 +393,8 @@ class DockingNode(Node):
         self._det_sub = self.create_subscription(
             AprilTagDetectionArray, det_topic, self._on_detections, 10)
 
-        if self._dual.enabled:
-            self._dual_info_sub = self.create_subscription(CameraInfo,
-                self._p('dual.camera_info_topic'), self._on_dual_camera_info, qos_profile_sensor_data)
+        self._dual_info_sub = self.create_subscription(CameraInfo,
+            self._p('dual.camera_info_topic'), self._on_dual_camera_info, qos_profile_sensor_data)
         odom_topic = self._p('odom_topic')
         self._odom_sub = self.create_subscription(
             Odometry, odom_topic, self._on_odom, 10)
@@ -439,19 +433,9 @@ class DockingNode(Node):
     # ── Adapter factory ────────────────────────────────────────────
 
     def _create_adapter(self):
-        """Create the appropriate BaseAdapter based on base.type parameter."""
-        base_type = self._p('base.type')
-        cmd_vel_topic = self._p('base.cmd_vel_topic')
-
-        if base_type == 'omni':
-            from .base_adapter import OmniAdapter
-            return OmniAdapter(self, cmd_vel_topic=cmd_vel_topic)
-        elif base_type == 'quadruped':
-            from .base_adapter import QuadrupedAdapter
-            return QuadrupedAdapter(node=self)
-        else:  # diff_drive
-            from .base_adapter import DiffDriveAdapter
-            return DiffDriveAdapter(self, cmd_vel_topic=cmd_vel_topic)
+        """Create the BaseAdapter (全向底盘 OmniAdapter, 经 /cmd_vel 下发)."""
+        from .base_adapter import OmniAdapter
+        return OmniAdapter(self, cmd_vel_topic=self._p('base.cmd_vel_topic'))
 
     # ── Callbacks ──────────────────────────────────────────────────
 
@@ -463,8 +447,7 @@ class DockingNode(Node):
         # 机动期间冻结检测：盲转/盲走过程中相机帧运动模糊、二维码常在视野边缘，
         # 这些坏帧一律丢弃，绝不更新 _pose_buffer 或 _last_detection_ns。
         # 规划器因此只会读到小车停稳后新采的帧。
-        if self._dual.enabled:
-            self._on_dual_detections(msg)
+        self._on_dual_detections(msg)
 
     def _on_odom(self, msg: Odometry):
         self._odom_x = msg.pose.pose.position.x
@@ -674,13 +657,12 @@ class DockingNode(Node):
 
     def _discard_dual_pending(self):
         """Fence task / freeze / visual windows by ORIGINAL sensor time."""
-        if self._dual.enabled:
-            self._dual_pending.clear()
-            self._dual_window_ns = self.get_clock().now().nanoseconds
-            self._dual_received_ns = max(self._dual_received_ns, self._dual_window_ns)
-            # 冻结/离开视觉态期间的丢帧与链路延迟无关, 不得计入连续过期,
-            # 否则解冻后的第一帧就会拿着跨越冻结期的旧起点直接判死。
-            self._clear_dual_expiry()
+        self._dual_pending.clear()
+        self._dual_window_ns = self.get_clock().now().nanoseconds
+        self._dual_received_ns = max(self._dual_received_ns, self._dual_window_ns)
+        # 冻结/离开视觉态期间的丢帧与链路延迟无关, 不得计入连续过期,
+        # 否则解冻后的第一帧就会拿着跨越冻结期的旧起点直接判死。
+        self._clear_dual_expiry()
 
     def _invalidate_dual_pose(self):
         self._dual.invalidate()
@@ -834,10 +816,9 @@ class DockingNode(Node):
     def _get_latest_pose(self):
         """Get latest valid pose from buffer (with latency check)."""
         now_ns = self.get_clock().now().nanoseconds
-        if self._dual.enabled:
-            if not self._dual.fresh(now_ns, self._last_detection_ns):
-                return None
-            self._pose_buffer.set_max_latency_ns(int(self._dual.p('fresh_sec') * 1e9))
+        if not self._dual.fresh(now_ns, self._last_detection_ns):
+            return None
+        self._pose_buffer.set_max_latency_ns(int(self._dual.p('fresh_sec') * 1e9))
         return self._pose_buffer.get_latest(now_ns)
 
     # ── Control loop (20 Hz) ───────────────────────────────────────
@@ -846,24 +827,22 @@ class DockingNode(Node):
         """Main 20 Hz control loop — stop-and-go paradigm."""
         now_ns = self.get_clock().now().nanoseconds
 
-        if self._dual.enabled:
-            self._retry_dual_detections(now_ns)
+        self._retry_dual_detections(now_ns)
 
         # Gather inputs
         tag_visible = self._tag_fresh()
         tag_pose = self._get_latest_pose()
-        base_type = self._p('base.type')
 
         # Compute errors (for publishing and state machine)
         error_x, error_y, error_yaw = 0.0, 0.0, 0.0
         if tag_pose is not None:
-            error_x = tag_pose.dist - self._dual.effective_dock_distance()
+            error_x = tag_pose.dist - self._dual.target
             error_y = tag_pose.lat
             error_yaw = normalize_angle(tag_pose.yaw)
 
         # Final heading lock never searches, reverses or continues on a silent
         # camera. Frozen observations update only this independent wall watchdog.
-        if (self._dual.enabled and self._dual.stage == 'locked'
+        if (self._dual.stage == 'locked'
                 and self._executor.is_active
                 and not self._dual.fresh(now_ns, getattr(self, '_dual_live_wall_ns', self._dual.stamp))):
             # 同样必须在 cancel() 之前取相位, 否则恒读"已停稳"。
@@ -871,7 +850,7 @@ class DockingNode(Node):
             self._adapter.publish_stop()
             self._executor.cancel()
             self._sm.abort_motion(reason, CODE_TAG_NOT_FOUND)
-        if self._dual.enabled and self._sm.state == DockingState.SEARCH_TAG:
+        if self._sm.state == DockingState.SEARCH_TAG:
             self._lookup_camera_offset()
             if self._dual.failure:
                 self._adapter.publish_stop()
@@ -881,15 +860,14 @@ class DockingNode(Node):
 
         # State machine evaluation
         params = self._build_params_dict()
-        if self._dual.enabled:
-            # 墙码丢失取证经 params 下发: state_machine 对节点内部只用
-            # get_logger(), 不许伸手进来, params 是既有且唯一的数据通道。
-            # 传的是闭包而不是字符串: 取证要做四角投影与一串格式化, 而它每
-            # 2000 个 tick 才用得上一次, 20Hz 白算是纯浪费。
-            params['dual_wall_loss'] = lambda: self._wall_loss_outer_evidence(now_ns)
-            params['dual_settle_until_ns'] = self._dual.settle_until_ns
-            params['dual_settle_sec'] = self._dual.p('settle_sec')
-            params['dual_now_ns'] = now_ns
+        # 墙码丢失取证经 params 下发: state_machine 对节点内部只用
+        # get_logger(), 不许伸手进来, params 是既有且唯一的数据通道。
+        # 传的是闭包而不是字符串: 取证要做四角投影与一串格式化, 而它每
+        # 2000 个 tick 才用得上一次, 20Hz 白算是纯浪费。
+        params['dual_wall_loss'] = lambda: self._wall_loss_outer_evidence(now_ns)
+        params['dual_settle_until_ns'] = self._dual.settle_until_ns
+        params['dual_settle_sec'] = self._dual.p('settle_sec')
+        params['dual_now_ns'] = now_ns
         self._sm.evaluate(
             tag_pose=tag_pose,
             tag_visible=tag_visible,
@@ -940,15 +918,15 @@ class DockingNode(Node):
         # entry, then release the topic so other publishers can drive the robot.
         if state == DockingState.SEARCH_TAG:
             self._quiescent = False
-            self._run_search(tag_visible, tag_pose, base_type, now_ns)
+            self._run_search(tag_visible, tag_pose, now_ns)
 
         elif state == DockingState.APPROACH:
             self._quiescent = False
-            self._run_stop_and_go(tag_visible, tag_pose, base_type, now_ns)
+            self._run_stop_and_go(tag_visible, tag_pose, now_ns)
 
         elif state == DockingState.UNDOCKING:
             self._quiescent = False
-            self._run_undock(base_type, now_ns)
+            self._run_undock(now_ns)
 
         elif state == DockingState.DOCKED:
             # 充电收尾推进 (只发模式服务, 不占 /cmd_vel —— 仍走静默策略)。
@@ -982,8 +960,7 @@ class DockingNode(Node):
 
     # ── Stop-and-go loop ───────────────────────────────────────────
 
-    def _run_stop_and_go(self, tag_visible: bool, tag_pose, base_type: str,
-                         now_ns: int):
+    def _run_stop_and_go(self, tag_visible: bool, tag_pose, now_ns: int):
         """One tick of the turn-drive-turn stop-and-go loop.
 
         Three nested cases:
@@ -996,59 +973,58 @@ class DockingNode(Node):
         """
         # ── Case 1: a sub-step is executing ───────────────────────────
         if self._executor.is_active:
-            if self._dual.enabled and not self._check_dual_action(now_ns):
+            if not self._check_dual_action(now_ns):
                 return
             done = self._executor.update(
                 self._odom_x, self._odom_y, self._odom_yaw, now_ns,
             )
             if done:
-                if self._dual.enabled:
-                    # Δyaw / 航向保持已用 是第 0 步就要的现场观测量: 前者是
-                    # "这一程到底歪了多少"的唯一读数 (定 engage/budget 靠它),
-                    # 后者区分"没漂移"与"保持压根没接通"。
-                    hold_note = ''
-                    if self._executor.jog_hold_spent:
-                        hold_note = ' [预算耗尽/yaw 不可信 → 本程后段纯直行]'
-                    plan = self._dual_watch.plan
-                    dyaw = math.degrees(self._executor.jog_yaw_error)
-                    if plan.kind == 'yaw':
-                        # 实转 vs 指令: 盲转的欠转/过冲直接可读。
-                        yaw_note = (f'Δyaw={dyaw:+.2f}deg'
-                                    f'(指令{math.degrees(plan.turn_angle):+.2f}deg)')
-                    else:
-                        # 平移步没人命令它转 —— 这里量到的 yaw 全是寄生的。
-                        # 1° 起报: 0.5×sin(1°)=8.7mm 已是 dock_tolerance(20mm)
-                        # 的一半, 再大就足以单独把一步修正的收益吃光。
-                        yaw_note = f'Δyaw={dyaw:+.2f}deg'
-                        if abs(dyaw) >= 1.0:
-                            yaw_note += '(寄生! 平移步不该转, 下一轮 J 的 theta 项会变差)'
-                    self.get_logger().info(
-                        f'dual action COMPLETE signed_odom={self._dual_watch.signed:+.6f} '
-                        f'{yaw_note} '
-                        f'航向保持已用={math.degrees(self._executor.jog_hold_used):.2f}deg'
-                        f'{hold_note}; awaiting settled visual feedback')
+                # Δyaw / 航向保持已用 是第 0 步就要的现场观测量: 前者是
+                # "这一程到底歪了多少"的唯一读数 (定 engage/budget 靠它),
+                # 后者区分"没漂移"与"保持压根没接通"。
+                hold_note = ''
+                if self._executor.jog_hold_spent:
+                    hold_note = ' [预算耗尽/yaw 不可信 → 本程后段纯直行]'
+                plan = self._dual_watch.plan
+                dyaw = math.degrees(self._executor.jog_yaw_error)
+                if plan.kind == 'yaw':
+                    # 实转 vs 指令: 盲转的欠转/过冲直接可读。
+                    yaw_note = (f'Δyaw={dyaw:+.2f}deg'
+                                f'(指令{math.degrees(plan.turn_angle):+.2f}deg)')
+                else:
+                    # 平移步没人命令它转 —— 这里量到的 yaw 全是寄生的。
+                    # 1° 起报: 0.5×sin(1°)=8.7mm 已是 dock_tolerance(20mm)
+                    # 的一半, 再大就足以单独把一步修正的收益吃光。
+                    yaw_note = f'Δyaw={dyaw:+.2f}deg'
+                    if abs(dyaw) >= 1.0:
+                        yaw_note += '(寄生! 平移步不该转, 下一轮 J 的 theta 项会变差)'
+                self.get_logger().info(
+                    f'dual action COMPLETE signed_odom={self._dual_watch.signed:+.6f} '
+                    f'{yaw_note} '
+                    f'航向保持已用={math.degrees(self._executor.jog_hold_used):.2f}deg'
+                    f'{hold_note}; awaiting settled visual feedback')
 
-                    # 粗对准步不进双码的视觉反馈账: 它没有 active_feedback
-                    # (未走 action_started), 记进去只会污染 feedback 判据。
-                    # 清标志统一在 _mark_stopped —— 那是本 tick 之后、且能同时
-                    # 覆盖"队列排空一步都没起来"的路径。
-                    if not self._dual_prealign_active:
-                        self._dual.action_completed()
-                    self._dual_watch = None
+                # 粗对准步不进双码的视觉反馈账: 它没有 active_feedback
+                # (未走 action_started), 记进去只会污染 feedback 判据。
+                # 清标志统一在 _mark_stopped —— 那是本 tick 之后、且能同时
+                # 覆盖"队列排空一步都没起来"的路径。
+                if not self._dual_prealign_active:
+                    self._dual.action_completed()
+                self._dual_watch = None
                 if self._maneuver_queue:
                     # Chain straight into the next sub-step by odometry — no
                     # settle, tag not consulted. This is the whole point: the
                     # maneuver runs open-loop on odometry so a narrow FOV losing
                     # the tag mid-turn cannot derail it.
-                    self._start_next_maneuver_step(base_type)
+                    self._start_next_maneuver_step()
                 else:
                     # Whole sequence finished → settle before re-measuring.
                     self._maneuver_active = False
                     self._mark_stopped(now_ns)
-            self._publish_action_cmd(base_type)
+            self._publish_action_cmd()
             return
 
-        if self._dual.enabled and now_ns < self._dual.settle_until_ns:
+        if now_ns < self._dual.settle_until_ns:
             self._adapter.publish_stop()
             return
 
@@ -1073,39 +1049,37 @@ class DockingNode(Node):
         # ── Case 2.5: 已规划待发 —— 恢复运动模式后立即原样起步 ─────────
         # 规划在锁定下已完成并暂存 _pending_seq; 等 stand_up 确认期间
         # 不重测/不重规划。
-        if not self._launch_pending_seq(base_type, now_ns):
+        if not self._launch_pending_seq(now_ns):
             return
 
-        if self._dual.enabled:
+        self._adapter.publish_stop()
+        if not self._has_odom:
+            self._sm.abort_motion('dual docking requires odometry',
+                                  CODE_MOTION_STALLED)
+            return
+        self._lookup_camera_offset()
+        # 步骤 1.5: 趴下前先用单码 (墙码) 把方位粗对准到 ±prealign_tolerance。
+        # 双码枚举的单步上限只有几度, 它是精调器不是收敛器 —— 锁定那一刻
+        # 残留多少方位误差, 双码就得一步几度地啃回来。现场锁定时方位差
+        # 20.4°, 双码要 ~30 步 × 2.4s ≈ 70s, 顶着观测超时走。
+        if not self._dual_prealign(tag_visible, tag_pose, now_ns):
+            return
+        seq = self._dual.plan_dual(tag_pose, now_ns)
+        if self._dual.failure:
+            self._executor.cancel()
+            self._sm.abort_motion(self._dual.failure,
+                                  CODE_VISION_NO_PROGRESS)
+        elif self._dual.complete:
+            self._executor.cancel()
+            self._pending_seq = None
             self._adapter.publish_stop()
-            if not self._has_odom:
-                self._sm.abort_motion('dual docking requires odometry',
-                                      CODE_MOTION_STALLED)
-                return
-            self._lookup_camera_offset()
-            # 步骤 1.5: 趴下前先用单码 (墙码) 把方位粗对准到 ±prealign_tolerance。
-            # 双码枚举的单步上限只有几度, 它是精调器不是收敛器 —— 锁定那一刻
-            # 残留多少方位误差, 双码就得一步几度地啃回来。现场锁定时方位差
-            # 20.4°, 双码要 ~30 步 × 2.4s ≈ 70s, 顶着观测超时走。
-            if not self._dual_prealign(tag_visible, tag_pose, base_type, now_ns):
-                return
-            # (plan_dual 收 planner 参但从不触碰; GeometryPlanner 已删)
-            seq = self._dual.plan_dual(tag_pose, base_type, None, now_ns)
-            if self._dual.failure:
-                self._executor.cancel()
-                self._sm.abort_motion(self._dual.failure,
-                                      CODE_VISION_NO_PROGRESS)
-            elif self._dual.complete:
-                self._executor.cancel()
-                self._pending_seq = None
-                self._adapter.publish_stop()
-                self._sm.finish_dual()
-            elif seq:
-                self._pending_seq = list(seq)
-                self._launch_pending_seq(base_type, now_ns)
-            return
+            self._sm.finish_dual()
+        elif seq:
+            self._pending_seq = list(seq)
+            self._launch_pending_seq(now_ns)
+        return
 
-    def _run_undock(self, base_type: str, now_ns: int):
+    def _run_undock(self, now_ns: int):
         """泊出的一个 tick: 盲退 → 原地转 180° → UNDOCKED。
 
         两段纯里程计闭环盲动顺序执行：
@@ -1128,13 +1102,13 @@ class DockingNode(Node):
                 self._maneuver_active = False
                 self._executor.mark_stop_time(now_ns)
                 self._undock_phase += 1
-                if not self._start_undock_step(base_type):
+                if not self._start_undock_step():
                     # 两段盲动均完成 → 泊出成功
                     self._adapter.publish_stop()
                     self._sm.finish_undock()
                     self._charge.reset()
                     return
-            self._publish_action_cmd(base_type)
+            self._publish_action_cmd()
             return
 
         # Case 2: 首次进入 → 启动第一段(盲退)
@@ -1154,14 +1128,14 @@ class DockingNode(Node):
             self._undock_code = CODE_MOTION_GATED
             return
         self._undock_phase = 0
-        if not self._start_undock_step(base_type):
+        if not self._start_undock_step():
             self._adapter.publish_stop()
             self._sm.finish_undock()
             self._charge.reset()
             return
-        self._publish_action_cmd(base_type)
+        self._publish_action_cmd()
 
-    def _start_undock_step(self, base_type: str) -> bool:
+    def _start_undock_step(self) -> bool:
         """启动 _undock_phase 指示的泊出子动作。
 
         phase 0 = 盲退, phase 1 = 原地转 180°。
@@ -1203,8 +1177,7 @@ class DockingNode(Node):
 
     # ── Angle-stepped search loop ─────────────────────────────────
 
-    def _run_search(self, tag_visible: bool, tag_pose, base_type: str,
-                    now_ns: int):
+    def _run_search(self, tag_visible: bool, tag_pose, now_ns: int):
         """角度步进搜索的一个 tick：转固定角度(里程计闭环)→停稳→检测→再转。
 
         转满 360° 直到找到二维码或状态机超时。结构镜像 _run_stop_and_go 的
@@ -1220,10 +1193,10 @@ class DockingNode(Node):
             if done:
                 self._maneuver_active = False
                 self._mark_stopped(now_ns)
-            self._publish_action_cmd(base_type)
+            self._publish_action_cmd()
             return
 
-        if self._dual.enabled and now_ns < self._dual.settle_until_ns:
+        if now_ns < self._dual.settle_until_ns:
             self._adapter.publish_stop()
             return
 
@@ -1272,7 +1245,7 @@ class DockingNode(Node):
             self._adapter.publish_stop()
             return
 
-        if (self._dual.enabled and self._search_step * abs(float(
+        if (self._search_step * abs(float(
                 self._p('search.step_angle_deg'))) >= 360.0):
             self._adapter.publish_stop()
             self._sm.abort_motion(
@@ -1304,9 +1277,9 @@ class DockingNode(Node):
         else:
             self._frozen = False
             self._maneuver_active = False
-        self._publish_action_cmd(base_type)
+        self._publish_action_cmd()
 
-    def _start_next_maneuver_step(self, base_type: str):
+    def _start_next_maneuver_step(self):
         """Pop and start the next queued sub-step, re-referencing odometry.
 
         Skips over sub-steps too small to actually move (a sub-degree turn or a
@@ -1317,13 +1290,13 @@ class DockingNode(Node):
         """
         while self._maneuver_queue:
             step = self._maneuver_queue.pop(0)
-            if self._launch_step(step, base_type):
+            if self._launch_step(step):
                 return
         # Queue drained without launching anything → maneuver is over.
         self._maneuver_active = False
         self._mark_stopped(self.get_clock().now().nanoseconds)
 
-    def _dual_prealign(self, tag_visible: bool, tag_pose, base_type: str,
+    def _dual_prealign(self, tag_visible: bool, tag_pose,
                        now_ns: int) -> bool:
         """趴下前用单码 (墙码) 把方位粗对准。True = 可以进入双码。
 
@@ -1391,10 +1364,10 @@ class DockingNode(Node):
         self._dual_prealign_active = True
         self._pending_seq = [ActionPlan(kind='yaw',
                                         turn_angle=math.copysign(step, bearing))]
-        self._launch_pending_seq(base_type, now_ns)
+        self._launch_pending_seq(now_ns)
         return False
 
-    def _launch_pending_seq(self, base_type: str, now_ns: int) -> bool:
+    def _launch_pending_seq(self, now_ns: int) -> bool:
         """处理已规划的待发序列。返回 False = 本 tick 到此为止, 调用方立即 return
         (仍在等 stand_up 解锁, 或已起步 —— 起步后若贯穿落入 Case 3 会在同一
         tick 重测重规划、覆写刚启动的队列); True = 无待发序列, 继续量测规划。
@@ -1405,7 +1378,7 @@ class DockingNode(Node):
         """
         if self._pending_seq is None:
             return True
-        if (self._dual.enabled and not self._dual_prealign_active
+        if (not self._dual_prealign_active
                 and not self._dual.pending_valid(now_ns)):
             self._pending_seq = None
             self._adapter.publish_stop()
@@ -1417,27 +1390,26 @@ class DockingNode(Node):
         self._maneuver_active = True
         self._frozen = True          # 开始盲动：冻结检测，运动期丢弃所有帧
         self._discard_dual_pending()
-        self._start_next_maneuver_step(base_type)
+        self._start_next_maneuver_step()
         return False
 
-    def _launch_step(self, plan: ActionPlan, base_type: str) -> bool:
+    def _launch_step(self, plan: ActionPlan) -> bool:
         """Start one executor action from an ActionPlan and re-ref odometry.
 
         Returns True if an action actually started, False if the step was too
         small to move (caller advances to the next queued step).
         """
-        if self._dual.enabled:
-            now = self.get_clock().now().nanoseconds
-            stamp = getattr(self, '_odom_stamp_ns', 0)
-            if self._executor.is_active:
-                return False  # No new start, budget or qualification commit.
-            if (stamp <= 0 or not 0 <= now-stamp <= self._dual.p('odom_fresh_sec')*1e9
-                    or not all(math.isfinite(v) for v in (self._odom_x, self._odom_y, self._odom_yaw))):
-                self._adapter.publish_stop()
-                self._sm.abort_motion(
-                    'dual requires fresh odometry before action start',
-                    CODE_MOTION_STALLED)
-                return False
+        now = self.get_clock().now().nanoseconds
+        stamp = getattr(self, '_odom_stamp_ns', 0)
+        if self._executor.is_active:
+            return False  # No new start, budget or qualification commit.
+        if (stamp <= 0 or not 0 <= now-stamp <= self._dual.p('odom_fresh_sec')*1e9
+                or not all(math.isfinite(v) for v in (self._odom_x, self._odom_y, self._odom_yaw))):
+            self._adapter.publish_stop()
+            self._sm.abort_motion(
+                'dual requires fresh odometry before action start',
+                CODE_MOTION_STALLED)
+            return False
         if plan.kind == 'yaw':
             # 全量盲转: 整条机动路径是一次算好的, 钳半截会把后续直行腿带偏
             # 航向; 里程计闭环 + 每停重测兜底。
@@ -1449,7 +1421,7 @@ class DockingNode(Node):
             self.get_logger().info(
                 f'  子步：原地转 {math.degrees(plan.turn_angle):+.1f}°（盲转，里程计校准）')
         elif plan.kind == 'forward':
-            if abs(plan.lateral_distance) > 1e-4 and self._is_omni(base_type):
+            if abs(plan.lateral_distance) > 1e-4:
                 self._executor.start_jog_lateral(
                     plan.lateral_distance, self._p('stopgo.lateral_rate'),
                     odom_scale=self._p('stopgo.lateral_odom_scale'))
@@ -1472,10 +1444,9 @@ class DockingNode(Node):
                 # 排除项都是有意的: 回退修剪 (continuous=False, ≤10cm/1.25s,
                 # 短到攒不出 engage 门槛的漂移, 且倒走叠 wz 的运动学未验证)、
                 # 区外 forward_step 逐步走 (那里墙码 bearing 微调活着, 每停
-                # 都在纠方向)、泊出/重试盲腿 (根本不经过这里)、单码通道
-                # (另有 final_straight 一套)。
+                # 都在纠方向)、泊出/重试盲腿 (根本不经过这里)。
                 hold = self._heading_hold_params() if (
-                    self._dual.enabled and plan.continuous
+                    plan.continuous
                     and plan.jog_distance > 0) else None
                 self._executor.start_jog(
                     plan.jog_distance, self._p('stopgo.jog_linear_rate'),
@@ -1488,15 +1459,14 @@ class DockingNode(Node):
                     f'  子步：前进 {plan.jog_distance:+.3f}m（盲走，里程计校准）')
         else:
             return False
-        if self._dual.enabled:
-            speed = (self._executor.angular_cmd if plan.turn_angle else
-                     self._executor.lateral_cmd if plan.lateral_distance else self._executor.linear_cmd)
-            self._dual_watch = ActionWatch(plan, now,
-                (self._odom_x, self._odom_y, self._odom_yaw),
-                self._executor._action_target, speed, self._dual.p)
-            if not self._dual_prealign_active:
-                self._dual.action_started(plan, now)
-        self._publish_action_cmd(base_type)
+        speed = (self._executor.angular_cmd if plan.turn_angle else
+                 self._executor.lateral_cmd if plan.lateral_distance else self._executor.linear_cmd)
+        self._dual_watch = ActionWatch(plan, now,
+            (self._odom_x, self._odom_y, self._odom_yaw),
+            self._executor._action_target, speed, self._dual.p)
+        if not self._dual_prealign_active:
+            self._dual.action_started(plan, now)
+        self._publish_action_cmd()
         return True
 
     def _check_dual_action(self, now):
@@ -1528,16 +1498,14 @@ class DockingNode(Node):
         """
         return self._maneuver_active or self._executor.is_active
 
-    def _publish_action_cmd(self, base_type: str):
+    def _publish_action_cmd(self):
         """Publish the current action's velocity command via the adapter."""
         kind = self._executor.action_kind
         if kind == 'jogging':
             angular = self._executor.angular_cmd
-            # angular == 0 时**必须**走 publish_jog: BaseAdapter.publish_arc 的
-            # 默认实现回落成纯原地转, 会把前进速度整个丢掉。三个具体 adapter
-            # 都覆写了 publish_arc, 但默认实现是个陷阱 —— 这道分支让"未接通"
-            # 这条常态路径在任何 adapter 上都与航向保持上线前逐位相同, arc
-            # 只出现在真正接通的那零点几秒。
+            # angular == 0 时**必须**走 publish_jog: publish_arc 会把零角速度
+            # 退化成纯原地转, 把前进速度整个丢掉。这道分支让"未接通"这条常态
+            # 路径与航向保持上线前逐位相同, arc 只出现在真正接通的那零点几秒。
             if angular:
                 self._adapter.publish_arc(self._executor.linear_cmd, angular)
             else:
@@ -1545,17 +1513,14 @@ class DockingNode(Node):
         elif kind == 'turning':
             # 纯原地转弯。"转向时叠加前进速度"(arc) 已弃用: 规划器要的是原地
             # 转 θ 度, 叠上 vx 会让车沿弧驶出目标横向范围。转向精度靠里程计
-            # 校准 (full=True 全量盲转), 转得慢没关系; 差速轮原地转若需克服
-            # 静摩擦, 宁可加大 jog_angular_rate, 也不叠前向速度。
+            # 校准 (全量盲转), 转得慢没关系; 差速轮原地转若需克服静摩擦,
+            # 宁可加大 jog_angular_rate, 也不叠前向速度。
             # 注意与上面 jogging 分支的 arc 区分, 那是方向相反的另一件事:
             # 这条禁的是"本该只转、却混进了走", 那条是"本该只走、要守住不歪"
             # (行进中航向保持, 见 HeadingHold)。
             self._adapter.publish_turn(self._executor.angular_cmd)
         elif kind == 'lateral':
-            if hasattr(self._adapter, 'publish_lateral'):
-                self._adapter.publish_lateral(self._executor.lateral_cmd)
-            else:
-                self._adapter.publish_stop()
+            self._adapter.publish_lateral(self._executor.lateral_cmd)
         else:
             self._adapter.publish_stop()
 
@@ -1571,8 +1536,7 @@ class DockingNode(Node):
         # 漏清的后果是静默的: 之后真正的双码动作会被当成粗对准步, 既不查
         # pending_valid 也不记 action_started, 双码的预算/合格状态全部作废。
         self._dual_prealign_active = False
-        if self._dual.enabled:
-            self._dual.stopped(now_ns)
+        self._dual.stopped(now_ns)
 
     def _reset_visual_state(self):
         """解冻 + 丢弃运动期全部旧位姿。
@@ -1586,9 +1550,8 @@ class DockingNode(Node):
         self._pose_buffer.clear()          # 丢弃所有历史缓冲位姿
         self._dual.reset_filter()
         self._discard_dual_pending()
-        if self._dual.enabled:
-            self._dual.settle_until_ns = max(self._dual.settle_until_ns,
-                self.get_clock().now().nanoseconds)          # 桩码 EMA 同步丢弃 (hold 跨停保持)
+        self._dual.settle_until_ns = max(self._dual.settle_until_ns,
+            self.get_clock().now().nanoseconds)          # 桩码 EMA 同步丢弃 (hold 跨停保持)
 
     def _reset_maneuver(self):
         """Clear any queued/active blind maneuver.
@@ -1683,10 +1646,6 @@ class DockingNode(Node):
             min_engage_ns=int(min_engage*1e9),
             cooldown_ns=int(self._p('stopgo.heading_hold_cooldown_sec')*1e9),
             budget=budget)
-
-    @staticmethod
-    def _is_omni(base_type: str) -> bool:
-        return base_type in ('omni', 'quadruped')
 
     # ── Params dict ────────────────────────────────────────────────
 
@@ -1828,8 +1787,7 @@ class DockingNode(Node):
 
             tag_pose = self._get_latest_pose()
             if tag_pose is not None:
-                target_dist = self._dual.effective_dock_distance()
-                feedback.distance_error = abs(tag_pose.dist - target_dist)
+                feedback.distance_error = abs(tag_pose.dist - self._dual.target)
                 feedback.yaw_error = abs(tag_pose.yaw)
             feedback.state = self._sm.state_name.lower()
             goal_handle.publish_feedback(feedback)

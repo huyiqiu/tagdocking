@@ -39,7 +39,7 @@ camera_info 时间戳天然逐帧一致, 且内含降采样, 少一跳大帧 DDS
         -p camera_info_file:=/path/to/rtsp_camera_info.yaml
 
     # 或经 launch 一键起整套(见 launch/docking.launch.py):
-    ros2 launch tagdocking docking.launch.py base_type:=omni \\
+    ros2 launch tagdocking docking.launch.py \\
         rtsp_url:=rtsp://192.168.1.100:8554/live \\
         camera_info_file:=/path/to/rtsp_camera_info.yaml \\
         odom_topic:=/odom camera_mount_z:=0.35

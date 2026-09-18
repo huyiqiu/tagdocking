@@ -23,7 +23,6 @@
 #   camera_info_file        <包share>/config/rtsp_camera_info.yaml (绝对路径)
 #   odom_topic              /odin1/odometry_highfreq
 #   camera_downscale        0
-#   dual_enable             true
 #   dual_settle_sec         1.0
 #   dual_dock_distance      0.47
 #   camera_lateral_offset_m 0

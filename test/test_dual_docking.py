@@ -11,12 +11,12 @@ from tagdocking.dual_camera import CameraModel
 class Node:
     def __init__(self, **overrides):
         self.params = {'dual.'+k: v for k, v in DEFAULTS.items()}
-        self.params.update({'dual.enable': True, 'dual.pile_tag_id': 51,
+        self.params.update({'dual.pile_tag_id': 51,
                             'tag.id': 0, 'tag.family': '36h11',
-                            'base.type': 'omni', 'dual.dock_distance': .5,
+                            'dual.dock_distance': .5,
                             'dual.straight_start_distance': 1.70,
                             'dual.align_tolerance_deg': 3., 'dual.align_hold_sec': .5,
-                            'dock_target.distance': .55, 'dual.wall_tag_size': .15,
+                            'dual.wall_tag_size': .15,
                             'dual.pile_tag_size': .05})
         self.params.update(overrides)
 
@@ -45,7 +45,7 @@ def frames(c, depth=1.8, x=0., pile_x=None, start=10., missing=False, count=4):
 
 
 def plan(c, now):
-    return c.plan_dual(None, 'omni', None, now)
+    return c.plan_dual(None, now)
 
 
 def test_observation_then_forward_and_recorrect():
@@ -219,11 +219,6 @@ def test_new_misaligned_pair_revokes_qualification():
     c.stopped(n)
     frames(c, depth=1.45, x=.1, start=13)
     assert c.qualified_ns == 0
-
-
-def test_single_tag_target_unchanged():
-    c = DualTagDocking(Node(**{'dual.enable': False}))
-    assert c.effective_dock_distance() == .55
 
 
 def feed_corrections(c, js):

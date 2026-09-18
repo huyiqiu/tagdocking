@@ -96,10 +96,14 @@ def test_passive_acceptance_switch_and_one_shot(outcome):
     assert c._phase == (c.DONE if outcome in ('ok', 'disabled') else c.FAILED)
 
 
-def test_explicit_false_launch_always_overrides_yaml():
+def test_launch_applies_dual_params_unconditionally():
     source = (ROOT / 'launch' / 'docking.launch.py').read_text()
-    assert "'dual.enable': dual_enabled" in source
-    assert 'if dual_enabled else []' not in source
+    # dual 恒开: launch 不再有 dual_enable 开关, 也不再写 'dual.enable';
+    # 双码参数 (tag 尺寸/ID) 必须无条件覆盖 yaml, 保证 apriltag 与
+    # docking_node 两侧的 TF frame 名一致。
+    assert 'dual_enable' not in source
+    assert "'dual.enable'" not in source
+    assert "'dual.wall_tag_size': wall_tag_size" in source
     # Never call launch_setup: it contains process-killing side effects.
     ast.parse(source)
 
@@ -117,7 +121,7 @@ def test_pending_expiry_does_not_start_or_qualify():
     node._adapter = NS(publish_stop=lambda: stops.append(True))
     node._reset_visual_state = lambda: None
     # No executor attributes: reaching it is a test failure.
-    assert not node._launch_pending_seq('omni', n+int(1e9))
+    assert not node._launch_pending_seq(n+int(1e9))
     assert node._pending_seq is None and stops and not c.progress
 
 
@@ -139,7 +143,7 @@ def test_stop_precedes_terminal_confirmation():
     node._planner = None
     node._lookup_camera_offset = lambda: None
     node._sm = NS(finish_dual=lambda: events.append('docked'))
-    node._run_stop_and_go(True, None, 'omni', n)
+    node._run_stop_and_go(True, None, n)
     assert events[-3:] == ['cancel', 'stop', 'docked']
 
 
@@ -216,7 +220,7 @@ def intake():
     n._dual_reject_count = {}
     n._sm = NS(state=DockingState.APPROACH)
     n._p = lambda name: {'tag.id': 0, 'tag.frame': 'wall',
-        'camera_frame': 'optical', 'base.type': 'omni'}[name]
+        'camera_frame': 'optical'}[name]
     n.now = int(20e9)
     n.get_clock = lambda: NS(now=lambda: NS(nanoseconds=n.now))
     n.logs, n.queries, n.events = [], [], []
@@ -514,7 +518,7 @@ def test_executor_rejected_start_does_not_commit_qualification(busy):
     n._odom_x = n._odom_y = n._odom_yaw = 0.
     n._executor = NS(is_active=busy,start_turn=lambda *a,**kw:False)
     n._p = lambda name: .1
-    assert not n._launch_step(ActionPlan(kind='yaw',turn_angle=.001),'omni')
+    assert not n._launch_step(ActionPlan(kind='yaw',turn_angle=.001))
     assert n._dual.actions == 0 and not n._dual.qualified_ns and not n._dual._travel_qualification
 
 
@@ -556,7 +560,7 @@ def prealign_node(**params):
                               warn=lambda *a, **kw: n.events.append('warn'))
     n._p = lambda name: {'stopgo.max_turn_step': .17}[name]
     n._pending_seq = None
-    n._launch_pending_seq = lambda bt, now: n.events.append('launch')
+    n._launch_pending_seq = lambda now: n.events.append('launch')
     return n
 
 
@@ -567,7 +571,7 @@ def test_prealign_turns_toward_the_wall_tag_with_a_bounded_step():
     """
     n = prealign_node(prealign_step_deg=8.)
     pose = TagPose(dist=1.371, lat=+.5, yaw=0., stamp_ns=int(20e9), normal=0.)
-    assert not n._dual_prealign(True, pose, 'omni', int(20e9))
+    assert not n._dual_prealign(True, pose, int(20e9))
     assert not n._dual_prealigned and n._dual_prealign_active
     assert n.events == ['launch']
     step, = n._pending_seq
@@ -578,7 +582,7 @@ def test_prealign_turns_toward_the_wall_tag_with_a_bounded_step():
     # 镜像: 墙码在车右 → 右转。
     m = prealign_node(prealign_step_deg=8.)
     m._dual_prealign(True, TagPose(dist=1.371, lat=-.5, yaw=0.,
-                                   stamp_ns=int(20e9), normal=0.), 'omni', int(20e9))
+                                   stamp_ns=int(20e9), normal=0.), int(20e9))
     assert m._pending_seq[0].turn_angle < 0
 
 
@@ -588,13 +592,13 @@ def test_prealign_step_is_clamped_by_residual_and_by_max_turn_step():
     n = prealign_node(prealign_step_deg=8., prealign_tolerance_deg=5.)
     bearing = math_.radians(6.)
     n._dual_prealign(True, TagPose(dist=1., lat=math_.tan(bearing), yaw=0.,
-                                   stamp_ns=int(20e9), normal=0.), 'omni', int(20e9))
+                                   stamp_ns=int(20e9), normal=0.), int(20e9))
     assert n._pending_seq[0].turn_angle == pytest.approx(bearing, rel=1e-6)
     # stopgo.max_turn_step 仍是硬闸 (保证墙码不转出视野)。
     m = prealign_node(prealign_step_deg=14.)
     m._p = lambda name: {'stopgo.max_turn_step': .10}[name]
     m._dual_prealign(True, TagPose(dist=1., lat=1., yaw=0.,
-                                   stamp_ns=int(20e9), normal=0.), 'omni', int(20e9))
+                                   stamp_ns=int(20e9), normal=0.), int(20e9))
     assert m._pending_seq[0].turn_angle == pytest.approx(.10)
 
 
@@ -603,20 +607,20 @@ def test_prealign_hands_off_when_tight_and_warns_but_hands_off_when_exhausted():
     n = prealign_node(prealign_tolerance_deg=5.)
     tight = math_.radians(3.)
     assert n._dual_prealign(True, TagPose(dist=1.371, lat=math_.tan(tight), yaw=0.,
-                                          stamp_ns=int(20e9), normal=0.), 'omni', int(20e9))
+                                          stamp_ns=int(20e9), normal=0.), int(20e9))
     assert n._dual_prealigned and n._pending_seq is None and not n.events
     # 预算耗尽: 告警后仍移交双码 —— 收敛/失败判定的责任统一在双码,
     # 两处都判失败会让同一个故障出现两种说法。
     m = prealign_node(prealign_max_steps=3)
     m._dual_prealign_steps = 3
     assert m._dual_prealign(True, TagPose(dist=1.371, lat=.5, yaw=0.,
-                                          stamp_ns=int(20e9), normal=0.), 'omni', int(20e9))
+                                          stamp_ns=int(20e9), normal=0.), int(20e9))
     assert m._dual_prealigned and m.events == ['warn'] and m._pending_seq is None
 
 
 def test_prealign_waits_for_a_pose_and_never_reengages_after_acquire():
     n = prealign_node()
-    assert not n._dual_prealign(False, None, 'omni', int(20e9))
+    assert not n._dual_prealign(False, None, int(20e9))
     assert n.events == ['stop'] and n._pending_seq is None
     # observe/approach/locked 相位由双码几何或锁定直行掌方向盘, 单码不得插手 ——
     # 这些相位下连 _dual_prealigned 都不该被读 (locked 直行没有粗对准概念)。
@@ -626,7 +630,7 @@ def test_prealign_waits_for_a_pose_and_never_reengages_after_acquire():
         del m._dual_prealigned
         assert m._dual_prealign(True, TagPose(dist=.6, lat=.5, yaw=0.,
                                               stamp_ns=int(20e9), normal=0.),
-                                'omni', int(20e9))
+                                int(20e9))
         assert m._pending_seq is None and not m.events
 
 
@@ -669,9 +673,10 @@ def hold_node(**overrides):
 
 
 def test_jogging_publishes_an_arc_only_while_the_hold_is_engaged():
-    """BaseAdapter.publish_arc 的默认实现回落成**纯原地转**, 会把前进速度整个
-    丢掉。所以未接通 (常态, 占整程 95%+) 必须一次都不碰 publish_arc; 接通时
-    发出去的第一个实参必须还是那 0.08m/s 前进速度, 不是 0。"""
+    """publish_arc 是航向保持接通时的专属通道; 未接通 (常态, 占整程 95%+)
+    必须一次都不碰它 —— 底盘侧把 arc 当"走+转都生效"处理, 未接通时混进
+    角速度就是在没有闭环依据的地方发转向。接通时发出去的第一个实参必须
+    还是那 0.08m/s 前进速度, 不是 0。"""
     node = hold_node()
     calls = []
     node._adapter = NS(publish_jog=lambda v: calls.append(('jog', v)),
@@ -681,31 +686,30 @@ def test_jogging_publishes_an_arc_only_while_the_hold_is_engaged():
     node._executor = NS(action_kind='jogging', linear_cmd=.08,
                         angular_cmd=0., lateral_cmd=0.)
     for _ in range(5):
-        node._publish_action_cmd('omni')
-    assert calls == [('jog', .08)]*5, '未接通却走了 arc —— 默认实现会丢掉前进速度'
+        node._publish_action_cmd()
+    assert calls == [('jog', .08)]*5, '未接通却走了 arc —— 会混进无依据的转向'
     node._executor.angular_cmd = -.12
-    node._publish_action_cmd('omni')
+    node._publish_action_cmd()
     assert calls[-1] == ('arc', .08, -.12), '接通时前进速度必须原样带上'
     # turning 分支方向相反: "本该只转、却混进了走"仍然禁止
     node._executor = NS(action_kind='turning', linear_cmd=.08,
                         angular_cmd=.3, lateral_cmd=0.)
-    node._publish_action_cmd('omni')
+    node._publish_action_cmd()
     assert calls[-1] == ('turn', .3), 'turning 仍须纯原地转'
 
 
-def launched(plan_step, dual_enabled=True, **overrides):
+def launched(plan_step, **overrides):
     """跑真实的 _launch_step, 返回传给 start_jog 的 hold 实参。"""
     node = hold_node(**{'stopgo.jog_linear_rate': .08, 'stopgo.jog_odom_scale': 1.,
                         'stopgo.jog_backward_odom_scale': 1.,
                         'stopgo.lateral_rate': .12, 'stopgo.lateral_odom_scale': 1.,
                         **overrides})
     seen = {}
-    node._dual = NS(enabled=dual_enabled, p=lambda k: 0.5,
+    node._dual = NS(p=lambda k: 0.5,
                     action_started=lambda plan, now: None)
     node._odom_x = node._odom_y = node._odom_yaw = 0.
     node._odom_stamp_ns = int(10e9)
     node.get_clock = lambda: NS(now=lambda: NS(nanoseconds=int(10e9)))
-    node._is_omni = lambda t: True
     node._adapter = NS(publish_stop=lambda: None, publish_jog=lambda v: None,
                        publish_arc=lambda v, w: None)
     node._sm = NS(abort_motion=lambda m, code='': None)
@@ -717,7 +721,7 @@ def launched(plan_step, dual_enabled=True, **overrides):
             seen.update(hold=hold, distance=d), setattr(node._executor, 'is_active', True)),
         set_odom_ref=lambda *a, **kw: None, action_kind='jogging',
         _action_target=.45, angular_cmd=0., linear_cmd=.08, lateral_cmd=0.)
-    node._launch_step(plan_step, 'omni')
+    node._launch_step(plan_step)
     return seen.get('hold', 'not-called')
 
 
@@ -733,8 +737,6 @@ def test_heading_hold_arms_only_for_the_continuous_zone_run():
                                continuous=True)) is None, '倒走必须被 jog_distance>0 挡住'
     # 区外 forward_step 逐步走: 那里墙码 bearing 微调活着, 每停都在纠方向
     assert launched(RealActionPlan(kind='forward', jog_distance=.10)) is None
-    # 单码通道 (另有 final_straight 一套)
-    assert launched(zone, dual_enabled=False) is None
     # 现场一键回滚
     assert launched(zone, **{'stopgo.heading_hold_enable': False}) is None
 

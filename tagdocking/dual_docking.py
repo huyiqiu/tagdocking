@@ -2,7 +2,6 @@
 
 Coordinates are calibrated optical x-right/y-down/z-forward. Ground-plane
 geometry uses the complete optical-to-base rigid transform, not tag normals.
-The historical parallax solver is retained below for offline compatibility.
 """
 import math
 from dataclasses import replace
@@ -123,90 +122,86 @@ class DualTagDocking:
     """
     def __init__(self, node):
         self._node = node
-        self.enabled = bool(node._p('dual.enable'))
         self._pile_tag_id = int(node._p('dual.pile_tag_id'))
         self.r = self.t = None
         self.camera = None
         self.reset()
-        if self.enabled:
-            if self._pile_tag_id == int(node._p('tag.id')):
-                raise ValueError('dual wall and pile IDs must differ')
-            if node._p('base.type') not in ('omni', 'quadruped'):
-                raise ValueError('dual docking requires a lateral-capable base')
-            for name, value in DEFAULTS.items():
-                v = self.p(name)
-                if not math.isfinite(v) or v <= 0:
-                    raise ValueError('dual.' + name + ' must be finite and positive')
-            for name in ('visibility_samples', 'feedback_fail_windows', 'no_candidate_windows',
-                         'min_frames', 'max_actions', 'reverse_count', 'prealign_max_steps',
-                         'standoff_reverse_count', 'straight_yaw_max_turns'):
-                if self.p(name) < 1 or not self.p(name).is_integer():
-                    raise ValueError('dual.' + name + ' must be a positive integer')
-            if self.p('visibility_samples') > 256:
-                raise ValueError('dual.visibility_samples must be <= 256')
-            if self.p('min_lateral_m') > self.p('lateral_step'):
-                raise ValueError('dual.min_lateral_m exceeds dual.lateral_step')
-            # 横移步长同样不再有 3cm 硬上限 (原 min(.03, lateral_step), 与 yaw_cap
-            # 和 forward_step 同一种病: 配置项是装饰)。上限留 0.10m —— 横移是
-            # 单步盲走, 没有转向那样的角度反馈, 一步太大轻则把两码推出画面
-            # (visible() 会拦), 重则误差无处吸收。执行器对任何通道都不钳制
-            # 距离 (jog_max 只闸单码规划器), 本区间就是双码横移的全部防线。
-            if not 0.005 <= self.p('lateral_step') <= .10:
-                raise ValueError('dual.lateral_step must be in [0.005, 0.10] m')
-            # yaw 步长不再有 3° 硬上限 (见 yaw_cap): 3° 命令的停止滞后与命令本身
-            # 同量级, 提前量被 0.5*target 钳位 → 每步只转一半, 远场 20° 偏差要
-            # 30 步才收敛, 必然撞上 observe_timeout。但上限也不能无界: 大步转向
-            # 会把 tag 甩出视野 (visible() 会否掉, 于是一个候选都不剩), 且
-            # max_turn_step (0.17rad≈9.7°) 是执行器侧的硬闸。留 15° 作为理智上限。
-            for name in ('yaw_step_deg', 'yaw_fine_step_deg'):
-                if not 0.5 <= self.p(name) <= 15.:
-                    raise ValueError('dual.' + name + ' must be in [0.5, 15] degrees')
-            if self.p('yaw_fine_step_deg') > self.p('yaw_step_deg'):
-                raise ValueError('dual.yaw_fine_step_deg must not exceed yaw_step_deg')
-            # 单码粗对准门槛必须比双码对准门槛宽: 否则粗对准要去做双码的活,
-            # 而单码量测 (墙码 bearing) 的噪声正是双码几何要绕开的东西。
-            if self.p('prealign_tolerance_deg') < float(node._p('dual.align_tolerance_deg')):
-                raise ValueError('dual.prealign_tolerance_deg must be >= align_tolerance_deg')
-            if not 1. <= self.p('prealign_step_deg') <= 15.:
-                raise ValueError('dual.prealign_step_deg must be in [1, 15] degrees')
-            for name in ('wall_tag_size', 'pile_tag_size'):
-                if not math.isfinite(self.p(name)) or self.p(name) <= 0:
-                    raise ValueError('dual.' + name + ' must be finite and positive')
-            if not (0 < self.target < self.near < self.p('observation_distance')):
-                raise ValueError(
-                    'require dock_distance < straight_start_distance < observation_distance, got '
-                    f"{self.target:.2f} / {self.near:.2f} / {self.p('observation_distance'):.2f} "
-                    '(站立式: observation_distance=1.8, straight_start_distance=1.70)')
-            # 纯直行区必须夹在停泊点与站位之间: 低于 dock_distance 等于从不生效
-            # (禁令区在终点之后), 高于站位则把 observe 的纠偏一起禁掉 —— 而双码
-            # 对准本来就只在站位处做, 禁掉它整场就没有对准环节了。
-            # 取 == near 合法: "整个 approach 全程纯直行"是一个有意义的配置。
-            if not self.target < self.p('steering_stop_distance') <= self.near:
-                raise ValueError(
-                    'require dock_distance < steering_stop_distance <= '
-                    'straight_start_distance, got '
-                    f"{self.target:.2f} / {self.p('steering_stop_distance'):.2f} / "
-                    f'{self.near:.2f}')
-            # locked 的墙码 bearing 微调是最后的精修: 容差比双码对准门还松就
-            # 等于能撤销入口门; 下限 0.5° 以下落进底盘转向分辨率, 是命令噪声。
-            if not 0.5 <= self.p('straight_yaw_tol_deg') <= float(node._p('dual.align_tolerance_deg')):
-                raise ValueError('dual.straight_yaw_tol_deg must be in [0.5, align_tolerance_deg] degrees')
-            # 上界 15°: 门槛 = atan(target·sin(lag)/(z−target)), lag 再大只是
-            # 把区内转向整体关掉 (= 旧行为), 不会不安全; 拦在这里只为让
-            # "本以为配了个小旋钮、实际关掉了整个功能" 在启动时就被看见。
-            if not 0 < self.p('straight_yaw_lag_deg') <= 15:
-                raise ValueError('dual.straight_yaw_lag_deg must be in (0, 15] degrees')
-            # 站位必须在观察窗内 (≤ obs-tol): 它同时是 approach 桩码丢失闭锁的
-            # 窗口上界、yaw_cap 远/近分档与站位守卫的基准, 站在窗外没有意义。
-            if self.near > self.p('observation_distance') - self.p('observation_tolerance') + 1e-9:
-                raise ValueError(
-                    'require straight_start_distance <= observation_distance - observation_tolerance, got '
-                    f"{self.near:.2f} > {self.p('observation_distance'):.2f}-"
-                    f"{self.p('observation_tolerance'):.2f}")
-            if self.p('dock_tolerance') >= self.target:
-                raise ValueError('dual dock_tolerance must be smaller than target')
-            if not (0.3 <= float(node._p('dual.align_tolerance_deg')) <= 10):
-                raise ValueError('dual.align_tolerance_deg must be in [0.3, 10]')
+        if self._pile_tag_id == int(node._p('tag.id')):
+            raise ValueError('dual wall and pile IDs must differ')
+        for name, value in DEFAULTS.items():
+            v = self.p(name)
+            if not math.isfinite(v) or v <= 0:
+                raise ValueError('dual.' + name + ' must be finite and positive')
+        for name in ('visibility_samples', 'feedback_fail_windows', 'no_candidate_windows',
+                     'min_frames', 'max_actions', 'reverse_count', 'prealign_max_steps',
+                     'standoff_reverse_count', 'straight_yaw_max_turns'):
+            if self.p(name) < 1 or not self.p(name).is_integer():
+                raise ValueError('dual.' + name + ' must be a positive integer')
+        if self.p('visibility_samples') > 256:
+            raise ValueError('dual.visibility_samples must be <= 256')
+        if self.p('min_lateral_m') > self.p('lateral_step'):
+            raise ValueError('dual.min_lateral_m exceeds dual.lateral_step')
+        # 横移步长同样不再有 3cm 硬上限 (原 min(.03, lateral_step), 与 yaw_cap
+        # 和 forward_step 同一种病: 配置项是装饰)。上限留 0.10m —— 横移是
+        # 单步盲走, 没有转向那样的角度反馈, 一步太大轻则把两码推出画面
+        # (visible() 会拦), 重则误差无处吸收。执行器对任何通道都不钳制
+        # 距离 (jog_max 只闸单码规划器), 本区间就是双码横移的全部防线。
+        if not 0.005 <= self.p('lateral_step') <= .10:
+            raise ValueError('dual.lateral_step must be in [0.005, 0.10] m')
+        # yaw 步长不再有 3° 硬上限 (见 yaw_cap): 3° 命令的停止滞后与命令本身
+        # 同量级, 提前量被 0.5*target 钳位 → 每步只转一半, 远场 20° 偏差要
+        # 30 步才收敛, 必然撞上 observe_timeout。但上限也不能无界: 大步转向
+        # 会把 tag 甩出视野 (visible() 会否掉, 于是一个候选都不剩), 且
+        # max_turn_step (0.17rad≈9.7°) 是执行器侧的硬闸。留 15° 作为理智上限。
+        for name in ('yaw_step_deg', 'yaw_fine_step_deg'):
+            if not 0.5 <= self.p(name) <= 15.:
+                raise ValueError('dual.' + name + ' must be in [0.5, 15] degrees')
+        if self.p('yaw_fine_step_deg') > self.p('yaw_step_deg'):
+            raise ValueError('dual.yaw_fine_step_deg must not exceed yaw_step_deg')
+        # 单码粗对准门槛必须比双码对准门槛宽: 否则粗对准要去做双码的活,
+        # 而单码量测 (墙码 bearing) 的噪声正是双码几何要绕开的东西。
+        if self.p('prealign_tolerance_deg') < float(node._p('dual.align_tolerance_deg')):
+            raise ValueError('dual.prealign_tolerance_deg must be >= align_tolerance_deg')
+        if not 1. <= self.p('prealign_step_deg') <= 15.:
+            raise ValueError('dual.prealign_step_deg must be in [1, 15] degrees')
+        for name in ('wall_tag_size', 'pile_tag_size'):
+            if not math.isfinite(self.p(name)) or self.p(name) <= 0:
+                raise ValueError('dual.' + name + ' must be finite and positive')
+        if not (0 < self.target < self.near < self.p('observation_distance')):
+            raise ValueError(
+                'require dock_distance < straight_start_distance < observation_distance, got '
+                f"{self.target:.2f} / {self.near:.2f} / {self.p('observation_distance'):.2f} "
+                '(站立式: observation_distance=1.8, straight_start_distance=1.70)')
+        # 纯直行区必须夹在停泊点与站位之间: 低于 dock_distance 等于从不生效
+        # (禁令区在终点之后), 高于站位则把 observe 的纠偏一起禁掉 —— 而双码
+        # 对准本来就只在站位处做, 禁掉它整场就没有对准环节了。
+        # 取 == near 合法: "整个 approach 全程纯直行"是一个有意义的配置。
+        if not self.target < self.p('steering_stop_distance') <= self.near:
+            raise ValueError(
+                'require dock_distance < steering_stop_distance <= '
+                'straight_start_distance, got '
+                f"{self.target:.2f} / {self.p('steering_stop_distance'):.2f} / "
+                f'{self.near:.2f}')
+        # locked 的墙码 bearing 微调是最后的精修: 容差比双码对准门还松就
+        # 等于能撤销入口门; 下限 0.5° 以下落进底盘转向分辨率, 是命令噪声。
+        if not 0.5 <= self.p('straight_yaw_tol_deg') <= float(node._p('dual.align_tolerance_deg')):
+            raise ValueError('dual.straight_yaw_tol_deg must be in [0.5, align_tolerance_deg] degrees')
+        # 上界 15°: 门槛 = atan(target·sin(lag)/(z−target)), lag 再大只是
+        # 把区内转向整体关掉 (= 旧行为), 不会不安全; 拦在这里只为让
+        # "本以为配了个小旋钮、实际关掉了整个功能" 在启动时就被看见。
+        if not 0 < self.p('straight_yaw_lag_deg') <= 15:
+            raise ValueError('dual.straight_yaw_lag_deg must be in (0, 15] degrees')
+        # 站位必须在观察窗内 (≤ obs-tol): 它同时是 approach 桩码丢失闭锁的
+        # 窗口上界、yaw_cap 远/近分档与站位守卫的基准, 站在窗外没有意义。
+        if self.near > self.p('observation_distance') - self.p('observation_tolerance') + 1e-9:
+            raise ValueError(
+                'require straight_start_distance <= observation_distance - observation_tolerance, got '
+                f"{self.near:.2f} > {self.p('observation_distance'):.2f}-"
+                f"{self.p('observation_tolerance'):.2f}")
+        if self.p('dock_tolerance') >= self.target:
+            raise ValueError('dual dock_tolerance must be smaller than target')
+        if not (0.3 <= float(node._p('dual.align_tolerance_deg')) <= 10):
+            raise ValueError('dual.align_tolerance_deg must be in [0.3, 10]')
 
     def p(self, name):
         return float(self._node._p('dual.' + name))
@@ -299,9 +294,6 @@ class DualTagDocking:
     @property
     def cam_offset_known(self):
         return self.r is not None
-
-    def effective_dock_distance(self):
-        return self.target if self.enabled else float(self._node._p('dock_target.distance'))
 
     def set_extrinsics(self, translation, quaternion):
         r = rotation(quaternion)
@@ -997,7 +989,7 @@ class DualTagDocking:
         return self._emit(ActionPlan(kind='forward', jog_distance=-self.p('reverse_step')),
                           relaxed=relaxed, reverse_kind=why)
 
-    def plan_dual(self, wall, base_type, planner, now_ns):
+    def plan_dual(self, wall, now_ns):
         now = now_ns
         self.started_ns = self.started_ns or now
         if self.failure or self.complete:
@@ -1355,47 +1347,5 @@ class DualTagDocking:
                 return self._emit(run, aligned=True)
         return self._emit_forward(ActionPlan(kind='forward', jog_distance=min(
             self.p('forward_step'), remaining/self.r[0][2])), aligned=True)
-
-
-def parallax_solve(b_w: float, d_w: float, b_p: float, d_p: float,
-                   min_baseline: float = 0.08, max_baseline: float = 1.0,
-                   max_slide: float = 0.6, max_psi: float = 0.7):
-    """双码视差解算: 由两码方位/距离解机器人横偏 Y 与航向误差 ψ。
-
-    生成模型 (REP-103, 桩轴为 x', 机器人在轴侧偏 Y、航向偏 ψ):
-        b_w = atan(-Y/d_w) - ψ
-        b_p = atan(-Y/d_p) - ψ
-    联立消 ψ (Δ = b_w − b_p), 用 tan 减法公式化为 Y 的二次方程:
-        tanΔ·Y² + (d_p−d_w)·Y + tanΔ·d_w·d_p = 0
-    解析解 (取近根 + 有理化, Δ→0 数值稳定):
-        Y = 2·tanΔ·d_w·d_p / ((d_w−d_p) + √D)
-        D = (d_w−d_p)² − 4·tan²Δ·d_w·d_p
-        ψ = atan(−Y/d_w) − b_w
-    D < 0 ⟺ 两码方位差超过基线几何上限 → 无物理解。方位差函数在
-    |Y| = √(d_w·d_p) 处有极值, 观测落在极值两侧时方程双解 (两位姿产生
-    相同观测) —— 取 |Y| 较小的根 (单调可逆区, 观测-位姿一一对应);
-    真实位姿远偏到双解区时解算欠幅但方向正确, 走停每停重测闭环自愈。
-
-    Returns:
-        (Y, psi) — 修正量为 -Y (横移) / -ψ (原地转); 解不可信时 None:
-        基线退化 [min_baseline, max_baseline] 之外、方位差超基线几何
-        上限 (D < 0)、或解幅值超合理性范围 (max_slide / max_psi)。
-    """
-    baseline = d_w - d_p
-    if not (min_baseline <= baseline <= max_baseline):
-        return None
-    db = b_w - b_p                   # 方位差 = atan(-Y/d_w) - atan(-Y/d_p)
-    t = math.tan(db)
-    # 二次方程判别式: D < 0 ⟺ 方位差超过基线几何上限 → 无物理解。
-    # |Y| 恰在 √(d_w·d_p) 处 D 理论为 0, 浮点舍入可出 -1e-17 → 容差防误拒。
-    disc = baseline * baseline - 4.0 * t * t * d_w * d_p
-    if disc < -1e-12:
-        return None
-    # 有理化近根 (Δ→0 时分子分母同阶→0, 无 0/0 灾难)
-    y = 2.0 * t * d_w * d_p / (baseline + math.sqrt(max(disc, 0.0)))
-    psi = math.atan(-y / d_w) - b_w
-    if abs(y) > max_slide or abs(psi) > max_psi:
-        return None
-    return y, psi
 
 
