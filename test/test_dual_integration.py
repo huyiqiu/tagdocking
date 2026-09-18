@@ -50,12 +50,12 @@ def clock_node():
 
 def test_dual_state_machine_no_single_tag_success_search_or_retry():
     sm = DockingStateMachine(clock_node())
-    sm._state = DockingState.FINAL_SERVO
-    params = {'dual_enable': True}
+    sm._state = DockingState.APPROACH
+    params = {}
     def tick(visible):
         return sm.evaluate(TagPose(.1, 0, 0, int(20e9), 0), visible,
-                           0, 0, 0, 0, 0, 0, False, int(20e9), params)
-    assert tick(True) == DockingState.FINAL_SERVO
+                           False, int(20e9), params)
+    assert tick(True) == DockingState.APPROACH
     for _ in range(60):
         tick(False)
     assert sm.state == DockingState.MOTION_FAILED
@@ -890,7 +890,7 @@ def test_stale_locked_watchdog_reason_names_fresh_sec():
 def _outer_budget_reason(**extra):
     sm = DockingStateMachine(clock_node())
     sm._tag_lost_count = 51
-    params = {'dual_enable': True, 'tag': {'tag_loss_timeout_sec': 2.5}}
+    params = {'tag': {'tag_loss_timeout_sec': 2.5}}
     params.update(extra)
     return sm._wall_loss_reason(params)
 
@@ -973,8 +973,7 @@ def _sm_at(state, **attrs):
 
 
 def _tick(sm, now_s, params, visible=False, pose=None, stalled=False):
-    sm.evaluate(pose, visible, 0, 0, 0, 0, 0, 0, stalled,
-                int(now_s * 1e9), params)
+    sm.evaluate(pose, visible, stalled, int(now_s * 1e9), params)
     return sm
 
 
@@ -983,23 +982,14 @@ def _overall_timeout():
 
 
 def _motion_stalled():
-    return _tick(_sm_at(DockingState.APPROACH), 21, {}, stalled=True)
+    # APPROACH 由双码全权驱动 (evaluate 无条件早退), motion_stalled 判据只
+    # 够得着其余活动态 —— 用 UNDOCKING 钉这条路径。
+    return _tick(_sm_at(DockingState.UNDOCKING), 21, {}, stalled=True)
 
 
 def _search_timeout():
     return _tick(_sm_at(DockingState.SEARCH_TAG), 100,
                  {'timeout_sec': 9e9, 'search': {'timeout_sec': 60.0}})
-
-
-def _approach_timeout():
-    return _tick(_sm_at(DockingState.APPROACH), 100,
-                 {'timeout_sec': 9e9, 'approach_timeout_sec': 60.0},
-                 visible=True, pose=TagPose(2.0, 0, 0, int(20e9), 0))
-
-
-def _retry_reverse_timeout():
-    return _tick(_sm_at(DockingState.RETRYING), 100,
-                 {'timeout_sec': 9e9, 'retry': {'timeout_sec': 15.0}})
 
 
 def _undock_timeout(node_code):
@@ -1012,20 +1002,8 @@ def _undock_timeout(node_code):
 
 def _dual_wall_loss():
     sm = _sm_at(DockingState.APPROACH, _tag_lost_count=200)
-    return _tick(sm, 21, {'timeout_sec': 9e9, 'dual_enable': True,
+    return _tick(sm, 21, {'timeout_sec': 9e9,
                           'tag': {'tag_loss_timeout_sec': 2.5}})
-
-
-def _final_servo_timeout(visible):
-    # 位姿超差 (距离 0.9m 远于 dock_target 0.30m ± 容差), 只有可见性不同。
-    # 码可见那一支走 fail() —— 它先退满重试才是终态, 所以重试预算要先用光,
-    # 否则这里停在 RETRYING (那是活动态, 不该有失败留档)。
-    pose = TagPose(0.9, 0.2, 0.3, int(20e9), 0)
-    sm = _sm_at(DockingState.FINAL_SERVO)
-    sm._retry_count = sm._max_retries
-    return _tick(sm, 100,
-                 {'timeout_sec': 9e9, 'final_servo_timeout_sec': 30.0},
-                 visible=visible, pose=pose if visible else None)
 
 
 def _cancelled():
@@ -1034,33 +1012,20 @@ def _cancelled():
     return sm
 
 
-def _retries_exhausted():
-    sm = _sm_at(DockingState.FINAL_SERVO)
-    for _ in range(sm._max_retries + 1):
-        sm._state = DockingState.FINAL_SERVO   # fail() 后会去 RETRYING
-        sm.fail('测试: 直行入口对准过差')
-    return sm
-
-
 # 每一行 = 一条通往错误终态的路。加新的 abort 点就往这里加一行 ——
 # 漏加也不会静默: _transition_to 的守卫会把它报成 unspecified, 而
 # test_unaccounted_failure_path_warns_and_marks_itself 咬着那个码。
+# (v1.0 删掉了单码重试链: 倒车超时/末端精调超时×2/重试耗尽/接近超时
+# 五条路随之消失, 双码失败全部经 abort_motion 直落终态。)
 FAILURE_PATHS = [
     ('整体超时', _overall_timeout, CODE_TIMEOUT),
     ('运动卡死', _motion_stalled, CODE_MOTION_STALLED),
     ('搜索超时', _search_timeout, CODE_TAG_NOT_FOUND),
-    ('接近超时', _approach_timeout, CODE_VISION_NO_PROGRESS),
-    ('倒车超时', _retry_reverse_timeout, CODE_MOTION_STALLED),
     ('泊出超时-门控', lambda: _undock_timeout(CODE_MOTION_GATED),
      CODE_MOTION_GATED),
     ('泊出超时-节点没给码', lambda: _undock_timeout(''), CODE_MOTION_STALLED),
     ('双码外层丢码', _dual_wall_loss, CODE_TAG_NOT_FOUND),
-    ('末端精调超时-码可见', lambda: _final_servo_timeout(True),
-     CODE_VISION_NO_PROGRESS),
-    ('末端精调超时-码不可见', lambda: _final_servo_timeout(False),
-     CODE_TAG_NOT_FOUND),
     ('用户取消', _cancelled, CODE_CANCELLED),
-    ('重试耗尽', _retries_exhausted, CODE_VISION_NO_PROGRESS),
 ]
 
 
@@ -1106,14 +1071,6 @@ def test_failure_ledger_is_cleared_on_each_new_run_and_seq_advances():
     sm.start_undock()                # 泊出同样算新一轮
     assert sm.failure_reason == '' and sm.failure_code == ''
     assert sm.run_seq == first + 3
-
-
-def test_retryable_failure_does_not_leave_a_failure_record():
-    """中途可重试的失败不该留下失败留档 —— 那一轮最后可能是成功的。"""
-    sm = _sm_at(DockingState.FINAL_SERVO)
-    sm.fail('测试: 第一次对准过差')
-    assert sm.state == DockingState.RETRYING
-    assert sm.failure_code == '' and sm.failure_reason == ''
 
 
 def test_publish_outcome_emits_code_and_reason_once_per_terminal():

@@ -560,7 +560,7 @@ def undock_timeout(note='', code='', elapsed=31.0):
     sm = DockingStateMachine(node)
     sm.start_undock()
     node.ns = BASE_NS + int(elapsed * 1e9)
-    sm.evaluate(None, False, 0., 0., 0., 0., 0., 0., False, node.ns,
+    sm.evaluate(None, False, False, node.ns,
                 {'undock': {'timeout_sec': 30.0}})
     return sm
 

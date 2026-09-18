@@ -366,13 +366,10 @@ docking_node:
     # 现场 3° 转向曾在起步 108ms 被判 opposite direction 而中止, 即此瞬态。
     dual.action_startup_sec: 0.6                # s — 起步瞬态宽限, 期间不判反向
 
-    # ── Docking Tolerance ──
+    # ── Docking Tolerance (单码遗留, 仅剩声明; 随单码路径一并删除) ──
     tolerance.position_m: 0.05                # m — 前后 ±5cm 视为到位
     tolerance.yaw_deg: 10.0                   # degrees — ±10° 视为对准
-    tolerance.stable_time_sec: 1.0            # s — must be stable for this long
 
-    # ── Safety ──
-    safety.minimum_distance_m: 0.15           # m — stop if closer than this
     # 静止站立使每个停看点多花 ~1.5-2.5s (锁定+settle+稳定帧+解锁), 一次接近
     # 10-15 停 → +20-40s, 超时相应上调 (120→180); 双码站立流程 (1.8m 站位后退
     # + 1.3m 直行 ≈ 26 步 × ~2.9s) 再上调 (180→300)。
@@ -393,18 +390,12 @@ docking_node:
     # 转动期冻结检测避免误锁; 单向旋转不交替, 12 步(30°)转满一圈在 60s 超时内。
     search.angular_speed: 0.3                 # rad/s — 每步旋转速度
     search.step_angle_deg: 30.0               # deg — 每步旋转角度, 建议≥10°(太小会半速拖慢)
-    search.rotate_time_sec: 0.8               # (已弃用) 角度步进化后不再读取, 保留兼容旧配置
     search.pause_time_sec: 3.0                # s — 每步之间的检测停留时长 (检测流有 1.6~3s 空档, 1.5s 会整个错过)
     search.initial_look_sec: 4.0              # s — 搜索第 0 步的停留时长 (开局 RTSP/检测流冷启动, 再多等一会)
     search.hold_time_sec: 0.5                 # s — 二维码持续可见此时长才锁定
     search.search_direction: 1                # +1=CCW, -1=CW (从未见过二维码时的起始方向)
     # 静止站立使每个搜索步 (锁+检测+解锁) 多花 ~1-2.5s, 12 步会远超 60s, 上调到 120。
     search.timeout_sec: 120.0                 # 整体搜索超时
-
-    # ── Per-State Timeouts ──
-    align_timeout_sec: 15.0
-    approach_timeout_sec: 180.0               # 静止站立每停 +1.5-2.5s, 60→90; 双码 APPROACH 跨 1.8→0.6m (~24 步) 且纠偏全程同钟, 90→180
-    final_servo_timeout_sec: 30.0
 
     # ── Pose Buffer ──
     pose_buffer.size: 30                      # max buffered poses

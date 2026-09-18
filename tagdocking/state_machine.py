@@ -1,20 +1,22 @@
-"""Docking state machine — full lifecycle management.
+"""Docking state machine — full lifecycle management (dual-only).
 
 States:
     IDLE         — waiting for start command
     SEARCH_TAG   — rotating/pausing to find the AprilTag
-    ALIGN        — (legacy, skipped — absorbed into APPROACH stop-and-go)
-    APPROACH     — stop-and-go: lateral→yaw→forward via geometry planner
-    FINAL_SERVO  — stability confirmation (tag pose stable + velocity zero)
-    DOCKED       — success: position + yaw within tolerance, robot stable
+    APPROACH     — dual-tag optical stop-and-go (双码全权驱动走停闭环)
+    DOCKED       — success: dual complete, robot settled on the pile
     UNDOCKING    — pulling out: blind reverse a distance + 180° turn
     UNDOCKED     — success: undock maneuver complete
 
 Error terminal states:
-    TAG_LOST     — tag not visible for > timeout
-    TIMEOUT      — overall docking timeout exceeded
-    MOTION_FAILED— commanded motion not reflected in odometry
+    TIMEOUT      — overall docking timeout exceeded (含搜索超时)
+    MOTION_FAILED— commanded motion not reflected in odometry / abort_motion
     CANCELLED    — user cancelled the docking
+
+双码路径里 APPROACH 由 DualTagDocking 全权驱动: 失败一律 abort_motion
+直落 MOTION_FAILED (本机曾经的单码 fail()→RETRYING 倒车重试链在双码下
+不可达, 已随 v1.0 删除)。APPROACH 的墙码丢失看门狗 (tag_loss_timeout_sec)
+在本文件 evaluate() 里, 是该参数唯一的消费者。
 
 失败留档 (对上层应用的契约): 每一条通往错误终态的路都必须记下
 reason (人读的现场串) + code (FAILURE_CODES 里的稳定机器码), 统一经
@@ -24,22 +26,15 @@ _transition_to 有一道守卫: 进错误终态却没记账就 WARN 自述, 所�
 """
 
 import enum
-import math
-import time
-from .utils import normalize_angle
 
 
 class DockingState(enum.IntEnum):
     IDLE = 0
     SEARCH_TAG = 2
-    ALIGN = 3
     APPROACH = 4
-    FINAL_SERVO = 5
     DOCKED = 6
-    RETRYING = 8          # 失败后倒车重试(活动态, 节点驱动盲退后转 SEARCH_TAG)
     UNDOCKING = 9         # 泊出(活动态): 盲退一段距离 + 原地转180°
     # Error states
-    TAG_LOST = 10
     TIMEOUT = 11
     MOTION_FAILED = 12
     CANCELLED = 13
@@ -49,10 +44,7 @@ class DockingState(enum.IntEnum):
 # States that are considered "active" (not terminal)
 _ACTIVE_STATES = {
     DockingState.SEARCH_TAG,
-    DockingState.ALIGN,
     DockingState.APPROACH,
-    DockingState.FINAL_SERVO,
-    DockingState.RETRYING,
     DockingState.UNDOCKING,
 }
 
@@ -61,7 +53,6 @@ _SUCCESS_STATES = {DockingState.DOCKED, DockingState.UNDOCKED}
 
 # Terminal error states
 _ERROR_STATES = {
-    DockingState.TAG_LOST,
     DockingState.TIMEOUT,
     DockingState.MOTION_FAILED,
     DockingState.CANCELLED,
@@ -115,7 +106,7 @@ class DockingStateMachine:
 
         # Per-state sub-phase tracking
         self._search_tag_hold_start_ns = 0
-        self._align_hold_count = 0
+        # 墙码丢失看门狗的连续未采纳 tick 计数 (evaluate 里累加)。
         self._tag_lost_count = 0
         # 失败理由留档: 过去它只活在一行 error 日志里, 之后无处可取, 通过
         # action 调用的客户端连一个字都拿不到 (只有 'motion_failed')。纯诊断,
@@ -129,14 +120,6 @@ class DockingStateMachine:
         # outcome 话题是锁存的, 不带轮次号就分不出来 (墙上时钟的年龄判不出:
         # 锁存值年龄一直涨, 每 tick 发布则恒为 ~0.05s, 两种都没用)。
         self._run_seq = 0
-
-        # Final servo stability
-        self._stable_since_ns = 0
-        self._last_velocity = (0.0, 0.0, 0.0)
-
-        # 失败重试: 倒车后重新停靠。max_retries 由节点从参数写入。
-        self._retry_count = 0
-        self._max_retries = 2
 
     # ── Properties ──────────────────────────────────────────────────
 
@@ -163,10 +146,6 @@ class DockingStateMachine:
     @property
     def is_error(self) -> bool:
         return self._state in _ERROR_STATES
-
-    @property
-    def retry_count(self) -> int:
-        return self._retry_count
 
     def elapsed_ns(self, now_ns: int) -> int:
         """Nanoseconds since docking started."""
@@ -197,12 +176,9 @@ class DockingStateMachine:
             self._node.get_logger().warn(f'无法启动：当前状态={self._state.name}')
             return False
 
-        self._retry_count = 0   # 用户主动启动: 重试计数清零
         self._begin_run()
         self._transition_to(DockingState.SEARCH_TAG)
         # 每次用户触发都是一次全新的停泊: 重置整体超时起点。
-        # (重试走 retry_search(), 不动 _docking_start_ns, 故同一次停泊内的
-        #  多次倒车重试仍累计在同一超时窗口内。)
         self._docking_start_ns = self._state_start_ns
         return True
 
@@ -239,8 +215,7 @@ class DockingStateMachine:
 
     def finish_dual(self):
         """Called only after controller-confirmed settled finish and zero/cancel."""
-        if self._state in (DockingState.ALIGN, DockingState.APPROACH,
-                           DockingState.FINAL_SERVO):
+        if self._state == DockingState.APPROACH:
             self._transition_to(DockingState.DOCKED)
 
     def finish_undock(self):
@@ -253,33 +228,6 @@ class DockingStateMachine:
         # (cancelled 那一族的约定就是"不算故障")。
         self._record_failure('用户取消停泊', CODE_CANCELLED)
         self._transition_to(DockingState.CANCELLED)
-
-    def fail(self, reason: str = '', code: str = CODE_VISION_NO_PROGRESS):
-        """节点主动报失败 — 可重试的失败(如直行阶段对准过差)。
-
-        若还有重试次数, 转 RETRYING: 节点盲退一段距离后由 retry_search() 转
-        SEARCH_TAG 重新锁定靠近。退满 max_retries 次仍失败才落 MOTION_FAILED 终态。
-        AprilTag 近场位姿(尤其降采样后的小码)单帧噪声大, 直行入口一次方位超限
-        往往是抖动而非真没对准 —— 后退重锁给一次重新靠近的机会。
-        与 cancel()(用户主动取消)区分: cancel() 不重试, 直接终态。
-        """
-        if reason:
-            self._node.get_logger().error(f'导航失败：{reason}')
-        if self._retry_count < self._max_retries:
-            self._retry_count += 1
-            self._node.get_logger().warn(
-                f'停靠失败，自动重试({self._retry_count}/{self._max_retries}) '
-                f'→ 倒车后重新锁定')
-            self._transition_to(DockingState.RETRYING)
-        else:
-            # 只有退满重试才是终态, 这时才记账 —— 中途的可重试失败不该留下
-            # 失败留档 (那一轮可能最后是成功的)。
-            self._node.get_logger().error(
-                f'停靠失败且已达最大重试次数({self._max_retries})')
-            self._record_failure(
-                reason or f'停靠失败且已达最大重试次数({self._max_retries})',
-                code)
-            self._transition_to(DockingState.MOTION_FAILED)
 
     @property
     def failure_reason(self) -> str:
@@ -339,12 +287,11 @@ class DockingStateMachine:
                               or '证据不可得 (节点未提供取证, 只能翻 dual detection <reason> 日志)')
 
     def abort_motion(self, reason: str = '', code: str = CODE_UNSPECIFIED):
-        """系统级失败 — 直接落 MOTION_FAILED, 不再重试。
+        """系统级失败 — 直接落 MOTION_FAILED, 不重试。
 
-        与 fail() 的区别: fail() 在 RETRYING 态再转 RETRYING 是 no-op
-        (_transition_to 对同状态直接返回), 会把节点卡死在倒车步; 而无法
-        恢复运动模式 (stand_up 重试耗尽) / 被外部锁定打断机动这类系统级
-        失败, 倒车重试毫无意义且同样发不出 cmd_vel, 必须直落终态。
+        双码路径唯一的失败入口: 双码下没有"倒车重试"这回事, 视觉闭环修不动
+        (vision_no_progress)、墙码丢失 (tag_not_found)、门控 (motion_gated)
+        等一律 abort_motion 直落终态, 由上层决定要不要重新触发停泊。
 
         code 默认 CODE_UNSPECIFIED 而不是某个具体族: 漏传要能被 _transition_to
         的守卫抓出来, 默认成一个像样的码只会把漏传藏起来。
@@ -354,39 +301,21 @@ class DockingStateMachine:
         self._record_failure(reason, code)
         self._transition_to(DockingState.MOTION_FAILED)
 
-    def retry_search(self):
-        """RETRYING 倒车到位后调用: 转 SEARCH_TAG 重新锁定。
-
-        保留 _docking_start_ns(整体超时累计), 只重置搜索子相位。
-        """
-        self._search_tag_hold_start_ns = 0
-        self._tag_lost_count = 0
-        self._transition_to(DockingState.SEARCH_TAG)
-
     def reset(self):
         """Full reset to IDLE."""
         self._state = DockingState.IDLE
         self._state_start_ns = 0
         self._docking_start_ns = 0
         self._search_tag_hold_start_ns = 0
-        self._align_hold_count = 0
         self._tag_lost_count = 0
         self._abort_reason = ''
         self._abort_code = ''
-        self._stable_since_ns = 0
-        self._retry_count = 0
 
     # ── State machine evaluation ────────────────────────────────────
 
     def evaluate(self,
                  tag_pose,          # TagPose or None
                  tag_visible: bool,
-                 odom_x: float,
-                 odom_y: float,
-                 odom_yaw: float,
-                 cmd_vx: float,
-                 cmd_vy: float,
-                 cmd_wz: float,
                  motion_stalled: bool,
                  now_ns: int,
                  params: dict,
@@ -396,8 +325,6 @@ class DockingStateMachine:
         Args:
             tag_pose: Latest valid TagPose from pose buffer, or None.
             tag_visible: True if tag is fresh (within tag_fresh_timeout_sec).
-            odom_*: Current odometry.
-            cmd_*: Current velocity command being sent.
             motion_stalled: True if motion stalled (handled by action_executor now).
             now_ns: Current ROS time in nanoseconds.
             params: Dict of all relevant parameters (see _get_params_keys).
@@ -423,10 +350,10 @@ class DockingStateMachine:
                 self._transition_to(DockingState.TIMEOUT)
                 return self._state
 
-            # Dual controller owns optical stage/terminal predicates. In
-            # particular never use single-tag too-close success or retries.
-            if params.get('dual_enable') and state in (
-                    DockingState.ALIGN, DockingState.APPROACH, DockingState.FINAL_SERVO):
+            # APPROACH is owned end-to-end by the dual controller: never use
+            # single-tag too-close success or re-search on loss. The wall-loss
+            # watchdog below is the only tag_loss_timeout_sec consumer.
+            if state == DockingState.APPROACH:
                 if maneuver_active:
                     self._tag_lost_count = 0
                 elif not tag_visible:
@@ -437,34 +364,6 @@ class DockingStateMachine:
                     self.abort_motion(self._wall_loss_reason(params),
                                       CODE_TAG_NOT_FOUND)
                 return self._state
-
-            # Tag lost during a vision state → try to re-acquire rather than
-            # dying. A single dropped frame at 6 fps (or blur right after a
-            # turn) must NOT terminate docking. After ~1 s of continuous loss
-            # we fall back to SEARCH_TAG to re-lock; only if SEARCH_TAG itself
-            # then times out do we reach the terminal TAG_LOST. Losing the tag
-            # while already searching stays terminal.
-            if state in (DockingState.ALIGN, DockingState.APPROACH,
-                         DockingState.FINAL_SERVO):
-                # A blind turn-drive-turn maneuver expects the tag to leave view
-                # during the motion — do NOT accumulate loss while it runs, and
-                # reset the counter so a maneuver that ends with the tag briefly
-                # out of frame gets a full grace window afterward.
-                if maneuver_active:
-                    self._tag_lost_count = 0
-                elif not tag_visible:
-                    self._tag_lost_count += 1
-                else:
-                    self._tag_lost_count = 0
-                loss_timeout = params.get('tag', {}).get('tag_loss_timeout_sec', 1.0)
-                tag_lost_limit = max(1, int(loss_timeout / 0.05))  # 20Hz 循环
-                if self._tag_lost_count > tag_lost_limit:
-                    self._node.get_logger().warn(
-                        f'接近过程中二维码丢失超过 {loss_timeout:.1f}s → '
-                        f'SEARCH_TAG 重新锁定')
-                    self._tag_lost_count = 0
-                    self._transition_to(DockingState.SEARCH_TAG)
-                    return self._state
 
             # Motion failure check
             if motion_stalled:
@@ -482,28 +381,6 @@ class DockingStateMachine:
 
         elif state == DockingState.SEARCH_TAG:
             self._eval_search(tag_visible, tag_pose, now_ns, params)
-
-        elif state == DockingState.ALIGN:
-            self._eval_align(tag_visible, tag_pose, now_ns, params)
-
-        elif state == DockingState.APPROACH:
-            self._eval_approach(tag_visible, tag_pose, now_ns, params)
-
-        elif state == DockingState.FINAL_SERVO:
-            self._eval_final_servo(tag_visible, tag_pose, now_ns,
-                                   cmd_vx, cmd_vy, cmd_wz, params)
-
-        elif state == DockingState.RETRYING:
-            # 倒车超时保护: 里程计不走(底盘卡死/失联)会卡在 RETRYING,
-            # 直接落 MOTION_FAILED 终态(不再重试, 防止无限倒车)。
-            retry_timeout = params.get('retry', {}).get('timeout_sec', 15.0)
-            if self.state_elapsed_ns(now_ns) * 1e-9 > retry_timeout:
-                self._node.get_logger().error('重试倒车超时 — MOTION_FAILED')
-                self._record_failure(
-                    f'重试倒车超时 {retry_timeout:.0f}s: 里程计不走 '
-                    f'(底盘卡死/失联), 不再重试',
-                    CODE_MOTION_STALLED)
-                self._transition_to(DockingState.MOTION_FAILED)
 
         elif state == DockingState.UNDOCKING:
             # 泊出超时保护: 里程计不走(底盘卡死/失联)会卡在 UNDOCKING,
@@ -564,146 +441,6 @@ class DockingStateMachine:
         else:
             self._search_tag_hold_start_ns = 0
 
-    def _eval_align(self, tag_visible, tag_pose, now_ns, params):
-        """ALIGN: coarse yaw alignment with tag before approach."""
-        if not tag_visible or tag_pose is None:
-            return
-
-        tolerance_cfg = params.get('tolerance', {})
-        yaw_tol = math.radians(tolerance_cfg.get('yaw_deg', 5.0))
-
-        if abs(tag_pose.yaw) < yaw_tol:
-            self._align_hold_count += 1
-            if self._align_hold_count >= 5:  # ~250ms at 20Hz
-                self._node.get_logger().info('航向已对准 → APPROACH')
-                self._transition_to(DockingState.APPROACH)
-                return
-        else:
-            self._align_hold_count = 0
-
-        # Timeout
-        align_timeout = params.get('align_timeout_sec', 15.0)
-        if self.state_elapsed_ns(now_ns) * 1e-9 > align_timeout:
-            self._node.get_logger().warn('对准超时，继续进入 APPROACH')
-            self._transition_to(DockingState.APPROACH)
-
-    def _eval_approach(self, tag_visible, tag_pose, now_ns, params):
-        """APPROACH: drive toward tag until within final servo distance."""
-        if not tag_visible or tag_pose is None:
-            return
-
-        tolerance_cfg = params.get('tolerance', {})
-        pos_tol = tolerance_cfg.get('position_m', 0.03)
-        dock_target = params.get('dock_target', {})
-        target_distance = dock_target.get('distance', 0.30)
-        approach_timeout = params.get('approach_timeout_sec', 60.0)
-
-        # Check if close enough for final servo.
-        # 用 2x 容差(而非 3x)收紧进入阈值: 进入 FINAL_SERVO 时距目标 <=6cm,
-        # 避免 FINAL_SERVO 期间还要大幅移动导致近距离 tag 检测抖动丢失。
-        # 距离-only: 两阶段直行"故意不修横向、入口横向误差带到终点"(docking_node
-        # 入口检查语义), hypot 里掺 lat 等于拿直行保证不了的量当门槛 —— 2026-09
-        # 实测: [done] 后 hypot(0.006, 0.110)=0.110 > 0.10 进不了 FINAL_SERVO,
-        # [done] 每秒重规划死循环直到超时。横向/角度的最终裁决统一交给
-        # _eval_final_servo 的方位门 (15° ≈ dist·tan15°, 已隐含横向预算)。
-        distance = abs(tag_pose.dist - target_distance)
-        if distance < pos_tol * 2:  # 2x tolerance → transition to FINAL_SERVO
-            self._node.get_logger().info(
-                f'距离足够近（距离误差={distance:.3f}m）→ FINAL_SERVO')
-            self._transition_to(DockingState.FINAL_SERVO)
-            return
-
-        # Timeout
-        if self.state_elapsed_ns(now_ns) * 1e-9 > approach_timeout:
-            self._node.get_logger().error('接近超时')
-            self._record_failure(
-                f'接近超时 {approach_timeout:.0f}s: 码看得见但走不到位 —— '
-                f'换个起始位姿重试',
-                CODE_VISION_NO_PROGRESS)
-            self._transition_to(DockingState.TIMEOUT)
-
-    def _eval_final_servo(self, tag_visible, tag_pose, now_ns,
-                          cmd_vx, cmd_vy, cmd_wz, params):
-        """FINAL_SERVO: 到 dock_distance 即判定成功 (到位即 DOCKED)。
-
-        stop-and-go 下规划器已经把车停在目标距离附近 (plan_straight 距离
-        到位即 [done] 停车), 这里只做"离家门口一步之遥"的确认。直行阶段
-        不再追角度, 用户可接受到位时方位偏 15°(方位=atan2(横向,距离),
-        横向本就是它的投影, 15° 已隐含横向 ≤ dist·tan15° ≈ 14cm)。故判据
-        只保留: 距离在 pos_tol 内 + 方位 ≤ yaw_tol_deg, 单帧即判定 ——
-        不再要求横向 < pos_tol(过严) 也不再累积 1s 稳定(呼吸/平衡摆动会
-        让稳定永远凑不齐, 把已停好的泊位误判失败、连打十几秒日志后超时
-        重试)。
-        """
-        tolerance_cfg = params.get('tolerance', {})
-        pos_tol = tolerance_cfg.get('position_m', 0.05)
-        # 直行到位方位门槛: 用 final_servo.yaw_tol_deg (默认 15°), 而非
-        # tolerance.yaw_deg(10°, 那是阶段1 对准的宽门)。
-        final_servo_cfg = params.get('final_servo', {})
-        yaw_tol_deg = final_servo_cfg.get('yaw_tol_deg', 15.0)
-        yaw_tol = math.radians(yaw_tol_deg)
-
-        dock_target = params.get('dock_target', {})
-        target_distance = dock_target.get('distance', 0.30)
-        lateral_offset = dock_target.get('lateral_offset', 0.0)
-        yaw_offset_rad = math.radians(dock_target.get('yaw_offset_deg', 0.0))
-
-        if tag_visible and tag_pose is not None:
-            error_dist = abs(tag_pose.dist - target_distance)
-            error_lat = abs(tag_pose.lat - lateral_offset)
-            error_yaw = abs(normalize_angle(tag_pose.yaw - yaw_offset_rad))
-
-            # 到位即成功: 距离在容差内 + 方位 ≤ 15° 单帧判定, 不等稳定。
-            if error_dist < pos_tol and error_yaw < yaw_tol:
-                self._node.get_logger().info(
-                    f'停靠成功：距离误差={error_dist:.3f}m '
-                    f'横向误差={error_lat:.3f}m '
-                    f'航向误差={math.degrees(error_yaw):.1f}°')
-                self._transition_to(DockingState.DOCKED)
-                return
-
-        # Safety: minimum distance
-        safety_cfg = params.get('safety', {})
-        min_distance = safety_cfg.get('minimum_distance_m', 0.15)
-        if tag_pose is not None and tag_pose.dist < min_distance:
-            self._node.get_logger().warn(
-                f'已达最小安全距离（{tag_pose.dist:.3f}m < {min_distance}m）→ DOCKED')
-            self._transition_to(DockingState.DOCKED)
-            return
-
-        # Timeout: 兜底 —— 距离始终到不了容差内(差太远/停下倒退)才走到这。
-        final_timeout = params.get('final_servo_timeout_sec', 30.0)
-        if self.state_elapsed_ns(now_ns) * 1e-9 > final_timeout:
-            self._node.get_logger().error('FINAL_SERVO 超时')
-            if tag_visible and tag_pose is not None:
-                error_dist = abs(tag_pose.dist - target_distance)
-                error_lat = abs(tag_pose.lat - lateral_offset)
-                error_yaw = abs(normalize_angle(tag_pose.yaw - yaw_offset_rad))
-                if error_dist < pos_tol and error_yaw < yaw_tol:
-                    self._node.get_logger().warn(
-                        f'超时但位姿合格, 接受当前位姿 (距离={error_dist:.3f}m '
-                        f'横向={error_lat:.3f}m 航向={math.degrees(error_yaw):.1f}°)')
-                    self._transition_to(DockingState.DOCKED)
-                    return
-                self._node.get_logger().error(
-                    f'超时且位姿超差 (距离={error_dist:.3f}m '
-                    f'横向={error_lat:.3f}m 航向={math.degrees(error_yaw):.1f}°) '
-                    f'→ 重试')
-                self.fail(
-                    f'FINAL_SERVO 超时 {final_timeout:.0f}s 且位姿超差 '
-                    f'(距离={error_dist:.3f}m 容差={pos_tol:.3f}m '
-                    f'横向={error_lat:.3f}m '
-                    f'航向={math.degrees(error_yaw):.1f}° 容差={yaw_tol_deg:.0f}°)',
-                    CODE_VISION_NO_PROGRESS)
-                return
-            # 码也看不见了 —— 近场出画/丢码, 处置是退开重新引导, 与"修不动"
-            # 不是一件事, 故归 tag_not_found 而非 vision_no_progress。
-            self._record_failure(
-                f'FINAL_SERVO 超时 {final_timeout:.0f}s 且二维码不可见 '
-                f'(近场出画/丢码) —— 退开重新引导进视野',
-                CODE_TAG_NOT_FOUND)
-            self._transition_to(DockingState.TIMEOUT)
-
     # ── Internal ────────────────────────────────────────────────────
 
     def _transition_to(self, new_state: DockingState):
@@ -727,8 +464,6 @@ class DockingStateMachine:
 
         # Reset per-state tracking
         self._search_tag_hold_start_ns = 0
-        self._align_hold_count = 0
         self._tag_lost_count = 0
-        self._stable_since_ns = 0
 
         self._node.get_logger().info(f'状态：{old.name} → {new_state.name}')
