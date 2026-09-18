@@ -120,11 +120,7 @@ class DockingNode(Node):
         # ── Action executor (odometry dead-reckoning) ─────────────
         self._executor = ActionExecutor(
             turn_settle_sec=self._p('stopgo.turn_settle_sec'),
-            turn_undershoot=self._p('stopgo.turn_undershoot'),
-            max_turn_step=self._p('stopgo.max_turn_step'),
             small_turn_rad=self._p('stopgo.small_turn_rad'),
-            final_approach_distance=self._p('final_servo.distance'),
-            yaw_threshold=math.radians(self._p('stopgo.yaw_threshold_deg')),
             turn_lead_per_speed=self._p('stopgo.turn_lead_per_speed'),
             turn_slow_rad=self._p('stopgo.turn_slow_rad'),
             min_angular_rate=self._p('stopgo.min_angular_rate'),
@@ -149,10 +145,6 @@ class DockingNode(Node):
         self._dock_tag_id = 0
         self._camera_frame = ''
 
-        # Latest raw wall-tag values (dual 路径在墙码被采纳时写入, 供
-        # executor.update 的视觉早停与状态发布消费)。
-        self._raw_dist: float | None = None
-        self._raw_lat: float | None = None
         self._last_detection_ns = 0
         self._tf_fail_count = 0
         self._det_msg_count = 0         # /detections 消息总数 (搜索停留日志诊断: 检测流是否活着)
@@ -245,11 +237,6 @@ class DockingNode(Node):
         self.declare_parameter('base_frame', 'base_link')
         self.declare_parameter('measure_frame', '')
 
-        # Dock target
-        self.declare_parameter('dock_target.distance', 0.30)
-        self.declare_parameter('dock_target.lateral_offset', 0.0)
-        self.declare_parameter('dock_target.yaw_offset_deg', 0.0)
-
         # Base
         self.declare_parameter('base.type', 'diff_drive')
         self.declare_parameter('base.cmd_vel_topic', 'cmd_vel')
@@ -275,29 +262,19 @@ class DockingNode(Node):
         # Pose buffer
         self.declare_parameter('pose_buffer.size', 30)
 
-        # Final servo
-        self.declare_parameter('final_servo.distance', 0.20)
-        self.declare_parameter('final_servo.max_linear_speed', 0.05)
-        self.declare_parameter('final_servo.max_yaw_speed', 0.2)
-        # 到 dock_distance 即判定成功的方位门槛 (deg)。直行阶段不再追角度,
-        # 到距离后方位偏 15° 以内都接受 —— 只要求到位就 DOCKED, 不再做
-        # 1s 稳定确认/连续微调(呼吸摆动会让稳定凑不齐, 把已停好的泊位误判失败)。
-        self.declare_parameter('final_servo.yaw_tol_deg', 15.0)
-
         # Final straight (两阶段停泊: 85cm 对准 → 55cm 纯直行)
         self.declare_parameter('final_straight.enable', True)
         self.declare_parameter('final_straight.start_distance', 0.85)
         self.declare_parameter('final_straight.yaw_threshold_deg', 3.0)
         # 近场法线(normal)对准门槛 (deg): 收紧到 ~2° 让"先对齐法线再横移"的次序
-        # 成立 —— 之前法线对准用 stopgo.yaw_threshold_deg(10°) 太松, 2~5° 航向
-        # 误差被当作已对齐, 带着误差横移导致反复/反向横移。
+        # 成立。
         self.declare_parameter('final_straight.normal_yaw_threshold_deg', 2.0)
         # 法线转向触发的噪声下限 (deg): 实际转向门槛 = max(上面, 本值)。
         # normal 有平面 PnP 二义性 (mirror 解, 近场 ±10° 双峰: 实测解卷绕后在
         # ~170°/~190° 两簇间跳, 车体已转 15° 读数几乎不变), 3帧 EMA 后残差
         # 仍 ±3-5°。门槛低于噪声下限时转向决策本身抖动 → 原地摆头追噪声、
         # 横移永远触发不了 (2026-09 对接日志)。残差航向误差不查 normal ——
-        # 由直行入口包络 (bearing+横向) 兜底, 系统容忍 final_servo 15°。
+        # 由直行入口包络 (bearing+横向) 兜底。
         self.declare_parameter('final_straight.normal_turn_min_deg', 6.0)
         self.declare_parameter('final_straight.entry_lateral_m', 0.03)
         # 近场/远场分界: dist ≤ 此值时阶段1 走「法线对准 + 横移」微调;
@@ -342,12 +319,10 @@ class DockingNode(Node):
         self.declare_parameter('dual.pile_fresh_timeout_sec', 2.0)
 
         # Stop-and-go params
-        self.declare_parameter('stopgo.yaw_threshold_deg', 3.0)
         self.declare_parameter('stopgo.jog_linear_rate', 0.08)
         self.declare_parameter('stopgo.jog_angular_rate', 0.3)
         # 转向角速度下限 — 必须 > l1w_control 的 min_angular_z 死区 (0.10)。
         self.declare_parameter('stopgo.min_angular_rate', 0.12)
-        self.declare_parameter('stopgo.turn_creep_linear', 0.0)  # 已弃用，固定纯原地转
         self.declare_parameter('stopgo.lateral_rate', 0.08)
         # 狗固件横移通道航位推算严重低估（实测 odom 0.507m / 实际约 2m，
         # 低估 ~4 倍）：判停目标 = 距离/该系数，即真实位移达到目标时停。
@@ -357,7 +332,6 @@ class DockingNode(Node):
         self.declare_parameter('stopgo.jog_odom_scale', 1.0)
         self.declare_parameter('stopgo.jog_backward_odom_scale', 1.0)
         self.declare_parameter('stopgo.turn_settle_sec', 0.5)
-        self.declare_parameter('stopgo.turn_undershoot', 0.75)
         # 盲转停止滞后补偿 (scripts/test_turn_angle 同款): odom 判停到底盘
         # 真停之间的 控制周期+里程计延迟+惯性 让全速盲转每次多转 ~5-7°,
         # 法线对准在 ±2° 门槛两侧反复翻转 (对接日志: 目标 ±9.7° 实转 15-17°)。
@@ -369,8 +343,6 @@ class DockingNode(Node):
         self.declare_parameter('stopgo.turn_slow_rad', 0.14)
         self.declare_parameter('stopgo.max_turn_step', 0.3)
         self.declare_parameter('stopgo.small_turn_rad', 0.1)
-        self.declare_parameter('stopgo.theta_shrink_ratio', 2.0)
-        self.declare_parameter('stopgo.drift_tol', 0.15)
 
         # ── 行进中航向保持 (双码纯直行区专用) ─────────────────────────
         # 区内一次走完剩余距离不再走停, 于是行程中新产生的 yaw 漂移没有
@@ -848,8 +820,6 @@ class DockingNode(Node):
                         f'pile_z={pile[2]:.3f}m '
                         f'pile_bearing={math.degrees(math.atan2(pile[0], pile[2])):+.2f}deg '
                         f'frames={self._dual.frames} stage={self._dual.stage} outer={self._sm.state.name}', now)
-                self._raw_dist = wall[2]
-                self._raw_lat = -wall[0]
                 self._last_detection_ns = stamp
                 self._pose_buffer.add(TagPose(dist=wall[2], lat=-wall[0],
                     yaw=-math.atan2(wall[0], wall[2]), normal=0.0, stamp_ns=stamp))
@@ -888,9 +858,8 @@ class DockingNode(Node):
         error_x, error_y, error_yaw = 0.0, 0.0, 0.0
         if tag_pose is not None:
             error_x = tag_pose.dist - self._dual.effective_dock_distance()
-            error_y = tag_pose.lat - self._p('dock_target.lateral_offset')
-            error_yaw = normalize_angle(
-                tag_pose.yaw - math.radians(self._p('dock_target.yaw_offset_deg')))
+            error_y = tag_pose.lat
+            error_yaw = normalize_angle(tag_pose.yaw)
 
         # Final heading lock never searches, reverses or continues on a silent
         # camera. Frozen observations update only this independent wall watchdog.
@@ -1025,20 +994,12 @@ class DockingNode(Node):
           3. Idle & settled                 → measure the tag and plan a fresh
              turn-drive-turn sequence (or declare done).
         """
-        target_distance = self._dual.effective_dock_distance()
-
         # ── Case 1: a sub-step is executing ───────────────────────────
         if self._executor.is_active:
             if self._dual.enabled and not self._check_dual_action(now_ns):
                 return
             done = self._executor.update(
-                self._odom_x, self._odom_y, self._odom_yaw,
-                tag_visible and not self._dual.enabled, self._raw_dist,
-                self._bearing_fn,
-                self._theta_bounds_fn,
-                target_distance,
-                self._p('stopgo.drift_tol'),
-                now_ns,
+                self._odom_x, self._odom_y, self._odom_yaw, now_ns,
             )
             if done:
                 if self._dual.enabled:
@@ -1161,11 +1122,7 @@ class DockingNode(Node):
             # 指令已经在发了, 超时就意味着里程计没跟上 → 查底盘, 不是查桥。
             self._undock_code = CODE_MOTION_STALLED
             done = self._executor.update(
-                self._odom_x, self._odom_y, self._odom_yaw,
-                False, None,   # blind: 不看 tag
-                self._bearing_fn, self._theta_bounds_fn,
-                self._p('dock_target.distance'),
-                self._p('stopgo.drift_tol'), now_ns,
+                self._odom_x, self._odom_y, self._odom_yaw, now_ns,
             )
             if done:
                 self._maneuver_active = False
@@ -1219,7 +1176,7 @@ class DockingNode(Node):
                 self._undock_phase += 1   # 距离为 0, 跳过盲退直接转
             else:
                 self._executor.start_jog(
-                    -dist, rate, blind=True,
+                    -dist, rate,
                     odom_scale=self._p('stopgo.jog_backward_odom_scale'))
                 self._executor.set_odom_ref(
                     self._odom_x, self._odom_y, self._odom_yaw)
@@ -1232,7 +1189,7 @@ class DockingNode(Node):
         if self._undock_phase == 1:
             angle = math.radians(float(self._p('undock.turn_angle_deg')))
             rate = float(self._p('undock.angular_rate'))
-            if self._executor.start_turn(angle, rate, full=True):
+            if self._executor.start_turn(angle, rate):
                 self._executor.set_odom_ref(
                     self._odom_x, self._odom_y, self._odom_yaw)
                 self._maneuver_active = True
@@ -1258,11 +1215,7 @@ class DockingNode(Node):
         # ── Case 1: 搜索步正在执行（里程计闭环盲转）──────────────
         if self._executor.is_active:
             done = self._executor.update(
-                self._odom_x, self._odom_y, self._odom_yaw,
-                tag_visible, self._raw_dist,
-                self._bearing_fn, self._theta_bounds_fn,
-                self._p('dock_target.distance'),
-                self._p('stopgo.drift_tol'), now_ns,
+                self._odom_x, self._odom_y, self._odom_yaw, now_ns,
             )
             if done:
                 self._maneuver_active = False
@@ -1338,7 +1291,7 @@ class DockingNode(Node):
         step_angle = math.radians(self._p('search.step_angle_deg'))
         angle = step_angle * self._search_direction
         rate = self._p('search.angular_speed')
-        if self._executor.start_turn(angle, rate, full=True):
+        if self._executor.start_turn(angle, rate):
             self._executor.set_odom_ref(
                 self._odom_x, self._odom_y, self._odom_yaw)
             self._maneuver_active = True
@@ -1486,12 +1439,10 @@ class DockingNode(Node):
                     CODE_MOTION_STALLED)
                 return False
         if plan.kind == 'yaw':
-            # Full computed turn — no undershoot, no per-step cap. The whole
-            # turn-drive-turn path was computed together; a clamped turn1 would
-            # drive the full leg along the wrong heading.
+            # 全量盲转: 整条机动路径是一次算好的, 钳半截会把后续直行腿带偏
+            # 航向; 里程计闭环 + 每停重测兜底。
             if not self._executor.start_turn(
-                    plan.turn_angle, self._p('stopgo.jog_angular_rate'),
-                    full=True):
+                    plan.turn_angle, self._p('stopgo.jog_angular_rate')):
                 return False
             self._executor.set_odom_ref(
                 self._odom_x, self._odom_y, self._odom_yaw)
@@ -1528,11 +1479,11 @@ class DockingNode(Node):
                     and plan.jog_distance > 0) else None
                 self._executor.start_jog(
                     plan.jog_distance, self._p('stopgo.jog_linear_rate'),
-                    blind=True, odom_scale=scale, hold=hold)
+                    odom_scale=scale, hold=hold)
                 if not self._executor.is_active:
                     return False
                 self._executor.set_odom_ref(
-                    self._odom_x, self._odom_y, self._odom_yaw, bearing=0.0)
+                    self._odom_x, self._odom_y, self._odom_yaw)
                 self.get_logger().info(
                     f'  子步：前进 {plan.jog_distance:+.3f}m（盲走，里程计校准）')
         else:
@@ -1640,7 +1591,7 @@ class DockingNode(Node):
                 self.get_clock().now().nanoseconds)          # 桩码 EMA 同步丢弃 (hold 跨停保持)
 
     def _reset_maneuver(self):
-        """Clear any queued/active blind maneuver and its iteration counter.
+        """Clear any queued/active blind maneuver.
 
         Called on cancel/abort and whenever we leave the stop-and-go states, so
         a fresh docking attempt always re-plans from a new measurement and no
@@ -1682,29 +1633,6 @@ class DockingNode(Node):
         self._maneuver_active = False
 
     # ── Helpers for the action executor ────────────────────────────
-
-    def _bearing_fn(self) -> float:
-        """Current tag bearing from robot (rad)."""
-        if self._raw_dist is None or self._raw_lat is None:
-            return 0.0
-        return math.atan2(self._raw_lat, self._raw_dist)
-
-    def _theta_bounds_fn(self) -> float:
-        """Dynamic theta tolerance — tighter when closer."""
-        if self._raw_dist is None or self._raw_dist <= 0.0:
-            return math.radians(self._p('stopgo.yaw_threshold_deg'))
-        ratio = self._p('stopgo.theta_shrink_ratio')
-        return max(
-            math.radians(self._p('stopgo.yaw_threshold_deg')),
-            self._raw_dist / max(ratio, 0.1),
-        )
-
-    def _blind_cap_for_turn(self) -> float | None:
-        """Maximum turn angle when tag is not visible."""
-        return min(
-            self._p('stopgo.max_turn_step'),
-            2.0 * self._theta_bounds_fn(),
-        )
 
     def _heading_hold_params(self) -> HeadingHold | None:
         """行进中航向保持的继电参数; None = 关闭 (等价于 wz≡0 的老行为)。

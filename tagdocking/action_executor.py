@@ -5,17 +5,16 @@ by odometry displacement (not timed). This eliminates overshoot and
 undershoot from acceleration profiles — the robot moves exactly the
 commanded distance or angle, verified by wheel odometry.
 
-During motion, the camera is NOT consulted (image blur from movement
-degrades detection quality). Visual checks are only used for early-stop
-safety (e.g., tag distance already at target).
+All motions are blind (odometry-only): the camera is never consulted
+during motion (image blur degrades detection quality, and the pre-move
+pose is stale by construction). Completion is pure odometry.
 
 Usage:
     exec = ActionExecutor()
     exec.start_jog(0.5, rate=0.08)       # jog 0.5m forward at 0.08 m/s
     exec.start_turn(0.3, rate=0.3)       # turn 0.3 rad at 0.3 rad/s
     # In control loop:
-    done = exec.update(odom_x, odom_y, odom_yaw, tag_visible, raw_dist, raw_lat,
-                       bearing_fn, theta_bounds_fn, now_ns)
+    done = exec.update(odom_x, odom_y, odom_yaw, now_ns)
     if done:
         plan_next_step()
 """
@@ -70,19 +69,12 @@ class ActionExecutor:
 
     def __init__(self,
                  turn_settle_sec: float = 0.5,
-                 turn_undershoot: float = 0.75,
-                 max_turn_step: float = 0.3,
                  small_turn_rad: float = 0.1,
-                 final_approach_distance: float = 1.0,
-                 yaw_threshold: float = 0.05,
                  turn_lead_per_speed: float = 0.30,
                  turn_slow_rad: float = 0.14,
                  min_angular_rate: float = 0.12):
         self._turn_settle_ns = int(turn_settle_sec * 1e9)
-        self._turn_undershoot = turn_undershoot
-        self._max_turn_step = max_turn_step
         self._small_turn_rad = small_turn_rad
-        self._final_approach_distance = final_approach_distance
         # 盲转停止滞后补偿 — 与 scripts/test_turn_angle 同款的两板斧。
         # 判停依据是 /dog/odom 累计角, 但从"odom 判停"到"底盘真停"之间存在
         # 控制周期(50ms)+里程计延迟+底盘减速惯性: 实测 0.3rad/s 全速盲转
@@ -110,12 +102,6 @@ class ActionExecutor:
         # 本步起始角速度(含 start_turn 的小角半速), 近目标减速段的基准,
         # 保证只降一档、不会逐帧累乘到 0。
         self._turn_base_angular = 0.0
-        # Fixed bearing tolerance the PLANNER uses to decide a yaw is needed.
-        # The turn's visual early-stop must be at least this tight, otherwise
-        # the planner keeps demanding a turn (|bearing| > yaw_threshold) while
-        # the executor aborts it immediately against the much looser dynamic
-        # theta_bounds — a deadlock at mid range (see _update_turn).
-        self._yaw_threshold = yaw_threshold
 
         # Action state: 'idle' | 'jogging' | 'turning' | 'lateral'
         self._action = 'idle'
@@ -128,8 +114,6 @@ class ActionExecutor:
         self._jog_start_x = 0.0
         self._jog_start_y = 0.0
         self._jog_start_yaw = 0.0
-        self._jog_start_bearing = 0.0
-        self._jog_blind = False
         # 行进中航向保持 (见 HeadingHold)。_jog_hold None = 本次行程不保持,
         # angular 恒 0, 与改动前逐位相同。
         self._jog_hold: HeadingHold | None = None
@@ -146,7 +130,6 @@ class ActionExecutor:
 
         # Turn tracking
         self._turn_start_yaw = 0.0
-        self._turn_blind_cap = None
         # Unwrapped accumulated rotation (rad) since the turn started. The raw
         # odom yaw wraps at ±π, so "turned = abs(normalize_angle(delta))" caps
         # at π and a 180° turn (target π) never completes cleanly: the robot
@@ -218,17 +201,13 @@ class ActionExecutor:
     # ── Start actions ───────────────────────────────────────────────
 
     def start_jog(self, distance: float, linear_rate: float,
-                  blind: bool = False, odom_scale: float = 1.0,
+                  odom_scale: float = 1.0,
                   hold: HeadingHold | None = None):
         """Start a straight-line jog of `distance` metres.
 
         Positive = forward, negative = reverse.
         `linear_rate` is the signed constant speed (m/s).
-        `blind` = True disables the visual early-stops (distance-at-target and
-        bearing-drift) so the jog runs purely on odometry — required for the
-        blind turn-drive-turn maneuver, where the pre-move tag pose is stale and
-        the whole leg must be driven to completion regardless of what the
-        (frozen) camera reading says.
+        盲走: 纯里程计判停, 行进中不看相机 (见模块 docstring)。
 
         odom_scale: some legged chassis (ZSL-1) under-report translation in
         their odometry (measured ~2x low in reverse, ~4x low laterally; only
@@ -247,7 +226,6 @@ class ActionExecutor:
         self._action_linear = linear_rate if distance >= 0 else -abs(linear_rate)
         self._action_angular = 0.0
         self._action_target = abs(distance) / max(odom_scale, 0.05)
-        self._jog_blind = blind
         # rate 抬到 min_angular_rate 之上: 结构上不可能配进 l1w_control 的 0.10
         # 死区 (同 start_turn 的减速抬底, 让死区不可达而不是靠启动校验报错)。
         self._jog_hold = hold and hold._replace(
@@ -260,22 +238,13 @@ class ActionExecutor:
         self._jog_hold_used = 0.0
         self._jog_hold_spent = False
 
-    def start_turn(self, angle: float, angular_rate: float,
-                   full: bool = False) -> bool:
+    def start_turn(self, angle: float, angular_rate: float) -> bool:
         """Start an in-place rotation of `angle` radians.
 
         Positive = CCW (left turn), negative = CW (right turn).
-
-        `full` = False (default, legacy aim-and-go): apply undershoot and
-        max-step clamping — a conservative fraction of the angle, re-measured
-        each step.
-
-        `full` = True (turn-drive-turn maneuver): execute the ENTIRE computed
-        angle, NO undershoot, NO max-step cap. The turn-drive-turn geometry is
-        computed as one atomic path; clamping turn1 here would send the robot
-        off along the wrong heading for the full drive leg. Odometry closes the
-        loop and the planner re-measures after the whole sequence, so the full
-        angle is both wanted and safe.
+        全量盲转: 执行整个指令角, 无 undershoot/步长钳制 —— 里程计闭环,
+        欠转/过冲由下一停的量测兜底; 停止滞后由 _update_turn 的近目标减速
+        + 提前量判停补偿。
 
         Returns True if the action actually started, False if the angle was too
         small to bother (caller should advance to the next queued step).
@@ -283,18 +252,8 @@ class ActionExecutor:
         if self._action != 'idle':
             return False
 
-        if full:
-            damped = angle  # execute the full computed angle
-            min_turn = 0.005  # rad (~0.3°) — below this, not worth a move
-        else:
-            # Undershoot: only turn a fraction of the requested angle to
-            # prevent overshoot from chassis inertia
-            damped = angle * self._turn_undershoot
-            if abs(damped) > self._max_turn_step:
-                damped = self._max_turn_step if damped > 0 else -self._max_turn_step
-            min_turn = 0.02
-
-        if abs(damped) < min_turn:  # too small to bother
+        damped = angle
+        if abs(damped) < 0.005:  # rad (~0.3°) — too small to bother
             return False
 
         self.turn_count += 1
@@ -338,40 +297,30 @@ class ActionExecutor:
 
     # ── Set odometry reference ──────────────────────────────────────
 
-    def set_odom_ref(self, x: float, y: float, yaw: float, bearing: float = 0.0,
-                     blind_cap: float | None = None):
+    def set_odom_ref(self, x: float, y: float, yaw: float):
         """Record the current odometry as the reference for the active action.
 
         Must be called ONCE after start_jog/start_turn, when the robot is
         considered to have begun moving from this odometry position.
         """
-        if self._action == 'jogging':
-            self._jog_start_x = x
-            self._jog_start_y = y
-            self._jog_start_yaw = yaw
-            self._jog_start_bearing = bearing
-        elif self._action == 'lateral':
-            self._jog_start_x = x
-            self._jog_start_y = y
-            self._jog_start_yaw = yaw
-        elif self._action == 'turning':
+        if self._action == 'turning':
             self._turn_start_yaw = yaw
-            self._turn_blind_cap = blind_cap
             self._turn_accumulated = 0.0
             self._turn_prev_yaw = yaw
+        else:   # jogging / lateral: same reference triple
+            self._jog_start_x = x
+            self._jog_start_y = y
+            self._jog_start_yaw = yaw
 
     # ── Update (call at control-loop rate) ──────────────────────────
 
     def update(self, odom_x: float, odom_y: float, odom_yaw: float,
-               tag_visible: bool, raw_dist: float | None,
-               bearing_fn, theta_bounds_fn,
-               target_distance: float, drift_tol: float,
                now_ns: int) -> bool:
         """Check if the current action has completed via odometry.
 
-        Returns True when the action is done (robot has moved the
-        commanded distance/angle, or a visual safety check triggers
-        early stop).
+        Returns True when the robot has moved the commanded distance/angle.
+        Completion is pure odometry — the camera is never consulted
+        mid-motion (see module docstring).
 
         After returning True, the caller should read fresh tag data
         and plan the next step.
@@ -380,57 +329,25 @@ class ActionExecutor:
             return True
 
         if self._action == 'jogging':
-            return self._update_jog(odom_x, odom_y, odom_yaw,
-                                    tag_visible, raw_dist, bearing_fn,
-                                    theta_bounds_fn, target_distance, drift_tol,
-                                    now_ns)
+            return self._update_jog(odom_x, odom_y, odom_yaw, now_ns)
 
         if self._action == 'lateral':
-            return self._update_lateral(odom_x, odom_y, odom_yaw,
-                                         tag_visible, raw_dist, target_distance)
+            return self._update_lateral(odom_x, odom_y, odom_yaw)
 
         if self._action == 'turning':
-            return self._update_turn(odom_yaw, tag_visible, raw_dist,
-                                     bearing_fn, theta_bounds_fn)
+            return self._update_turn(odom_yaw)
 
         return False
 
-    def _update_jog(self, ox, oy, oyaw, tag_visible, raw_dist,
-                    bearing_fn, theta_bounds_fn, target_dist, drift_tol,
-                    now_ns) -> bool:
+    def _update_jog(self, ox, oy, oyaw, now_ns) -> bool:
         dx = ox - self._jog_start_x
         dy = oy - self._jog_start_y
         traveled = math.hypot(dx, dy)
 
-        # 航向保持先算, 再走判停 —— 双码直行一律 blind=True (docking_node
-        # _launch_step), 放在下面的 _jog_blind 早返回之后就永远执行不到。
+        # 航向保持先算, 再走判停。
         self._update_heading_hold(oyaw, traveled, now_ns)
 
-        # Blind jog (turn-drive-turn leg): odometry-only, NO visual early-stop.
-        # The pre-move tag pose is stale for the whole maneuver and the leg was
-        # computed as part of one atomic path — a visual short-circuit here
-        # would truncate the drive and strand the robot off the normal line.
-        if self._jog_blind:
-            if traveled >= self._action_target:
-                self._stop()
-                return True
-            return False
-
-        # Safety: visual distance already at target → early stop
-        if tag_visible and raw_dist is not None and raw_dist <= target_dist:
-            self._stop()
-            return True
-
-        # Safety: bearing drift during jog (chassis may run an arc)
-        # If bearing has drifted too far, stop early and re-plan
-        if tag_visible and raw_dist is not None:
-            current_bearing = bearing_fn()
-            drift = abs(normalize_angle(current_bearing - self._jog_start_bearing))
-            if drift > 2.0 * theta_bounds_fn():
-                self._stop()
-                return True
-
-        # Odometry target reached
+        # Odometry target reached — 纯里程计判停。
         if traveled >= self._action_target:
             self._stop()
             return True
@@ -517,7 +434,7 @@ class ActionExecutor:
             self._jog_hold_engage_ns = now_ns
         self._action_angular = self._jog_hold_engaged
 
-    def _update_lateral(self, ox, oy, oyaw, tag_visible, raw_dist, target_dist) -> bool:
+    def _update_lateral(self, ox, oy, oyaw) -> bool:
         """Check lateral odometry displacement against target.
 
         oyaw 只用来记 Δyaw, 不参与判停: 横移步没人命令它转, 所以这里量到的
@@ -535,19 +452,13 @@ class ActionExecutor:
         sin_yaw = math.sin(self._jog_start_yaw)
         lateral = -sin_yaw * dx + cos_yaw * dy
 
-        # Safety: visual distance already at target → early stop
-        if tag_visible and raw_dist is not None and raw_dist <= target_dist:
-            self._stop()
-            return True
-
         if abs(lateral) >= self._action_target:
             self._stop()
             return True
 
         return False
 
-    def _update_turn(self, odom_yaw, tag_visible, raw_dist,
-                     bearing_fn, theta_bounds_fn) -> bool:
+    def _update_turn(self, odom_yaw) -> bool:
         # Accumulate the unwrapped rotation. odom_yaw wraps at ±π, so a naive
         # abs(normalize_angle(odom_yaw - start)) caps at π and breaks for any
         # turn ≥ π (e.g. the 180° undock): the robot overshoots, the measure
@@ -561,12 +472,7 @@ class ActionExecutor:
         self._jog_yaw_error = self._turn_accumulated
         turned = abs(self._turn_accumulated)
 
-        # Determine completion target: use blind cap if tag not visible
         target_now = self._action_target
-        if not (tag_visible and raw_dist is not None):
-            if self._turn_blind_cap is not None:
-                target_now = min(self._turn_blind_cap, self._action_target)
-
         if turned >= target_now:
             self._stop()
             return True
@@ -590,26 +496,11 @@ class ActionExecutor:
             self._stop()
             return True
 
-        # NO visual early-stop for turns.
-        #
-        # In stop-and-go the camera is not trusted mid-motion: docking_node
-        # enforces this with its `_frozen` gate — during a blind maneuver all
-        # detections are dropped, so `_raw_*`/bearing_fn() here are ALWAYS the
-        # stale pre-turn values, and `tag_visible` may go stale too.
-        #
-        # A turn is commanded by the planner precisely because that pre-turn
-        # bearing/lat is out of tolerance. The lateral trigger fires at a very
-        # small bearing (atan2(lateral_threshold, dist) — e.g. 2.3° at 1.25 m),
-        # far below yaw_threshold (10°). Gating turn completion on that same
-        # stale bearing therefore aborted the turn at ZERO rotation on the first
-        # tick, the robot never moved, the re-measured pose was identical, and
-        # the planner re-demanded the same turn forever — an infinite no-progress
-        # loop.
-        #
-        # Turn completion is governed by ODOMETRY alone (turned >= target_now),
-        # plus the stop-latency compensation above (近目标减速 + 提前量判停) —
-        # full=True 路径没有 undershoot/max_turn_step 保护 (docking omni 走停
-        # 与泊出都走 full=True), 不补偿的话每次盲转实转比目标多 5-7°。
+        # Turn completion is ODOMETRY-ONLY (turned >= target_now) + the
+        # stop-latency compensation above (近目标减速 + 提前量判停) — 全量盲转
+        # 没有 undershoot/max_turn_step 保护, 不补偿的话每次盲转实转比目标多
+        # 5-7°。行进中绝不看相机: 盲动期检测被冻结 (_frozen 门), 所有读数
+        # 都是转前旧值。
         return False
 
     # ── Visual settle after turn ────────────────────────────────────
@@ -633,7 +524,6 @@ class ActionExecutor:
         self._action = 'idle'
         self._action_linear = 0.0
         self._action_angular = 0.0
-        self._jog_blind = False
         # 停用航向保持, 但 _jog_yaw_error/_jog_hold_used/_jog_hold_spent 三个
         # 诊断量故意留着: 完成日志在 update() 返回 True 之后才打, 那时这里
         # 已经跑过了 —— 清掉就永远读不到。它们在下一次 start_jog 清。
@@ -652,7 +542,6 @@ class ActionExecutor:
         self._action_linear = 0.0
         self._action_angular = 0.0
         self._action_lateral = 0.0
-        self._jog_blind = False
         self._jog_hold = None
         self._jog_hold_engaged = 0.0
         self._last_stop_ns = None

@@ -216,8 +216,7 @@ def intake():
     n._dual_reject_count = {}
     n._sm = NS(state=DockingState.APPROACH)
     n._p = lambda name: {'tag.id': 0, 'tag.frame': 'wall',
-        'camera_frame': 'optical', 'base.type': 'omni',
-        'dock_target.lateral_offset': 0., 'dock_target.yaw_offset_deg': 0.}[name]
+        'camera_frame': 'optical', 'base.type': 'omni'}[name]
     n.now = int(20e9)
     n.get_clock = lambda: NS(now=lambda: NS(nanoseconds=n.now))
     n.logs, n.queries, n.events = [], [], []
@@ -714,7 +713,7 @@ def launched(plan_step, dual_enabled=True, **overrides):
     node._dual_watch = None
     node._executor = NS(
         is_active=False,
-        start_jog=lambda d, r, blind=False, odom_scale=1., hold=None: (
+        start_jog=lambda d, r, odom_scale=1., hold=None: (
             seen.update(hold=hold, distance=d), setattr(node._executor, 'is_active', True)),
         set_odom_ref=lambda *a, **kw: None, action_kind='jogging',
         _action_target=.45, angular_cmd=0., linear_cmd=.08, lateral_cmd=0.)

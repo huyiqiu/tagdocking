@@ -19,11 +19,6 @@ docking_node:
     # camera optical frame (dist=tz, lat=-tx).
     measure_frame: ""
 
-    # ── Dock Target (final desired pose relative to tag) ──
-    dock_target.distance: 0.55                # m — 底盘距 tag 停泊距离
-    dock_target.lateral_offset: 0.0           # m — 0 = centered
-    dock_target.yaw_offset_deg: 0.0           # degrees — yaw offset from facing tag
-
     # ── Base Type ──
     #   "diff_drive" — unicycle control (vx + wz only)
     #   "omni"       — full 3-DOF (vx, vy, wz) via cmd_vel
@@ -51,7 +46,6 @@ docking_node:
     charge.service_wait_sec: 1.0              # s — 无桥宽限, 超时降级告警 (DOCKED 仍为成功)
 
     # ── Stop-and-Go Parameters ──
-    stopgo.yaw_threshold_deg: 10.0           # deg — ActionExecutor ctor 转向门槛
     stopgo.jog_linear_rate: 0.08             # m/s — constant speed during forward jog
     stopgo.jog_angular_rate: 0.3             # rad/s — constant speed during turn
     # 必须 > l1w_control 的 min_angular_z 死区 (0.10), 同 lateral_rate 的道理。
@@ -103,7 +97,6 @@ docking_node:
     # 1.03°), 否则一次都接不通、used 恒 0, 日志与"没漂够门槛"逐字相同 —— 配低了
     # 会被 warn 掉并本趟退回纯直行, 不会假装开着。要真开就给到 3° 以上。
     stopgo.heading_hold_budget_deg: 15.0      # 单程累计下发角上限, 耗尽后告警 + 纯直行
-    stopgo.turn_creep_linear: 0.0            # m/s — 已弃用: "边走边转"叠加前进会驶出目标横向范围; 固定纯原地转, 角度靠里程计校准 (此参数不再被读取, 保留仅为兼容)
     # 必须 > l1w_control 的 min_linear_y 死区 (0.10): 低于死区的横移指令会被
     # clampAxis 截成 0, 狗原地不动导致横移步判停卡死。取 0.12 留裕量。
     stopgo.lateral_rate: 0.12                # m/s — constant speed during lateral jog (omni)
@@ -122,8 +115,7 @@ docking_node:
     # 当前 1.0 = 未启用补偿（2026-09 确认: 当前设备/固件无需标定, 同上）。
     stopgo.jog_odom_scale: 1.0
     stopgo.jog_backward_odom_scale: 1.0
-    stopgo.turn_settle_sec: 1.5              # s — wait after turn for image to clear (加长: 避免模糊帧被 jump rejection 误拒)
-    stopgo.turn_undershoot: 0.75             # fraction — turn only x% of commanded angle (仅 legacy full=False 路径; 走停/泊出盲转走 full=True 不经过此值)
+    stopgo.turn_settle_sec: 1.5              # s — wait after turn for image to clear
     # 盲转停止滞后补偿 (scripts/test_turn_angle 同款两板斧): odom 判停到底盘
     # 真停之间隔着 控制周期(50ms)+/dog/odom 延迟+底盘减速惯性, 0.3rad/s 全速
     # 盲转实测每次多转 ~5-7° (对接日志: 目标 ±9.7° 实转 15-17°, 误差符号每步
@@ -132,18 +124,6 @@ docking_node:
     stopgo.turn_slow_rad: 0.14               # rad — 距目标此角度内减速到半速, 减小惯性冲量
     stopgo.max_turn_step: 0.17               # rad (~10°) — 单次转向硬上限, 小步转+每步重看, 低帧率下 tag 不易转出视野而丢失
     stopgo.small_turn_rad: 0.1               # rad — below this, turn at half speed
-    stopgo.theta_shrink_ratio: 2.0           # dynamic bearing tolerance: max(yaw_threshold, dist/ratio)
-    stopgo.drift_tol: 0.15                   # rad — bearing drift limit during jog
-
-    # ── Final Servo (到位即 DOCKED) ──
-    # stop-and-go 下规划器已把车停在目标距离 (plan_straight 距离到位即 [done]
-    # 停车), 这里只做确认: 距离在 tolerance.position_m 内 + 方位 ≤ yaw_tol_deg
-    # 即单帧判定 DOCKED —— 不再累积 1s 稳定(呼吸摆动凑不齐)也不查横向
-    # (横向是方位 atan2(横向,距离) 的投影, 15° 已隐含 ≤ dist·tan15° ≈ 14cm)。
-    final_servo.max_linear_speed: 0.05        # m/s — (legacy, not used in stop-and-go)
-    final_servo.max_yaw_speed: 0.2            # rad/s — (legacy)
-    final_servo.distance: 0.20                # m — enter FINAL_SERVO within this distance
-    final_servo.yaw_tol_deg: 15.0             # deg — 到 dock_distance 即判定的方位门槛 (直行阶段不再追角度, 15° 内都接受)
 
     # ── Final Straight (两阶段停泊) ──
     # 阶段1(APPROACH) 按远/近分两级:

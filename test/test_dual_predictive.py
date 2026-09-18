@@ -314,10 +314,10 @@ def test_turn_rate_never_falls_into_chassis_dead_zone():
     for deg in (3.0, 1.5, 0.75, 0.3):
         ex = ActionExecutor(small_turn_rad=0.1, turn_slow_rad=0.14,
                             min_angular_rate=0.12)
-        assert ex.start_turn(-math.radians(deg), 0.3, full=True)
+        assert ex.start_turn(-math.radians(deg), 0.3)
         assert abs(ex.angular_cmd) > dead, f'起步速率掉进死区 ({deg}deg)'
         # 起步即 remaining < turn_slow_rad → 近目标减速立刻生效
-        ex._update_turn(0.0, False, None, lambda: 0.0, lambda d: (0., 0.))
+        ex._update_turn(0.0)
         assert abs(ex.angular_cmd) > dead, f'近目标减速后掉进死区 ({deg}deg)'
         assert ex.angular_cmd < 0, '转向符号必须保持 CW'
 
@@ -1041,14 +1041,13 @@ def jogger(hold, distance=.45, rate=.12):
     """
     from tagdocking.action_executor import ActionExecutor
     ex = ActionExecutor(min_angular_rate=.12)
-    ex.start_jog(distance, .08, blind=True, hold=hold)
+    ex.start_jog(distance, .08, hold=hold)
     ex.set_odom_ref(0., 0., 0.)
     clock = {'ns': int(10e9), 'x': 0.}
     def step(yaw):
         clock['ns'] += DT
         clock['x'] += .08*DT*1e-9
-        done = ex.update(clock['x'], 0., yaw, False, None,
-                         lambda: 0., lambda d: (0., 0.), 0., .15, clock['ns'])
+        done = ex.update(clock['x'], 0., yaw, clock['ns'])
         return done, ex.angular_cmd
     return ex, step
 
@@ -1110,12 +1109,11 @@ def test_a_plain_or_blind_jog_is_bit_identical_without_the_hold():
             break
         assert ticks < 200
     assert ticks == math.ceil(.20/(.08*.05)), '判停时序被改动'
-    # blind 仍跳过视觉早停: 视觉说"已到位"也必须走完整条腿
+    # 判停纯里程计: 行程未满不算完 (走到一半也是这个语义)
     ex2 = ActionExecutor(min_angular_rate=.12)
-    ex2.start_jog(.20, .08, blind=True)
+    ex2.start_jog(.20, .08)
     ex2.set_odom_ref(0., 0., 0.)
-    assert not ex2.update(.01, 0., 0., True, .01, lambda: 0.,
-                          lambda d: (0., 0.), .50, .15, int(10e9))
+    assert not ex2.update(.01, 0., 0., int(10e9))
 
 
 def test_heading_hold_budget_is_a_diagnostic_gate_that_degrades_to_straight():
@@ -1169,8 +1167,7 @@ def test_delta_yaw_is_measured_on_every_step_not_only_the_held_one():
     lat = ActionExecutor(min_angular_rate=.12)
     lat.start_jog_lateral(.0125, .12)
     lat.set_odom_ref(0., 0., 0.)
-    lat.update(0., .004, math.radians(2.3), False, None,
-               lambda: 0., lambda d: (0., 0.), 0., .15, int(10e9))
+    lat.update(0., .004, math.radians(2.3), int(10e9))
     assert lat.angular_cmd == 0., '横移步只许看见寄生 yaw, 不许纠'
     assert lat.jog_yaw_error == pytest.approx(math.radians(2.3))
 
@@ -1184,10 +1181,9 @@ def test_delta_yaw_is_measured_on_every_step_not_only_the_held_one():
 
     # 转向步的 Δyaw = 真转了多少 (有符号、已解卷绕), 对照指令角即可读出欠转。
     turn = ActionExecutor(min_angular_rate=.12, small_turn_rad=.1, turn_slow_rad=.14)
-    assert turn.start_turn(-.0349, .3, full=True)
+    assert turn.start_turn(-.0349, .3)
     turn.set_odom_ref(0., 0., 0.)
-    turn.update(0., 0., -.01, False, None, lambda: 0., lambda d: (0., 0.),
-                0., .15, int(10e9))
+    turn.update(0., 0., -.01, int(10e9))
     assert turn.jog_yaw_error == pytest.approx(-.01)
 
 
