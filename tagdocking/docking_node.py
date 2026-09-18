@@ -64,7 +64,6 @@ from .charge_mode import ChargeMode
 from .dual_docking import DualTagDocking, DEFAULTS as DUAL_DEFAULTS
 from .dual_camera import CameraModel
 from .dual_feedback import ActionWatch
-from .dual_posture import DualPosture
 
 
 class DockingNode(Node):
@@ -97,10 +96,6 @@ class DockingNode(Node):
         # 双二维码对准管理器: 仅依赖参数, 必须先于规划器创建以提供目标距离。
         # dual.enable=false 时全程旁路, 行为同单码方案。
         self._dual = DualTagDocking(self)
-        # 姿态切换 (搜索锁定→趴下匍匐, 桩码锁定→站立): 用户流程步骤 2/5。
-        self._dual_posture = DualPosture(self)
-        # 切站立宽限窗内豁免 locked 墙码 watchdog (姿态切换瞬间墙码短暂丢失)
-        self._dual_stand_grace_ns = 0
         # FIFO, not a latest-only slot: delayed TF must get a chance to arrive.
         self._dual_pending = []
         self._dual_received_ns = 0
@@ -414,10 +409,6 @@ class DockingNode(Node):
         for name, default in DUAL_DEFAULTS.items():
             self.declare_parameter('dual.' + name, default)
         self.declare_parameter('dual.enable', False)
-        # 匍匐 profile 开关: false = 全程站立 (匍匐单轮转向每次附带 4.5~7cm 前移,
-        # 小角度无法精确调整, 见 README 6.5b); true = 保留原匍匐搜索/对准流程。
-        # 不进 DUAL_DEFAULTS: 布尔过不了 positivity 校验。
-        self.declare_parameter('dual.crouch_enable', False)
         self.declare_parameter('dual.camera_info_topic', '/camera_sync/camera_info')
         self.declare_parameter('dual.projection_mode', 'raw')
         # 墙码边长 (36h11:0, apriltag 节点按此解 PnP; launch 侧同步透传)
@@ -1159,7 +1150,6 @@ class DockingNode(Node):
         # camera. Frozen observations update only this independent wall watchdog.
         if (self._dual.enabled and self._dual.stage == 'locked'
                 and self._executor.is_active
-                and now_ns > self._dual_stand_grace_ns
                 and not self._dual.fresh(now_ns, getattr(self, '_dual_live_wall_ns', self._dual.stamp))):
             # 同样必须在 cancel() 之前取相位, 否则恒读"已停稳"。
             reason = self._wall_stale_reason(now_ns, self._motion_phase())
@@ -1430,16 +1420,6 @@ class DockingNode(Node):
             # 20.4°, 双码要 ~30 步 × 2.4s ≈ 70s, 顶着观测超时走。
             if not self._dual_prealign(tag_visible, tag_pose, base_type, now_ns):
                 return
-            # 步骤 2: 搜索锁定墙码后先趴下 —— 桩码贴桩底座更矮, 站立视角看不到,
-            # 双码对准/接近全程匍匐。切换期间停车等待 (响应+settle 非阻塞轮询)。
-            # crouch_enable=false (站立 profile) 跳过: 狗本来就站着。
-            if self._dual.crouch and not self._dual_posture.ensure_crouch(now_ns):
-                if self._dual_posture.failure:
-                    self._executor.cancel()
-                    self._sm.abort_motion(
-                        'dual 姿态切换: ' + self._dual_posture.failure,
-                        CODE_MOTION_GATED)
-                return
             seq = self._dual.plan_dual(tag_pose, base_type, self._planner, now_ns)
             if self._dual.failure:
                 self._executor.cancel()
@@ -1450,21 +1430,6 @@ class DockingNode(Node):
                 self._pending_seq = None
                 self._adapter.publish_stop()
                 self._sm.finish_dual()
-            elif not seq and self._dual.request_stand:
-                # 步骤 5: 桩码 z ≤ 锁定距离且对准成立 → 切站立 (匍匐进不了桩底座)。
-                # 站立后桩码必然丢失, locked 只按墙码纯直行; watchdog 给宽限窗
-                # (姿态切换瞬间墙码也会短暂丢失)。确认后重置观测窗重新采样。
-                if self._dual_posture.ensure_stand(now_ns):
-                    self._dual.request_stand = False
-                    self._dual.stopped(now_ns)
-                    self._discard_dual_pending()
-                    self._dual_stand_grace_ns = now_ns + int(5.0e9)
-                elif self._dual_posture.failure:
-                    self._executor.cancel()
-                    self._sm.abort_motion(
-                        'dual 姿态切换: ' + self._dual_posture.failure,
-                        CODE_MOTION_GATED)
-                return
             elif seq:
                 self._pending_seq = list(seq)
                 self._launch_pending_seq(base_type, now_ns)
@@ -2292,8 +2257,6 @@ class DockingNode(Node):
         self._reset_visual_state()
         self._straight_entered = False
         self._dual_watch = None
-        self._dual_posture.reset()          # 姿态序列回 IDLE (新轮 dock 重新趴下)
-        self._dual_stand_grace_ns = 0
         self._dual_diag_ns.clear()
         self._dual_reject_last = None
         self._dual_reject_count.clear()

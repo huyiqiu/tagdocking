@@ -59,8 +59,6 @@ DEFAULTS = {
     'standoff_reverse_limit': 1.00, 'standoff_reverse_count': 20,
     'acquire_timeout_sec': 60.0,
     'dock_tolerance': 0.02, 'mount_tolerance_deg': 2.0,
-    'pile_lock_distance': 0.30, 'crouch_settle_sec': 3.0,
-    'posture_retries': 2,
     'max_actions': 160, 'stable_position_m': 0.03,
     'min_lateral_m': 0.003, 'lateral_tolerance_m': 0.02,
     # 桩码垂直离场放行专用的横向对准容差 (只松横向, bearing/theta 仍按严格门)。
@@ -132,10 +130,6 @@ class DualTagDocking:
         self._pile_tag_id = int(node._p('dual.pile_tag_id'))
         self.r = self.t = None
         self.camera = None
-        # 匍匐 profile 开关 (dual.crouch_enable): false = 全程站立, 不在此切站立;
-        # true = 原匍匐流程, 桩码到锁定距离且对准成立时切站立。enable=false 也读,
-        # 保证属性恒存在。
-        self.crouch = bool(node._p('dual.crouch_enable'))
         self.reset()
         if self.enabled:
             if self._pile_tag_id == int(node._p('tag.id')):
@@ -186,8 +180,6 @@ class DualTagDocking:
                     'require dock_distance < straight_start_distance < observation_distance, got '
                     f"{self.target:.2f} / {self.near:.2f} / {self.p('observation_distance'):.2f} "
                     '(站立式: observation_distance=1.8, straight_start_distance=1.70)')
-            if not 0 < self.p('pile_lock_distance') < self.p('observation_distance'):
-                raise ValueError('require 0 < pile_lock_distance < observation_distance')
             # 纯直行区必须夹在停泊点与站位之间: 低于 dock_distance 等于从不生效
             # (禁令区在终点之后), 高于站位则把 observe 的纠偏一起禁掉 —— 而双码
             # 对准本来就只在站位处做, 禁掉它整场就没有对准环节了。
@@ -338,9 +330,6 @@ class DualTagDocking:
         self.standoff_actions = 0
         self.actions = 0
         self.progress = False
-        # 对准成立且桩码光学 z 到达锁定距离后置位 —— 节点据此执行切站立
-        # (匍匐进不了桩底座), 站立确认后由节点清除。
-        self.request_stand = False
         self._travel_qualification = 0
         self.qualified_ns = 0
         # 直行承诺时刻 (两码持住对准): 桩码垂直离场放行的第二个证据来源,
@@ -1085,7 +1074,7 @@ class DualTagDocking:
                 return self._advance(d)
             if self.stage == 'acquire' and missing_time >= self.p('missing_confirm_sec'):
                 # 桩码 5cm 可见性半径有限, 不可见有两种原因, 按墙码距离分流 ——
-                # 太远 (d > 观察点) → 匍匐前进逼近, 走进桩码检测半径;
+                # 太远 (d > 观察点) → 前进逼近, 走进桩码检测半径;
                 # 已在观察距离内仍不可见 → 初始太近 (出视野), 后退找回。
                 obs = self.p('observation_distance')
                 if d > obs + self.p('observation_tolerance'):
@@ -1156,19 +1145,6 @@ class DualTagDocking:
                     throttle_duration_sec=2.0)
                 return self._advance(d)
             return self._correction(metrics)
-        # 对准成立 (两码 bearing ≈ 0, 正对充电桩) 且桩码到达锁定距离 → 切站立:
-        # 桩码光学 z 再小就要出视野 (30cm 是匍匐视角的可见极限), 此后航向已由
-        # 对准锁定 —— 节点读 request_stand 执行 stand_up, 站立后桩码必然丢失,
-        # locked 只按墙码纯直行 (匍匐进不了桩底座)。
-        # 仅匍匐 profile: 站立全程下桩码在 0.9m 处仍清晰可见, 不在此切站立 --
-        # locked 由 approach 的合格桩码丢失闭锁进入 (near 窗内, 见 plan_dual)。
-        if self.crouch and self.pile[2] <= self.p('pile_lock_distance'):
-            self.stage = 'locked'
-            self.request_stand = True
-            self._node.get_logger().info(
-                f'dual 对准成立且桩码 z={self.pile[2]:.3f}m ≤ '
-                f'{self.p("pile_lock_distance"):.2f}m → 切站立 (锁定航向, 墙码直行)')
-            return None
         held = self.hold_ns and self.stamp-self.hold_ns >= float(self._node._p('dual.align_hold_sec'))*1e9
         if not held:
             return None

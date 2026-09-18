@@ -209,12 +209,10 @@ def intake():
     n._det_msg_count = 0
     # _reset_maneuver / _launch_pending_seq 会读写的手搭属性 (__init__ 里有,
     # 这里必须补齐, 否则 reset/cancel 族用例 AttributeError):
-    n._dual_posture = NS(reset=lambda: None)
     n._dual_watch = None
     n._dual_prealign_active = False
     n._dual_prealigned = False
     n._dual_prealign_steps = 0
-    n._dual_stand_grace_ns = 0
     n._dual_reject_last = None
     n._dual_reject_count = {}
     n._sm = NS(state=DockingState.APPROACH)

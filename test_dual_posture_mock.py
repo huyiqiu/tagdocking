@@ -1,17 +1,15 @@
 #!/usr/bin/env python3
-"""双码姿态切换 + 状态机全分支 mock 验证 (纯离线, 不依赖 ROS 运行时数据流)。
+"""双码状态机全分支 mock 验证 (纯离线, 不依赖 ROS 运行时数据流)。
 
-场景 (对照用户 5 步流程):
-  [T1] acquire 远距桩码不可见 → 按墙码距离分流: 匍匐前进逼近 (非倒车死路)
+场景 (对照用户 5 步流程; 匍匐姿态机已随 v1.0 移除, 全程站立):
+  [T1] acquire 远距桩码不可见 → 按墙码距离分流: 前进逼近 (非倒车死路)
   [T2] acquire 太近桩码出视野 → 后退找回 (reverse 预算 0.6m/12 次)
-  [T3] 双码对准 + 桩码 z=0.30m → locked + request_stand (30cm 主动锁定)
-  [T4] 对准 0.8m → observe→approach 全程匍匐前进 (不锁) → 桩码 0.30 锁定
-  [T5] locked + 站立后桩码必然丢失 → 墙码纯直行累积航向资格 → 0.50m complete
+  [T5] approach 桩码丢失闭锁 → locked 墙码纯直行累积航向资格 → 0.50m complete
        (验证 locked forward aligned=True 修复: 否则终点误判 no qualified approach)
-  [T6] locked 墙码 z 跳近豁免 overshoot (姿态切换跳变); 非 locked 命中 fail
-  [T7] DualPosture: 服务缺失宽限→fail / 趴下成功 / 桥锁 cmd_vel→fail /
-       服务拒绝重试耗尽→fail / 站立 motion_enabled 确认 / 站立超时重试耗尽→fail
+  [T6] locked 墙码 z 跳近豁免 overshoot; 非 locked 命中 fail
   [T8] ActionWatch: 正常完成 / 反方向 veto / 无里程计响应
+  [T9] 站立 profile 全程: 锁定直行带 bearing 微调, 0.50m 完成
+  [T10] ChargeMode 泊出门控 / [T11] 泊出超时失败码分流 (见各自 docstring)
 
 世界模型: 狗位姿 (x, y, yaw) 于 odom; 墙码 id=0 (15cm) 贴桩后墙, 桩码 id=51
 (5cm) 贴桩底座正面, 桩-墙距 0.70m; 两码同高 0.30m。相机正装 base (0.15,0,0.30),
@@ -27,7 +25,6 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import yaml
 
 from tagdocking.dual_docking import DEFAULTS, DualTagDocking
-from tagdocking.dual_posture import DualPosture
 from tagdocking.dual_feedback import ActionWatch
 from tagdocking.charge_mode import ChargeMode
 from tagdocking.geometry_planner import ActionPlan
@@ -143,15 +140,12 @@ def load_params(profile=None):
     return params
 
 
-# 匍匐 profile: 历史 T1-T8 场景按此调参 (obs 1.5 / near 1.0 / 30cm 主动锁定)。
-# pile_lock_distance 两 profile 同为 0.30, 站立下该触发被 crouch 门关掉。
-CROUCH_PROFILE = {'dual.crouch_enable': True,
-                  'dual.observation_distance': 1.5,
-                  'dual.straight_start_distance': 1.0}
+# 近距 profile: T1/T2/T6/T8/T10 历史场景按此调参 (obs 1.5 / near 1.0)。
+NEAR_PROFILE = {'dual.observation_distance': 1.5,
+                'dual.straight_start_distance': 1.0}
 # 站立 profile: 全程站立, locked 只能由 approach 桩码丢失闭锁进入,
 # 直行阶段带墙码 bearing 微调 (straight_yaw_tol_deg)。
-STANDING_PROFILE = {'dual.crouch_enable': False,
-                    'dual.observation_distance': 1.8,
+STANDING_PROFILE = {'dual.observation_distance': 1.8,
                     'dual.straight_start_distance': 1.70}
 
 
@@ -201,10 +195,12 @@ class World:
         self.pile = (pile_x, 0.0, 0.30)
         self.wall = (pile_x + WALL_BASELINE, 0.0, 0.30)
 
-    def observe_tick(self, d, pose, t, pile_on=True):
+    def observe_tick(self, d, pose, t, pile_on=True, hide_pile_below=None):
         wall = optical(pose, self.wall)
         pile = optical(pose, self.pile)
         seen = pile_on and PILE_VISIBLE[0] <= pile[2] <= PILE_VISIBLE[1]
+        if hide_pile_below is not None and wall[2] < hide_pile_below:
+            seen = False   # 桩码检测丢失 (反光/抖动), 与几何出视野无关
         return d.observe(int(t), int(t), wall, pile if seen else None,
                          pile_missing=not seen)
 
@@ -228,13 +224,14 @@ def make_dual(params, pile_x):
     return d, node, World(pile_x)
 
 
-def run(d, world, pose, t, until=None, max_ticks=1200, pile_on=True):
+def run(d, world, pose, t, until=None, max_ticks=1200, pile_on=True,
+        hide_pile_below=None):
     """闭环走停: 观测 → plan_dual → 执行动作 (started/completed/stopped 节奏)。"""
     d.stopped(int(t))
     t += int(1.6e9)
     actions, complete = [], False
     for _ in range(max_ticks):
-        world.observe_tick(d, pose, t, pile_on)
+        world.observe_tick(d, pose, t, pile_on, hide_pile_below)
         seq = d.plan_dual(None, 'omni', None, int(t))
         if d.failure:
             break
@@ -273,8 +270,10 @@ def t1_acquire_forward(params):
                               until=lambda d: d.stage != 'acquire')
     fwd = [a for a in actions if a.jog_distance > 0]
     rev = [a for a in actions if a.jog_distance < 0]
+    # 桩码 z 落到 2.2 (上沿) 即入视野: 3 步 × 0.1m 正好。断言的量是"逼近走
+    # 前进而非倒车", 不是步数 —— 步数由 forward_step 与可见包络共同决定。
     check('T1 acquire-太远走前进而非倒车',
-          len(fwd) >= 5 and not rev and d.stage != 'acquire' and not d.failure,
+          len(fwd) >= 3 and not rev and d.stage != 'acquire' and not d.failure,
           f'forward={len(fwd)} reverse={len(rev)} stage={d.stage} '
           f'failure={d.failure!r}')
     return d, world, pose, t, actions
@@ -294,53 +293,32 @@ def t2_acquire_reverse(params):
           f'stage={d.stage} failure={d.failure!r}')
 
 
-# ── T3: 对准 + 桩码 0.30 → 锁定 + request_stand ─────────────────────
-
-def t3_lock_at_30cm(params):
-    # 正对桩, 从站位 (wall z=1.5 = obs, pile z=0.80) approach 前进到
-    # pile z=0.30 → locked (30cm 主动锁定, 匍匐 profile)。
-    # 原断言 "actions==0" 已失效: 站位守卫 (obs 1.5, 守卫下沿 1.4) 会把
-    # 从 wall z=1.00 起步的场景先拖回观察窗 —— 守卫是对的, 场景改从窗内起步。
-    d, node, world = make_dual(params, 0.95)
-    pose, t, actions, _ = run(d, world, (0.0, 0.0, 0.0), 0,
-                              until=lambda d: d.stage == 'locked')
-    fwd = [a for a in actions if a.jog_distance > 0]
-    check('T3 对准+30cm主动锁定+request_stand',
-          d.stage == 'locked' and d.request_stand and len(actions) == len(fwd)
-          and not d.failure and not d.complete,
-          f'stage={d.stage} request_stand={d.request_stand} '
-          f'actions={len(actions)} failure={d.failure!r}')
-    return d, world, pose, t
-
-
-# ── T4: 对准 0.8m → approach 匍匐前进 → 0.30 锁定 ───────────────────
-
-def t4_approach_then_lock(params):
-    # 正对桩: pile z = 0.80 (PILE_X = 0.95), wall z = 1.50 (观察点)
-    d, node, world = make_dual(params, 0.95)
-    pose, t, actions, _ = run(d, world, (0.0, 0.0, 0.0), 0,
-                              until=lambda d: d.request_stand)
-    fwd = [a for a in actions if a.jog_distance > 0]
-    bad = [a for a in actions if a.jog_distance < 0 or a.turn_angle
-           or a.lateral_distance]
-    check('T4 匍匐approach前进→0.30锁定 (步骤4→5)',
-          d.stage == 'locked' and d.request_stand and len(fwd) >= 8
-          and not bad and not d.failure,
-          f'stage={d.stage} forward={len(fwd)} bad={len(bad)} '
-          f'pile_z={optical(pose, world.pile)[2]:.3f} failure={d.failure!r}')
-
-
-# ── T5: locked → 站立 → 墙码纯直行 → complete ───────────────────────
+# ── T5: approach 桩码丢失闭锁 → locked 直行 → complete ──────────────
 
 def t5_locked_straight_complete(params):
-    d, world, pose, t = t3_lock_at_30cm(params)
-    # 节点职责: ensure_stand 确认后清 request_stand + 重置观测窗 (T7 已验 DualPosture)
-    d.request_stand = False
-    pose, t, actions, complete = run(d, world, pose, t, pile_on=False)
+    """锁定经 approach 桩码丢失闭锁进入 (站立 profile, 30cm 主动锁定已删):
+    正对桩从站位 approach 前进, 桩码在墙码 z≈1.45m 处检测丢失 (反光/抖动,
+    先于 steering_stop 1.0m —— 再近一次连续直行就一步到泊位点, locked
+    没有步进机会), 丢失确认 1.5s 后闭锁。此后墙码纯直行: 逐步 0.1m 推进
+    (bearing 容差内), 航向资格照常累积 → 0.50m complete (验证 locked
+    forward aligned=True 修复: 否则终点误判 no qualified approach)。"""
+    d, node, world = make_dual(params, 1.25)   # wall z=1.8 = 站位, pile z=1.10
+    pose, t, actions, _ = run(d, world, (0.0, 0.0, 0.0), 0,
+                              until=lambda d: d.stage == 'locked',
+                              hide_pile_below=1.45)
+    assert d.stage == 'locked' and not d.failure, \
+        f'T5 前置失败: stage={d.stage} failure={d.failure!r} ' \
+        f'wall_z={optical(pose, world.wall)[2]:.3f}'
+    assert 1.0 < optical(pose, world.wall)[2] <= 1.90, \
+        f'T5 前置失败: 闭锁应发生在纯直行区外 (wall z=' \
+        f'{optical(pose, world.wall)[2]:.3f})'
+    pose, t, actions, complete = run(d, world, pose, t,
+                                     until=lambda d: d.complete,
+                                     hide_pile_below=1.45)
     fwd = [a for a in actions if a.jog_distance > 0]
     wall_z = optical(pose, world.wall)[2]
-    check('T5 locked直行→0.50 complete + 航向资格',
-          complete and d.progress and d.qualified_ns > 0 and len(fwd) >= 9
+    check('T5 丢失闭锁→locked直行→0.50 complete + 航向资格',
+          complete and d.progress and d.qualified_ns > 0 and len(fwd) >= 4
           and not d.failure and abs(wall_z - 0.50) <= 0.02,
           f'complete={complete} progress={d.progress} forward={len(fwd)} '
           f'wall_z={wall_z:.3f} failure={d.failure!r}')
@@ -380,116 +358,6 @@ def t6_overshoot(params):
           f'failure={d2.failure!r}')
 
 
-# ── T7: DualPosture 六态分支 ────────────────────────────────────────
-
-def make_posture(params, ready=True, result=True):
-    node = FakeNode(params, clients={
-        '/l1w_control/lie_down': FakeClient(ready, result),
-        '/l1w_control/stand_up': FakeClient(ready, result),
-    })
-    return DualPosture(node), node, node._clients['/l1w_control/lie_down'], \
-        node._clients['/l1w_control/stand_up']
-
-
-def t7_dual_posture(params):
-    # F1: 服务缺失 → 1s 宽限 → FAILED
-    dp, node, lie, stand = make_posture(params, ready=False)
-    t = 0
-    ok = dp.ensure_crouch(t)
-    t += int(0.5e9)
-    ok2 = dp.ensure_crouch(t)
-    t += int(0.6e9)
-    dp.ensure_crouch(t)
-    check('T7-F1 趴下服务缺失→宽限后fail',
-          not ok and not ok2 and dp._phase == DualPosture.FAILED
-          and '服务不可用' in dp.failure and lie.calls == 0,
-          f'failure={dp.failure!r} calls={lie.calls}')
-
-    # F2a: lie_down 成功 + settle 3s + motion_enabled=True → CROUCHED
-    dp, node, lie, stand = make_posture(params)
-    t = 0
-    dp.ensure_crouch(t)
-    t += int(0.05e9)
-    mid = dp.ensure_crouch(t)
-    set_motion(node, True)
-    t += int(3.0e9)
-    done = dp.ensure_crouch(t)
-    check('T7-F2a 趴下响应+settle→匍匐就绪',
-          not mid and done and dp._phase == DualPosture.CROUCHED
-          and lie.calls == 1,
-          f'mid={mid} done={done} phase={dp._phase}')
-
-    # F2b: settle 后 motion_enabled=False → 桥锁 cmd_vel → FAILED
-    dp, node, lie, stand = make_posture(params)
-    t = 0
-    dp.ensure_crouch(t)
-    t += int(0.05e9)
-    dp.ensure_crouch(t)
-    set_motion(node, False)
-    t += int(3.0e9)
-    dp.ensure_crouch(t)
-    check('T7-F2b 桥锁cmd_vel→明确fail',
-          dp._phase == DualPosture.FAILED and 'cmd_vel' in dp.failure,
-          f'failure={dp.failure!r}')
-
-    # F3: lie_down 拒绝 → 重试 2 次耗尽 → FAILED
-    dp, node, lie, stand = make_posture(params, result=False)
-    t = 0
-    dp.ensure_crouch(t)
-    for _ in range(6):
-        t += int(0.1e9)
-        dp.ensure_crouch(t)
-    check('T7-F3 服务拒绝重试耗尽→fail',
-          dp._phase == DualPosture.FAILED and '重试耗尽' in dp.failure
-          and lie.calls == 3,
-          f'failure={dp.failure!r} calls={lie.calls}')
-
-    # F4: CROUCHED → stand_up → motion_enabled=True → STANDED
-    dp, node, lie, stand = make_posture(params)
-    t = 0
-    dp.ensure_crouch(t)
-    t += int(0.05e9)
-    dp.ensure_crouch(t)
-    set_motion(node, True)
-    t += int(3.0e9)
-    assert dp.ensure_crouch(t) is True, 'F4 前置: 匍匐就绪'
-    t += int(0.1e9)
-    mid = dp.ensure_stand(t)
-    t += int(0.1e9)
-    done = dp.ensure_stand(t)
-    check('T7-F4 stand_up+motion确认→站立就绪',
-          not mid and done and dp._phase == DualPosture.STANDED
-          and stand.calls == 1,
-          f'mid={mid} done={done} phase={dp._phase}')
-
-    # F4b: stand_up 受理但 motion_enabled 永不变 True → 重试耗尽 → FAILED
-    dp, node, lie, stand = make_posture(params)
-    t = 0
-    dp.ensure_crouch(t)
-    t += int(0.05e9)
-    dp.ensure_crouch(t)
-    set_motion(node, True)
-    t += int(3.0e9)
-    assert dp.ensure_crouch(t) is True, 'F4b 前置: 匍匐就绪'
-    # 重新构造: motion 无回传 (None 语义) 场景复测站立确认路径
-    dp, node, lie, stand = make_posture(params)
-    t = 0
-    dp.ensure_crouch(t)
-    t += int(3.05e9)          # 无 motion 回传 → 放行 + warn (None 语义)
-    assert dp.ensure_crouch(t) is True, 'F4b 前置: 无回传放行'
-    t += int(0.1e9)
-    dp.ensure_stand(t)
-    for _ in range(80):
-        t += int(0.1e9)
-        dp.ensure_stand(t)
-        if dp._phase == DualPosture.FAILED:
-            break
-    check('T7-F4b 站立确认超时重试耗尽→fail',
-          dp._phase == DualPosture.FAILED and '超时' in dp.failure
-          and stand.calls == 3,
-          f'failure={dp.failure!r} calls={stand.calls}')
-
-
 # ── T8: ActionWatch ─────────────────────────────────────────────────
 
 def t8_action_watch(d):
@@ -515,10 +383,9 @@ def t8_action_watch(d):
 # ── T9: 站立 profile 全程 ───────────────────────────────────────────
 
 def t9_standing_end_to_end(params):
-    """T9 站立 profile 全程 (dual.crouch_enable: false, obs 1.8 / near 1.70):
-    - 匍匐从不触发: d.crouch False (节点据此跳过 ensure_crouch), 且全程
-      request_stand False (节点不调 ensure_stand → 无 lie_down/stand_up 服务);
-    - locked 只能由 approach 桩码丢失闭锁进入 (30cm 主动锁定被 crouch 门关掉);
+    """T9 站立 profile 全程 (obs 1.8 / near 1.70):
+    - locked 由 approach 桩码丢失闭锁进入 (30cm 主动锁定已删, 无姿态切换),
+      丢失点在墙码 z≈1.45m (先于 steering_stop 1.0m, locked 才有步进机会);
     - 闭锁那一刻注入 2° 航向扰动 (> straight_yaw_tol_deg 1.5°): locked
       bearing 微调必须至少触发一次。扰动不能放在起步 —— 双码纠偏的 theta
       门是 min(对准门, 1°), 桩码可见的全程都会把航向误差修掉 (这本就是
@@ -534,11 +401,10 @@ def t9_standing_end_to_end(params):
     locked_seen = locked_yaws = disturbed = 0
     for _ in range(900):
         stage_before = d.stage
-        world.observe_tick(d, pose, t)
+        world.observe_tick(d, pose, t, hide_pile_below=1.45)
         seq = d.plan_dual(None, 'omni', None, t)
         if d.failure:
             break
-        assert not d.request_stand, '站立 profile 下 request_stand 必须恒 False'
         if seq and seq[0].kind == 'done':
             complete = True
             break
@@ -562,10 +428,10 @@ def t9_standing_end_to_end(params):
         t += int(STEP*1e9)
     wall_z = optical(pose, world.wall)[2]
     check('T9 站立profile全程→complete+bearing微调',
-          complete and not d.failure and not d.crouch and disturbed
+          complete and not d.failure and disturbed
           and locked_seen > 0 and locked_yaws >= 1
           and abs(wall_z-0.50) <= 0.02,
-          f'complete={complete} failure={d.failure!r} crouch={d.crouch} '
+          f'complete={complete} failure={d.failure!r} '
           f'locked_yaws={locked_yaws} locked_plans={locked_seen} '
           f'actions={len(actions)} wall_z={wall_z:.3f} stage={d.stage}')
 
@@ -748,26 +614,24 @@ def t11_undock_failure_codes():
 
 
 def main():
-    crouch = load_params(CROUCH_PROFILE)
+    near = load_params(NEAR_PROFILE)
     standing = load_params(STANDING_PROFILE)
-    # T1/T2/T6/T7/T8/T10 与 profile 无关的场景走匍匐参数 (历史场景按匍匐调);
-    # T3/T4/T5 匍匐全链 (含 T3 内嵌的 30cm 主动锁定); T9 站立 profile 全程。
-    d0, _, _, _, _ = t1_acquire_forward(crouch)
-    t2_acquire_reverse(crouch)
-    t4_approach_then_lock(crouch)
-    t5_locked_straight_complete(crouch)
-    t6_overshoot(crouch)
-    t7_dual_posture(crouch)
+    # T1/T2/T6/T8/T10 历史场景按近距参数调; T5/T9 站立 profile
+    # (丢失闭锁 → locked 直行) 全程。
+    d0, _, _, _, _ = t1_acquire_forward(near)
+    t2_acquire_reverse(near)
+    t5_locked_straight_complete(standing)
+    t6_overshoot(near)
     t8_action_watch(d0)
     t9_standing_end_to_end(standing)
-    t10_charge_undock_gate(crouch)
+    t10_charge_undock_gate(near)
     t11_undock_failure_codes()
 
     failed = [n for n, ok in RESULTS if not ok]
     total = len(RESULTS)
     print(f'\n{"=" * 60}')
     print(f'{"PASS" if not failed else "FAIL"}: {total - len(failed)}/{total} '
-          f'双码姿态切换 + 状态机全分支验证')
+          f'双码状态机全分支验证')
     if failed:
         print('FAILED: ' + ', '.join(failed))
         sys.exit(1)

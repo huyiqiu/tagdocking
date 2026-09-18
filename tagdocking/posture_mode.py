@@ -69,14 +69,9 @@ class PostureMode:
         self._unlock_retries = int(node._p('posture.unlock_retries'))
         self._service_wait_ns = int(float(node._p('posture.service_wait_sec')) * 1e9)
 
-        if (bool(node._p('posture.enable')) and bool(node._p('dual.crouch_enable'))):
-            node.get_logger().warn(
-                '双码匍匐 profile 启用: 静止站立锁定 (posture) 强制旁路 —— 停看点'
-                ' static_stand 会把匍匐中的狗站起来, 桩码随即出视野; '
-                '匍匐停看由 dual.settle_sec + dual_posture 管理器保证')
         self._phase = self.IDLE if self._enabled() else self.DISABLED
         if self._phase == self.DISABLED:
-            node.get_logger().info('静止站立功能已停用 (posture.enable=false 或 dual.crouch_enable=true)')
+            node.get_logger().info('静止站立功能已停用 (posture.enable=false)')
 
         prefix = node._p('base.l1w_prefix')
         self._cli_lock = node.create_client(Trigger, f'{prefix}/static_stand')
@@ -132,13 +127,9 @@ class PostureMode:
         整体关掉呼吸抑制, 免重启、免无桥宽限等待。每个停-看边界重新读一次,
         开关即时生效 (含中途切换的状态迁移, 见各入口的守卫)。
 
-        双码匍匐 profile 强制旁路 (dual.crouch_enable=true): 匍匐流程里停看点
-        static_stand 会把狗站起来毁掉对准 (桩码矮, 站立看不到), 停振由
-        dual.settle_sec 保证。站立 profile (crouch_enable=false, 全程站立) 下
-        不旁路 —— static_stand 只是锁姿而非改姿, 恰是量测稳定工具。
+        双码全程站立: static_stand 只是锁姿而非改姿, 恰是量测稳定工具,
+        不需要旁路。
         """
-        if bool(self._node._p('dual.crouch_enable')):
-            return False
         return bool(self._node._p('posture.enable'))
 
     def on_stop(self, now_ns: int) -> None:

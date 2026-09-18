@@ -14,7 +14,6 @@ class Node:
         self.params.update({'dual.enable': True, 'dual.pile_tag_id': 51,
                             'tag.id': 0, 'tag.family': '36h11',
                             'base.type': 'omni', 'dual.dock_distance': .5,
-                            'dual.crouch_enable': False,
                             'dual.straight_start_distance': 1.70,
                             'dual.align_tolerance_deg': 3., 'dual.align_hold_sec': .5,
                             'posture.static_settle_sec': 1.2,

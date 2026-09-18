@@ -223,16 +223,10 @@ docking_node:
 
     # ── Dual optical stop/look docking (single-tag parameters above unchanged) ──
     # All distances below are optical z (not base x or Euclidean range).
-    # Standing-only profile (crouch_enable: false): 1.8m standoff -> dual
-    # corrections after every jog -> qualified near pile loss -> heading locked
-    # -> straight run with wall-bearing micro-correction -> 0.50m parked,
-    # then request passive. Crouch profile: dual.crouch_enable: true.
+    # Standing-only flow: 1.8m standoff -> dual corrections after every jog
+    # -> qualified near pile loss -> heading locked -> straight run with
+    # wall-bearing micro-correction -> 0.50m parked, then request passive.
     dual.enable: false
-    # 匍匐 profile 开关: false = 全程站立 (匍匐单轮转向每次附带 4.5~7cm 前移且
-    # 小角度无法精确调整, 已放弃匍匐搜索/调整; 匍匐代码原样保留, 见 README 6.5b)。
-    # true = 原匍匐流程 (站位 1.5m / near 1.0m / 30cm 主动锁定), 调参需整体回退
-    # 本节站位类参数。
-    dual.crouch_enable: false
     dual.wall_tag_size: 0.15
     dual.pile_tag_id: 51                       # must differ from tag.id
     dual.pile_tag_size: 0.05
@@ -390,9 +384,6 @@ docking_node:
     # "反向"判决 (超时/无响应判据不受影响, 它们本就有各自的时间门)。
     # 现场 3° 转向曾在起步 108ms 被判 opposite direction 而中止, 即此瞬态。
     dual.action_startup_sec: 0.6                # s — 起步瞬态宽限, 期间不判反向
-    dual.pile_lock_distance: 0.30               # m — pile optical z at which to switch to standing (30cm: any closer and the pile tag leaves the crouched FOV; requires aligned heading first)
-    dual.crouch_settle_sec: 3.0                 # s — lie_down settle wait (success + timer; no dedicated posture_state value for crouch)
-    dual.posture_retries: 2                     # x — crouch/stand service retries before dual aborts
 
     # ── Docking Tolerance ──
     tolerance.position_m: 0.05                # m — 前后 ±5cm 视为到位
