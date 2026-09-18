@@ -251,8 +251,8 @@ class DockingWebNode(Node):
         with self._viewer_lock:
             self._viewers += 1
             if self._img_sub is None:
-                # 必须与发布端匹配: rtsp_camera/camera_info_bridge 都是
-                # RELIABLE depth=10。用 sensor_data (BEST_EFFORT) 会收不到。
+                # 必须与发布端匹配: rtsp_camera 是 RELIABLE depth=10。
+                # 用 sensor_data (BEST_EFFORT) 会收不到。
                 qos = QoSProfile(depth=10,
                                  reliability=ReliabilityPolicy.RELIABLE)
                 self._img_sub = self.create_subscription(

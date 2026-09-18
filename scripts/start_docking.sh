@@ -21,17 +21,17 @@
 #
 #   rtsp_url                rtsp://127.0.0.1:8555/front
 #   camera_info_file        <包share>/config/rtsp_camera_info.yaml (绝对路径)
-#   odom_topic              /odin1/odometry_highfreq
+#   odom_topic              /dog/odom
 #   camera_downscale        0
-#   dual_settle_sec         1.0
-#   dual_dock_distance      0.47
-#   camera_lateral_offset_m 0
 #   tag_size                0.15
+#
+# 双码调参 (dual_dock_distance/dual_settle_sec 等) 不在 launch 里 ——
+# config/docking.yaml 是唯一真相来源, launch 参数传空串才回落 yaml。
 #
 # 如果这里再抄一遍, 日后改了 launch 默认值就会被脚本里的旧值悄悄盖掉, 变成
 # 两个真相来源、而且是难查的那一种。要临时改某个值, 在命令行追加即可:
 #
-#   ./start_docking.sh docking dual_dock_distance:=0.50
+#   ./start_docking.sh docking pile_tag_id:=52
 #
 # camera_info_file 用的是包内绝对路径, 不是原实测命令里的相对路径
 # config/rtsp_camera_info.yaml —— systemd 下工作目录不确定, 相对路径会失效。

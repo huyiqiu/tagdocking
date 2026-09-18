@@ -2,13 +2,13 @@
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
   <name>tagdocking</name>
-  <version>0.1.0</version>
+  <version>1.0.0</version>
   <description>
-    Industrial-grade AprilTag auto-docking framework with multi-chassis
-    support (diff-drive, omni, quadruped), visual servoing, and full
-    state machine. Docking is triggered directly (e.g. via the
-    /docking_node/start_docking service); pre-dock navigation is handled
-    externally.
+    AprilTag dual-tag auto-docking stack for the L1W quadruped (omni
+    chassis). RTSP camera stream, two-tag (wall + pile) optical
+    alignment, stop-and-go motion, charging handover. Docking is
+    triggered directly (Trigger service / Dock action / web console);
+    pre-dock navigation is handled externally.
   </description>
   <maintainer email="user@example.com">user</maintainer>
   <license>Apache-2.0</license>

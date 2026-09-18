@@ -7,17 +7,13 @@ docking_node:
     tag.id: 0                                 # tag ID to dock to
     tag.tag_loss_timeout_sec: 2.5             # s — 接近中连续丢墙码超此时长才判失败 (检测流实测有 1.6~3s 空档, 1s 必抖动)
                                               #   到时直落 MOTION_FAILED, 不搜索不重试。
-                                              #   且预算会被 dual.settle_sec(1.5s) 停稳窗结构性吃掉一截 (窗内每帧按设计拒收,
-                                              #   计数器却照涨), 2.5s 实测只剩 ~0.93s 真实宽限 —— 比上面那个 1.6~3s 空档还短。
+                                              #   且预算会被 dual.settle_sec(1.0s) 停稳窗结构性吃掉一截 (窗内每帧按设计拒收,
+                                              #   计数器却照涨), 2.5s 名义宽限实际更短。
                                               #   失败串会把这笔账算出来 (见「墙码丢失 — 外层丢码看门狗预算耗尽」)。
 
     # ── TF Frames ──
     camera_frame: "camera_color_optical_frame"
     base_frame: "base_link"
-    # measure_frame: empty = use base_frame; set to e.g. "base_footprint" for
-    # direct base→tag TF (dist=tx.x, lat=tx.y). When empty, converts from
-    # camera optical frame (dist=tz, lat=-tx).
-    measure_frame: ""
 
     # ── Base ──
     # 机器狗 (ZSL-1) 是全向底盘: 横向偏差直接横移修正,
@@ -121,40 +117,11 @@ docking_node:
     stopgo.max_turn_step: 0.17               # rad (~10°) — 单次转向硬上限, 小步转+每步重看, 低帧率下 tag 不易转出视野而丢失
     stopgo.small_turn_rad: 0.1               # rad — below this, turn at half speed
 
-    # ── Final Straight (两阶段停泊) ──
-    # 阶段1(APPROACH) 按远/近分两级:
-    #   远场 (dist > tighten_distance): 粗对准+前进。放宽方位/横向容忍 (far_*
-    #     参数), 不做法线对准/横移 (normal=None → pure pursuit 一键瞄准前进)。
-    #     1.5m 处 AprilTag normal 噪声 ±10° 被 dist 放大成 ±0.3m 横移噪声, 是
-    #     远场反复/反向横移的根源 — 远场只进不平移, 先走进再精调。
-    #   近场 (dist ≤ tighten_distance): 收紧到入口包络, 才做"先对齐法线再横移"
-    #     → 直行。法线门槛不收紧 (normal 近场抖动 4~5°, 收紧会摆头)。跨区
-    #     前进步长钳到恰好停在区界, 入口检查拿到最新鲜量测。
-    # 阶段2(直行): 进入 start_distance 后无条件纯直行, 不再调角(像停车入库)。
-    #   进入时做一次性失败检查(入口包络): 方位 > yaw_threshold_deg 或
-    #   |横向| > entry_lateral_m 则对准过差、入库会撞偏 → 报失败走重试
-    #   (倒车重锁)。直行阶段不修横向, 入口误差会一路带到终点, 故入口从严。
-    final_straight.enable: true                       # 两阶段停泊开关; false 恢复单阶段
-    final_straight.start_distance: 0.85               # m — 直行阶段起点 (须 > dock_target.distance)
-    final_straight.yaw_threshold_deg: 3.0             # deg — 入口方位门槛: 进入直行距离时超此值报导航失败; 近场方位修正门槛同此值 (launch 默认 3.0 会覆盖)
-    final_straight.normal_yaw_threshold_deg: 2.0      # deg — 近场法线(normal)对准门槛下限: 低于噪声, 实际生效门槛见 normal_turn_min_deg
-    # 法线转向触发门槛 = max(normal_yaw_threshold_deg, 本值) (deg)。
-    # normal 有平面 PnP 二义性 (mirror 解, 近场 ±10° 双峰: 实测解卷绕后在
-    # ~170°/~190° 两簇间跳, 车体转 15° 读数几乎不变), 3帧 EMA 后残差仍 ±3-5°
-    # → 2026-09 对接日志: 2° 门槛下原地摆头极限环, 横移永远触发不了。
-    # 残差航向不查 normal, 由直行入口 (bearing+横向) 兜底, 容忍 final_servo 15°。
-    final_straight.normal_turn_min_deg: 6.0
-    final_straight.entry_lateral_m: 0.07              # m — 入口横向门槛: 进入直行距离时 |横向| 超此值报导航失败 (一次性入口检查)
-    final_straight.lateral_threshold_m: 0.02          # m — 近场横移修正 / 捷径横向门槛: 比入口更紧。量测补偿加回相机 3cm 偏置后, 入口 0.03 的容差会把真实 0.03m 偏移放行直行 → 左腿撞桩; 近场修正与捷径改用此值 (须 < stopgo.lateral_threshold 保证规划器会滑)
-    final_straight.tighten_distance: 1.3              # m — 远/近分界: dist ≤ 此值进入近场精调 (法线对准+横移+直行), > 则远场粗对准+纯前进 (建议 ≥ start_distance + jog_max)
-    final_straight.far_yaw_threshold_deg: 15.0        # deg — 远场粗对准方位门槛: dist > tighten_distance 时方位 ≤ 此值即前进, 不做微调/横移 (远场 normal 不可靠不宜微调)
-    final_straight.far_lateral_m: 0.20                # m — 远场粗对准横向门槛: dist > tighten_distance 时 |lat| ≤ 此值即前进; 远场只要求大方向对, 不消横向偏 (走到近场再说)
-
     # ── Dual optical stop/look docking ──
     # All distances below are optical z (not base x or Euclidean range).
     # Standing-only flow: 1.8m standoff -> dual corrections after every jog
     # -> qualified near pile loss -> heading locked -> straight run with
-    # wall-bearing micro-correction -> 0.50m parked, then request passive.
+    # wall-bearing micro-correction -> 0.47m parked, then request passive.
     dual.wall_tag_size: 0.15
     dual.pile_tag_id: 51                       # must differ from tag.id
     dual.pile_tag_size: 0.05
@@ -164,7 +131,7 @@ docking_node:
     # 入口) 已改用直行包络 obs+tol = 1.90 —— 直行的提交发生在观察窗内任意处,
     # 拿窗下沿当放行门会在 1.70~1.90 造出"要先走一步才准走第一步"的死区。
     dual.straight_start_distance: 1.70
-    dual.dock_distance: 0.50
+    dual.dock_distance: 0.47                  # m — 停泊终点 (原 launch 默认值, v1.0 起烘焙于此)
     dual.align_tolerance_deg: 3.0              # each optical bearing, not their average
     dual.align_hold_sec: 0.5                   # same settled window, unique frames
     dual.observation_distance: 1.8
@@ -256,7 +223,7 @@ docking_node:
     dual.prealign_tolerance_deg: 5.0           # deg — 收进此方位即交给双码
     dual.prealign_step_deg: 8.0                # deg — 单步转向上限
     dual.prealign_max_steps: 12                # x — 步数预算, 耗尽告警后移交双码
-    dual.settle_sec: 1.5
+    dual.settle_sec: 1.0                      # s — 停稳窗 (原 launch 默认值, v1.0 起烘焙于此)
     dual.min_frames: 3
     dual.fresh_sec: 0.6
     dual.tf_skew_sec: 0.02

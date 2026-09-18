@@ -52,15 +52,3 @@ def test_rtsp_output_calibration_is_normalized(downscale):
     factor = downscale or 3
     assert (images[0].width, images[0].height) == (1200 // factor, 900 // factor)
     check(infos[0], images[0], factor)
-
-
-@pytest.mark.parametrize('factor', [1, 2, 3])
-def test_synthesized_bridge_calibration_is_normalized(factor):
-    cls = method_class('camera_info_bridge.py', 'CameraInfoBridge',
-                       dict(Image=image, CameraInfo=info))
-    n = cls.__new__(cls)
-    n._downscale, n._synth_intr, n._intr_cache = factor, calibration(), {}
-    msg = image()
-    msg.header.stamp = 456
-    msg.width, msg.height = 1200 // factor, 900 // factor
-    check(n._build_info(msg, 1200, 900, factor), msg, factor)

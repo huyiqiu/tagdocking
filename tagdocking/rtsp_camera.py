@@ -21,8 +21,8 @@
     rtsp_camera ─→ /camera_sync/image_raw + /camera_sync/camera_info
                 ─→ apriltag_node ─→ /detections + TF ─→ docking_node ─→ /cmd_vel
 
-(rtsp 模式下不再需要 camera_info_bridge: 本节点自己产出的 image 与
-camera_info 时间戳天然逐帧一致, 且内含降采样, 少一跳大帧 DDS 转发。)
+(本节点自己产出的 image 与 camera_info 时间戳天然逐帧一致, 且内含降采样,
+ 不需要再经任何同步桥转发大帧。)
 
 时间戳语义
 ----------
@@ -126,9 +126,8 @@ class RtspCameraNode(Node):
         self._intr_scale_warned = False
 
         # ── 发布者 ───────────────────────────────────────────────
-        # 与 camera_info_bridge 输出端一致: RELIABLE depth=10。
-        # (实测 apriltag_ros 的 image_transport 订阅在本机对 BEST_EFFORT
-        #  收不到 image, 见 camera_info_bridge 注释。)
+        # RELIABLE depth=10: 实测 apriltag_ros 的 image_transport 订阅在
+        # 本机对 BEST_EFFORT 收不到 image。
         qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE)
         self._img_pub = self.create_publisher(
             Image, str(self._p('image_out_topic')), qos)
@@ -191,7 +190,7 @@ class RtspCameraNode(Node):
 
         # 输出降采样: 0=按 target_width 自动取整倍; >0=固定倍数。
         # 输出宽度控制在 ~640: 16cm tag @1m 仍有 ~50px 供检测, 且避免大帧
-        # 打爆本机 DDS (大帧 RELIABLE 投递问题见 camera_info_bridge 注释)。
+        # 打爆本机 DDS (大帧 RELIABLE 投递会积压出秒级延迟)。
         self.declare_parameter('downscale', 0)
         self.declare_parameter('target_width', 640)
 

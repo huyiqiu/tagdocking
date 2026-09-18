@@ -4,11 +4,11 @@
 场景 (对照用户 5 步流程; 匍匐姿态机已随 v1.0 移除, 全程站立):
   [T1] acquire 远距桩码不可见 → 按墙码距离分流: 前进逼近 (非倒车死路)
   [T2] acquire 太近桩码出视野 → 后退找回 (reverse 预算 0.6m/12 次)
-  [T5] approach 桩码丢失闭锁 → locked 墙码纯直行累积航向资格 → 0.50m complete
+  [T5] approach 桩码丢失闭锁 → locked 墙码纯直行累积航向资格 → 0.47m complete
        (验证 locked forward aligned=True 修复: 否则终点误判 no qualified approach)
   [T6] locked 墙码 z 跳近豁免 overshoot; 非 locked 命中 fail
   [T8] ActionWatch: 正常完成 / 反方向 veto / 无里程计响应
-  [T9] 站立 profile 全程: 锁定直行带 bearing 微调, 0.50m 完成
+  [T9] 站立 profile 全程: 锁定直行带 bearing 微调, 0.47m 完成
   [T10] ChargeMode 泊出门控 / [T11] 泊出超时失败码分流 (见各自 docstring)
 
 世界模型: 狗位姿 (x, y, yaw) 于 odom; 墙码 id=0 (15cm) 贴桩后墙, 桩码 id=51
@@ -299,7 +299,7 @@ def t5_locked_straight_complete(params):
     正对桩从站位 approach 前进, 桩码在墙码 z≈1.45m 处检测丢失 (反光/抖动,
     先于 steering_stop 1.0m —— 再近一次连续直行就一步到泊位点, locked
     没有步进机会), 丢失确认 1.5s 后闭锁。此后墙码纯直行: 逐步 0.1m 推进
-    (bearing 容差内), 航向资格照常累积 → 0.50m complete (验证 locked
+    (bearing 容差内), 航向资格照常累积 → 0.47m complete (验证 locked
     forward aligned=True 修复: 否则终点误判 no qualified approach)。"""
     d, node, world = make_dual(params, 1.25)   # wall z=1.8 = 站位, pile z=1.10
     pose, t, actions, _ = run(d, world, (0.0, 0.0, 0.0), 0,
@@ -316,9 +316,9 @@ def t5_locked_straight_complete(params):
                                      hide_pile_below=1.45)
     fwd = [a for a in actions if a.jog_distance > 0]
     wall_z = optical(pose, world.wall)[2]
-    check('T5 丢失闭锁→locked直行→0.50 complete + 航向资格',
+    check('T5 丢失闭锁→locked直行→0.47 complete + 航向资格',
           complete and d.progress and d.qualified_ns > 0 and len(fwd) >= 4
-          and not d.failure and abs(wall_z - 0.50) <= 0.02,
+          and not d.failure and abs(wall_z - 0.47) <= 0.02,
           f'complete={complete} progress={d.progress} forward={len(fwd)} '
           f'wall_z={wall_z:.3f} failure={d.failure!r}')
 
@@ -326,14 +326,14 @@ def t5_locked_straight_complete(params):
 # ── T6: locked overshoot 豁免 vs 非 locked fail ─────────────────────
 
 def t6_overshoot(params):
-    # 6a: locked 且墙码 z=0.45 (< target-0.02) → 豁免, 出后退修正动作
+    # 6a: locked 且墙码 z=0.42 (< target-0.02 = 0.45) → 豁免, 出后退修正动作
     # 6b: approach 阶段同情况 → 命中 overshoot fail (locked 豁免不外溢)
-    # 相机距墙 0.45m 在世界模型里几何不可达: 桩码贴桩底座在墙前 0.70m, 会落到
+    # 相机距墙 0.42m 在世界模型里几何不可达: 桩码贴桩底座在墙前 0.70m, 会落到
     # 相机身后, observe 整帧拒绝 —— 旧场景表达式 (0.60+0.45-0.15) 实际产出
     # wall z=1.45, 测的根本不是 overshoot。改为直接注入滤波状态 (与 pytest
     # 单测同款); locked 下 observe 本就强制 pile=None, 注入合法。
-    wall = (0., -.2, 0.45)
-    d, node, world = make_dual(params, 0.45 + CAM[0])
+    wall = (0., -.2, 0.42)
+    d, node, world = make_dual(params, 0.42 + CAM[0])
     d.stage = 'locked'
     d.stopped(int(2e9))
     t = int(3.6e9)
@@ -344,7 +344,7 @@ def t6_overshoot(params):
     check('T6a locked 墙码z跳近豁免overshoot',
           not d.failure and seq and seq[0].jog_distance < 0,
           f'failure={d.failure!r} jog={seq[0].jog_distance if seq else None}')
-    d2, _, _ = make_dual(params, 0.45 + CAM[0])
+    d2, _, _ = make_dual(params, 0.42 + CAM[0])
     d2.stage = 'approach'
     d2.stopped(int(6e9))
     t2 = int(7.6e9)
@@ -390,7 +390,7 @@ def t9_standing_end_to_end(params):
       门是 min(对准门, 1°), 桩码可见的全程都会把航向误差修掉 (这本就是
       设计); locked 微调的职责窗口恰是桩码丢失之后, 对应现场最后一程
       盲走中的航向漂移;
-    - 0.50m 完成。
+    - 0.47m 完成。
     """
     d, node, world = make_dual(params, 1.25)   # wall z=1.8 = 站位, pile z=1.10
     pose = (0.0, 0.0, 0.0)
@@ -429,7 +429,7 @@ def t9_standing_end_to_end(params):
     check('T9 站立profile全程→complete+bearing微调',
           complete and not d.failure and disturbed
           and locked_seen > 0 and locked_yaws >= 1
-          and abs(wall_z-0.50) <= 0.02,
+          and abs(wall_z-0.47) <= 0.02,
           f'complete={complete} failure={d.failure!r} '
           f'locked_yaws={locked_yaws} locked_plans={locked_seen} '
           f'actions={len(actions)} wall_z={wall_z:.3f} stage={d.stage}')

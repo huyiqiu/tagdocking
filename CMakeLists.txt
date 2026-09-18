@@ -49,13 +49,12 @@ install(PROGRAMS
   scripts/docking_node
   scripts/docking_web
   scripts/docking_supervisor
-  scripts/camera_info_bridge
   scripts/rtsp_camera
   scripts/calibrate_rtsp
   scripts/test_turn_angle
   scripts/test_jog_distance
+  scripts/test_lateral_distance
   scripts/test_apriltag
-  scripts/calibrate_camera
   scripts/mock_l1w_control
   scripts/start_docking.sh
   DESTINATION lib/${PROJECT_NAME}

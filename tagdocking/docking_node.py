@@ -235,7 +235,6 @@ class DockingNode(Node):
         # TF
         self.declare_parameter('camera_frame', 'camera_color_optical_frame')
         self.declare_parameter('base_frame', 'base_link')
-        self.declare_parameter('measure_frame', '')
 
         # Base
         self.declare_parameter('base.cmd_vel_topic', 'cmd_vel')
@@ -260,35 +259,6 @@ class DockingNode(Node):
 
         # Pose buffer
         self.declare_parameter('pose_buffer.size', 30)
-
-        # Final straight (两阶段停泊: 85cm 对准 → 55cm 纯直行)
-        self.declare_parameter('final_straight.enable', True)
-        self.declare_parameter('final_straight.start_distance', 0.85)
-        self.declare_parameter('final_straight.yaw_threshold_deg', 3.0)
-        # 近场法线(normal)对准门槛 (deg): 收紧到 ~2° 让"先对齐法线再横移"的次序
-        # 成立。
-        self.declare_parameter('final_straight.normal_yaw_threshold_deg', 2.0)
-        # 法线转向触发的噪声下限 (deg): 实际转向门槛 = max(上面, 本值)。
-        # normal 有平面 PnP 二义性 (mirror 解, 近场 ±10° 双峰: 实测解卷绕后在
-        # ~170°/~190° 两簇间跳, 车体已转 15° 读数几乎不变), 3帧 EMA 后残差
-        # 仍 ±3-5°。门槛低于噪声下限时转向决策本身抖动 → 原地摆头追噪声、
-        # 横移永远触发不了 (2026-09 对接日志)。残差航向误差不查 normal ——
-        # 由直行入口包络 (bearing+横向) 兜底。
-        self.declare_parameter('final_straight.normal_turn_min_deg', 6.0)
-        self.declare_parameter('final_straight.entry_lateral_m', 0.03)
-        # 近场/远场分界: dist ≤ 此值时阶段1 走「法线对准 + 横移」微调;
-        # 远场走「纯方位粗对准 + 前进」(不横移), 避免 1.5m 处 normal 噪声
-        # 放大成反复/反向横移。用户直观认知 ~1.3m。
-        self.declare_parameter('final_straight.tighten_distance', 1.3)
-        # 远场粗对准门槛 (dist > tighten_distance 且 two_phase 启用):
-        # 比停走宽松 —— 远场只做大尺度朝向修正, 微调留给近场。方位用 bearing
-        # (atan2(lat,dist)), 不受 normal 噪声影响。
-        self.declare_parameter('final_straight.far_yaw_threshold_deg', 15.0)
-        self.declare_parameter('final_straight.far_lateral_m', 0.20)
-        # 近场横移修正 / 捷径的横向门槛 (比入口 entry_lateral_m 更紧): 量测补偿
-        # 加回 3cm 偏置后, 近场横移修正需在直行前把真实横向压到此值内, 否则左腿
-        # 仍会撞桩。
-        self.declare_parameter('final_straight.lateral_threshold_m', 0.02)
 
         # ── Dual-tag docking (双二维码对准, 唯一方案) ────────────────
         for name, default in DUAL_DEFAULTS.items():

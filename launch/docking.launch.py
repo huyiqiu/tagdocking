@@ -1,31 +1,23 @@
-"""Launch file for tagdocking — AprilTag auto-docking framework.
+"""Launch file for tagdocking — AprilTag dual-tag auto-docking stack.
 
 Starts:
-  1. Camera source — 三选一:
-       a. rtsp_url 非空 (机器狗): rtsp_camera 桥 (拉流 + 内参合成 + 静态TF)
-       b. use_odin:=true (odin1 相机): camera_info_bridge 合成模式
-          (/odin1/image/undistorted 去畸变流 + 包内内参 + frame_id 重打 + 静态TF)
-       c. 默认 (ROS 相机话题): camera_info_bridge (时间戳同步 + 降采样)
+  1. rtsp_camera — RTSP 拉流桥 (解码 + 内参合成 + 降采样 + 静态TF),
+     产出时间戳逐帧对齐的 image + camera_info 到 /camera_sync/*
   2. april_tag node (tag detection + TF broadcast)
   3. docking_node (tagdocking controller)
 
 Usage:
-  # Minimal: camera already publishing, just start docking stack
+  # 完整停泊栈 (机器狗默认配置: mediamtx front 流 + /dog/odom):
   ros2 launch tagdocking docking.launch.py
 
-  # With custom tag
-  ros2 launch tagdocking docking.launch.py dock_tag_id:=5 tag_size:=0.21
+  # 只起相机链路 (Web 看画面用, 由 docking_supervisor 按需调用):
+  ros2 launch tagdocking docking.launch.py nodes:=camera
 
-  # 机器狗 (RTSP 相机 + cmd_vel): 先 scripts/calibrate_rtsp 标定, 再:
+  # 换 RTSP 源 / 相机内参 / 安装位姿 (先 scripts/calibrate_rtsp 标定):
   ros2 launch tagdocking docking.launch.py \\
       rtsp_url:=rtsp://192.168.1.100:8554/live \\
       camera_info_file:=$PWD/config/rtsp_camera_info.yaml \\
       odom_topic:=/odom camera_mount_z:=0.35
-
-  # odin1 相机 (后装 3D 视觉模组, 去畸变流 1600x1296): 按实际安装位姿传
-  # camera_mount_* (与 rtsp 模式同一套参数), 内参自动用包内 odin_camera_info.yaml:
-  ros2 launch tagdocking docking.launch.py use_odin:=true \\
-      camera_mount_z:=0.30 camera_mount_pitch_deg:=0.0
 
   # 双二维码方案 (墙码 36h11:0 15cm + 桩码 5cm 联合对准 → 纯直行 → 距墙码
   # 0.50m 停泊): 桩码 ID=51 已确认; 全分辨率保 5cm 桩码远距可检。
@@ -62,16 +54,7 @@ DUAL_TUNING_ARGS = (
     'odom_noise_m', 'odom_noise_rad', 'action_startup_sec',
 )
 
-# dual_* 里少数几个的实测最优值 (2026-09 现场标定, 成功率最高的一组)。
-# 其余 dual_* 仍是空串 = 保留 config/docking.yaml 的权威值 —— 这张表只是
-# 对那条约定的按名例外, 不要顺手往里加参数: 进了这张表的值就脱离了 yaml,
-# 改 yaml 不再生效, 只能改这里。
-DUAL_ARG_DEFAULTS = {
-    'settle_sec': '1.0',      # yaml 为 1.5; 实测 1.0 停稳足够且更快
-    'dock_distance': '0.47',  # yaml 为 0.50; 实测 0.47 到位更稳
-}
-
-DEFAULT_RTSP_URL = 'rtsp://127.0.0.1:8589/test'
+DEFAULT_RTSP_URL = 'rtsp://127.0.0.1:8555/front'
 
 # rtsp 模式的默认内参: 写成包内绝对路径而不是留空靠回退逻辑猜。
 #   - `--show-args` 里直接看得到用的是哪一份, 不用去读回退代码才敢确定;
@@ -85,63 +68,35 @@ DEFAULT_RTSP_CAMERA_INFO = os.path.join(
 
 def launch_setup(context):
     # ── 参数体检要在清场之前 ──────────────────────────────────────
-    # 下面那段 pkill 有副作用: 它会收掉正在跑的 apriltag_node/camera_info_bridge,
-    # 而 apriltag 一死 `ros2 launch` 会连坐把整棵树带走。所以参数拼错必须在
-    # **动手之前**就炸掉 —— 否则一条 `nodes:=camrea` 的手抖就把好好跑着的栈
-    # 收了, 而且自己还起不来。(实测踩过: nodes:=bogus 把活栈整棵带下来了。)
+    # 下面那段 pkill 有副作用: 它会收掉正在跑的 apriltag_node, 而 apriltag
+    # 一死 `ros2 launch` 会连坐把整棵树带走。所以参数拼错必须在**动手之前**
+    # 就炸掉 —— 否则一条 `nodes:=camrea` 的手抖就把好好跑着的栈收了, 而且自
+    # 己还起不来。(实测踩过: nodes:=bogus 把活栈整棵带下来了。)
     nodes_mode = LaunchConfiguration('nodes').perform(context).strip().lower()
     if nodes_mode not in ('all', 'camera'):
-        # 照 rtsp/odin 互斥那条的写法: 拼错的值当场炸, 不静默退回默认值 ——
-        # 悄悄起了满栈就把"按需省 CPU"这件事整个抵消了。
+        # 拼错的值当场炸, 不静默退回默认值 —— 悄悄起了满栈就把"按需省 CPU"
+        # 这件事整个抵消了。
         raise RuntimeError(
             f"nodes 只能是 all 或 camera, 收到 '{nodes_mode}'")
 
-    # ── Kill stray apriltag_node / camera_info_bridge processes ──
+    # ── Kill stray apriltag_node processes ──────────────────────
     # apriltag_node is a separate process from docking_node; if docking_node
     # crashed (or was SIGKILLed), the apriltag node survived. Multiple stray
     # apriltag nodes each broadcast the SAME tag TF frame (tag<family>:<id>),
     # so the TF listener returns whichever competing transform arrived last —
     # producing wild, contradictory lat/dist jumps between measurements that
-    # make docking impossible. A stray camera_info_bridge (left over from a
-    # crashed run or a manual ros2 run) is just as bad: it double-publishes
-    # /camera_sync/* images and a second static TF. Reap both before starting
-    # a fresh set.
+    # make docking impossible. Reap it before starting a fresh set.
     try:
         subprocess.run(['pkill', '-9', '-f', 'apriltag_node'],
-                       timeout=5, check=False)
-        subprocess.run(['pkill', '-9', '-f', 'camera_info_bridge'],
                        timeout=5, check=False)
     except Exception:
         pass
 
-    image_topic = LaunchConfiguration('image_topic').perform(context)
-    camera_info_topic = LaunchConfiguration('camera_info_topic').perform(context)
     family = LaunchConfiguration('family').perform(context)
     tag_size = float(LaunchConfiguration('tag_size').perform(context))
     dock_tag_id = int(LaunchConfiguration('dock_tag_id').perform(context))
     camera_frame = LaunchConfiguration('camera_frame').perform(context)
     cmd_vel_topic = LaunchConfiguration('cmd_vel_topic').perform(context)
-    dock_distance = float(LaunchConfiguration('dock_distance').perform(context))
-    final_straight_distance = float(LaunchConfiguration('final_straight_distance').perform(context))
-    final_straight_yaw_deg = float(LaunchConfiguration('final_straight_yaw_deg').perform(context))
-    # 直行入口横向门槛 — 空值时用 yaml 权威值 (同 jog_max 的约定)
-    entry_lateral_m = LaunchConfiguration('entry_lateral_m').perform(context).strip()
-    # 相机安装横向偏移补偿 (m, + = 相机偏左) — 空值时用 yaml 权威值
-    camera_lateral_offset_m = LaunchConfiguration('camera_lateral_offset_m').perform(context).strip()
-    # 近场横移修正/捷径横向门槛 (m) — 空值时用 yaml 权威值
-    final_straight_lateral_threshold = LaunchConfiguration('final_straight_lateral_threshold').perform(context).strip()
-    # 近场法线对准门槛 (deg) — 空值时用 yaml 权威值
-    final_straight_normal_yaw_deg = LaunchConfiguration('final_straight_normal_yaw_deg').perform(context).strip()
-    # 远/近分界 (m): dist ≤ 此值近场精调, > 此值远场粗对准+纯前进 — 空值时用 yaml 权威值
-    final_straight_tighten_distance = LaunchConfiguration('final_straight_tighten_distance').perform(context).strip()
-    # 远场粗对准方位门槛 (deg) — 空值时用 yaml 权威值
-    final_straight_far_yaw_deg = LaunchConfiguration('final_straight_far_yaw_deg').perform(context).strip()
-    # 远场粗对准横向门槛 (m) — 空值时用 yaml 权威值
-    final_straight_far_lateral_m = LaunchConfiguration('final_straight_far_lateral_m').perform(context).strip()
-    # 到位即 DOCKED 的方位门槛 (deg) — 空值时用 yaml 权威值
-    final_servo_yaw_deg = LaunchConfiguration('final_servo_yaw_deg').perform(context).strip()
-    # 走停单步最大 jog 距离 — 空值时用 yaml 权威值 (同 odom_topic 的约定)
-    jog_max = LaunchConfiguration('jog_max').perform(context).strip()
 
     # 狗模式服务前缀 — 空值时用 yaml 权威值
     l1w_prefix = LaunchConfiguration('l1w_prefix').perform(context).strip()
@@ -150,7 +105,7 @@ def launch_setup(context):
     charge_passive = LaunchConfiguration('charge_passive').perform(context).strip()
     charge_static_stand = LaunchConfiguration('charge_static_stand').perform(context).strip()
 
-    # ── RTSP 相机模式 (机器狗) ──
+    # ── RTSP 相机 ──
     rtsp_url = LaunchConfiguration('rtsp_url').perform(context).strip()
     camera_info_file = LaunchConfiguration('camera_info_file').perform(context).strip()
     camera_downscale = int(LaunchConfiguration('camera_downscale').perform(context) or 0)
@@ -163,68 +118,22 @@ def launch_setup(context):
     mount_yaw = float(LaunchConfiguration('camera_mount_yaw_deg').perform(context) or 0.0)
     mount_pitch = float(LaunchConfiguration('camera_mount_pitch_deg').perform(context) or 0.0)
     mount_roll = float(LaunchConfiguration('camera_mount_roll_deg').perform(context) or 0.0)
-    use_rtsp = rtsp_url != ''
-
-    # ── Odin1 相机模式 (后装 3D 视觉模组) ──
-    use_odin = (LaunchConfiguration('use_odin').perform(context)
-                .strip().lower() == 'true')
-    if use_odin and rtsp_url == DEFAULT_RTSP_URL:
-        # rtsp_url 现在有非空默认值, 而 ros2 launch 的 CLI 传不进空串
-        # (`rtsp_url:=` 直接报 malformed) —— 不特判的话 use_odin 就没法用了,
-        # 每次都撞下面那条互斥错误。只吃掉"用户没动过的默认值"; 显式传了别的
-        # 地址仍然按冲突报错, 该拦的还是拦。
-        rtsp_url = ''
-        use_rtsp = False
-    if use_odin and use_rtsp:
-        raise RuntimeError('rtsp_url 与 use_odin 互斥: 一次只能选一种相机源')
 
     pkg_share = get_package_share_directory('tagdocking')
-    if use_rtsp:
-        # 默认值已是包内绝对路径 (DEFAULT_RTSP_CAMERA_INFO)。显式传空串时补回来,
-        # 保留"换机器/重部署不用记着传路径"的老行为。
-        if not camera_info_file:
-            camera_info_file = DEFAULT_RTSP_CAMERA_INFO
-        # 存在性检查对显式传入的路径同样生效: 打错一个字符就在这里报, 而不是
-        # 等 rtsp_camera 起不来再去翻它的日志。
-        if os.path.isfile(camera_info_file):
-            print(f'[docking.launch] rtsp 内参: {camera_info_file}')
-        else:
-            print(f'[docking.launch] 警告: 内参文件不存在: {camera_info_file} '
-                  '—— rtsp_camera 将启动失败。先标定: '
-                  'python3 scripts/calibrate_rtsp '
-                  '--url <rtsp地址> --out config/rtsp_camera_info.yaml',
-                  file=sys.stderr)
-
-    odin_downscale = 2
-    if use_odin:
-        # odin 驱动只发去畸变图像 (无 camera_info, frame_id 为空), 内参回退到
-        # 包内 odin_camera_info.yaml (抄自 odin calib.yaml, 随包安装)。
-        # 判据含"仍等于 rtsp 默认值": camera_info_file 现在默认非空 (指向 rtsp
-        # 那份标定), 只判空会让 use_odin 被悄悄喂上 rtsp 内参 —— 图照出、位姿
-        # 全错, 属于最难查的一类故障。
-        if not camera_info_file or camera_info_file == DEFAULT_RTSP_CAMERA_INFO:
-            odin_intr = os.path.join(pkg_share, 'config', 'odin_camera_info.yaml')
-            if os.path.isfile(odin_intr):
-                camera_info_file = odin_intr
-                print(f'[docking.launch] use_odin: camera_info_file 未指定, '
-                      f'使用包内内参: {odin_intr}')
-            else:
-                raise RuntimeError(
-                    'use_odin 需要 camera_info_file (包内也无 '
-                    'config/odin_camera_info.yaml, 包未重新构建?)')
-        # 用户没显式改 image_topic (仍是默认 /image_raw) 时才指到 odin 去畸变流,
-        # 允许显式覆盖 (如想试原始鱼眼流 /odin1/image, 需配对应的鱼眼内参)。
-        if image_topic == '/image_raw':
-            image_topic = '/odin1/image/undistorted'
-        # 降采样+限流默认 (实测 2026-09-08, Jetson): 全分辨率 1600x1296 下
-        # apriltag 只消化 ~6fps, odin 22fps 输入把 RELIABLE 队列塞满, 检出
-        # 时间戳年龄积到 ~1.15s (移动 tag 读数 2s 才跟上)。÷2 后 apriltag
-        # 提速 ~1 倍, 配合桥 max_fps=10 限流丢帧, 队列不再积压, 延迟 ~0.2s。
-        # 16cm tag @1m ÷2 后 ≈58px, 仍远高于 36h11 检测下限。要全分辨率
-        # (更远的小 tag) 时显式传 camera_downscale:=1。
-        odin_downscale = camera_downscale if camera_downscale > 0 else 2
-        print(f'[docking.launch] use_odin: {image_topic}, 内参 {camera_info_file}, '
-              f'downscale={odin_downscale}')
+    # 默认值已是包内绝对路径 (DEFAULT_RTSP_CAMERA_INFO)。显式传空串时补回来,
+    # 保留"换机器/重部署不用记着传路径"的老行为。
+    if not camera_info_file:
+        camera_info_file = DEFAULT_RTSP_CAMERA_INFO
+    # 存在性检查对显式传入的路径同样生效: 打错一个字符就在这里报, 而不是
+    # 等 rtsp_camera 起不来再去翻它的日志。
+    if os.path.isfile(camera_info_file):
+        print(f'[docking.launch] rtsp 内参: {camera_info_file}')
+    else:
+        print(f'[docking.launch] 警告: 内参文件不存在: {camera_info_file} '
+              '—— rtsp_camera 将启动失败。先标定: '
+              'python3 scripts/calibrate_rtsp '
+              '--url <rtsp地址> --out config/rtsp_camera_info.yaml',
+              file=sys.stderr)
 
     config_path = os.path.join(pkg_share, 'config', 'docking.yaml')
 
@@ -247,10 +156,6 @@ def launch_setup(context):
         value = LaunchConfiguration('dual_' + name).perform(context).strip()
         if value:
             dual_tuning['dual.' + name] = value
-    # Select rectified only for the known undistorted Odin source, never merely
-    # because apriltag's subscription happens to be named image_rect.
-    if 'dual.projection_mode' not in dual_tuning and use_odin and image_topic == '/odin1/image/undistorted':
-        dual_tuning['dual.projection_mode'] = 'rectified'
     for name in DUAL_TUNING_ARGS:
         value = LaunchConfiguration('dual_' + name).perform(context).strip()
         if value:
@@ -285,15 +190,9 @@ def launch_setup(context):
             f'({dock_tag_id}) 相同 —— apriltag 无法区分两个同 ID tag, '
             '请传 pile_tag_id:=<其他ID> 或改 yaml dual.pile_tag_id')
     # 5cm 桩码在降采样图上 1m 外低于 36h11 检测下限 → 建议全分辨率
-    if use_rtsp:
-        _eff_scale = camera_downscale
-    elif use_odin:
-        _eff_scale = odin_downscale
-    else:
-        _eff_scale = 1
-    if _eff_scale != 1:
+    if camera_downscale not in (0, 1):
         print(f'[docking.launch] 警告: 双码模式下 5cm 桩码在降采样 '
-              f'({_eff_scale}x) 图上 1m 外不可检, 建议 '
+              f'({camera_downscale}x) 图上 1m 外不可检, 建议 '
               'camera_downscale:=1 (全分辨率)', file=sys.stderr)
 
     # 同步桥输出话题。apriltag_ros 的 image_transport::CameraSubscriber 从 image
@@ -304,103 +203,45 @@ def launch_setup(context):
 
     nodes = []
 
-    if use_rtsp:
-        # ── RTSP 相机桥 (机器狗模式) ─────────────────────────────
-        # 替代"相机驱动 + camera_info_bridge": 直接产出时间戳逐帧对齐的
-        # image + camera_info 到 sync 话题 (apriltag 订阅口不变), 并发布
-        # base_frame→相机光学系 静态 TF (安装位姿 mount.*), 内含降采样。
-        nodes.append(Node(
-            package='tagdocking',
-            executable='rtsp_camera',
-            name='rtsp_camera',
-            arguments=['--ros-args', '--log-level', 'rtsp_camera:=error'],
-            parameters=[{
-                'rtsp_url': rtsp_url,
-                'camera_info_file': camera_info_file,
-                'image_out_topic': sync_image_topic,
-                'camera_info_out_topic': sync_info_topic,
-                'frame_id': camera_frame,
-                'downscale': camera_downscale,
-                'capture_backend': camera_backend,
-                'base_frame': base_frame,
-                'mount.x': mount_x,
-                'mount.y': mount_y,
-                'mount.z': mount_z,
-                'mount.yaw_deg': mount_yaw,
-                'mount.pitch_deg': mount_pitch,
-                'mount.roll_deg': mount_roll,
-                'publish_static_tf': True,
-            }],
-            output='screen',
-        ))
-    elif use_odin:
-        # ── Odin1 相机桥 (camera_info_bridge 合成模式) ───────────
-        # odin_driver 只发 /odin1/image/undistorted (sensor_msgs/Image, 去畸变
-        # 1600x1296), 全系统无 camera_info 话题且图像 frame_id 为空。桥用
-        # odin_camera_info.yaml 每帧现场构造 CameraInfo (apriltag PnP 必需)、
-        # 重打 frame_id (tag TF 挂靠点)、发布 base_frame→相机光学系 静态 TF
-        # (mount.* 安装位姿, 与 rtsp 模式同一套参数)。apriltag 订阅口不变。
-        nodes.append(Node(
-            package='tagdocking',
-            executable='camera_info_bridge',
-            name='camera_info_bridge',
-            parameters=[{
-                'image_topic': image_topic,
-                'image_out_topic': sync_image_topic,
-                'camera_info_out_topic': sync_info_topic,
-                'camera_info_file': camera_info_file,
-                'frame_id': camera_frame,
-                'downscale': odin_downscale,
-                # 限流: odin 22fps 远超 apriltag 消化能力, 不限流则队列积压出
-                # 秒级延迟 (实测全分辨率 ~1.15s)。10fps 与 rtsp_camera 默认一致。
-                'max_fps': 10.0,
-                'base_frame': base_frame,
-                'mount.x': mount_x,
-                'mount.y': mount_y,
-                'mount.z': mount_z,
-                'mount.yaw_deg': mount_yaw,
-                'mount.pitch_deg': mount_pitch,
-                'mount.roll_deg': mount_roll,
-                'publish_static_tf': True,
-            }],
-            output='screen',
-        ))
-    else:
-        # ── CameraInfo 同步桥 (ROS 相机话题模式) ─────────────────
-        # 相机 (usb_cam/astra) 的 image 与 camera_info 时间戳不对齐, apriltag 的严格
-        # 时间同步会丢弃几乎所有帧 (Synchronized pairs: 0) → 检测频率极低 → 转向后
-        # 来不及重新看到 tag 而丢失。桥每收到一帧 image 就用其时间戳重发 camera_info,
-        # 保证每帧都能配对。
-        #
-        # camera_info_bridge 是 tagdocking 包内节点 (原依赖的独立 autodock 包已废弃,
-        # 实现见 tagdocking/camera_info_bridge.py)。
-        nodes.append(Node(
-            package='tagdocking',
-            executable='camera_info_bridge',
-            name='camera_info_bridge',
-            parameters=[{
-                'image_topic': image_topic,
-                'camera_info_topic': camera_info_topic,
-                'image_out_topic': sync_image_topic,
-                'camera_info_out_topic': sync_info_topic,
-            }],
-            output='screen',
-        ))
+    # ── RTSP 相机桥 ────────────────────────────────────────────
+    # 直接产出时间戳逐帧对齐的 image + camera_info 到 sync 话题 (apriltag
+    # 订阅口不变), 并发布 base_frame→相机光学系 静态 TF (安装位姿 mount.*)。
+    nodes.append(Node(
+        package='tagdocking',
+        executable='rtsp_camera',
+        name='rtsp_camera',
+        arguments=['--ros-args', '--log-level', 'rtsp_camera:=error'],
+        parameters=[{
+            'rtsp_url': rtsp_url,
+            'camera_info_file': camera_info_file,
+            'image_out_topic': sync_image_topic,
+            'camera_info_out_topic': sync_info_topic,
+            'frame_id': camera_frame,
+            'downscale': camera_downscale,
+            'capture_backend': camera_backend,
+            'base_frame': base_frame,
+            'mount.x': mount_x,
+            'mount.y': mount_y,
+            'mount.z': mount_z,
+            'mount.yaw_deg': mount_yaw,
+            'mount.pitch_deg': mount_pitch,
+            'mount.roll_deg': mount_roll,
+            'publish_static_tf': True,
+        }],
+        output='screen',
+    ))
 
     if nodes_mode == 'camera':
         # ── camera 模式在此收尾 ──────────────────────────────────
-        # 只要相机链路: rtsp_camera (含它自己发的 mount 静态 TF) + 同步桥,
-        # 不起检测器也不起控制器。供 Web 在停泊栈没起时单纯看画面用 ——
-        # 看画面不需要检测, 而 apriltag 那份 decimate=1.0 的逐帧检测正是
-        # 这次要省掉的开销大头。
-        #
-        # 用提前 return 而不是把下面两段包进 if: 那样要重排近百行缩进, 在一个
-        # "只加参数" 的改动里混进大段格式变化, 日后 blame 这个文件的人得先
-        # 分辨哪些是真改动。相机链路本来就全在上面, 早退是顺着结构来的。
+        # 只要相机链路: rtsp_camera (含它自己发的 mount 静态 TF), 不起检测
+        # 器也不起控制器。供 Web 在停泊栈没起时单纯看画面用 —— 看画面不需
+        # 要检测, 而 apriltag 那份 decimate=1.0 的逐帧检测正是这次要省掉的
+        # 开销大头。用提前 return 而不是把下面两段包进 if: 相机链路本来就
+        # 全在上面, 早退是顺着结构来的。
         return nodes
 
     # ── AprilTag detection node ─────────────────────────────────
-    # 双码模式: 墙码 + 桩码两 tag 逐 tag 边长 (嵌套 tag.sizes; 桩码 5cm 与
+    # 双码方案: 墙码 + 桩码两 tag 逐 tag 边长 (嵌套 tag.sizes; 桩码 5cm 与
     # 墙码 15cm 边长不同, 旧 fork 的单一 size 参数解不出桩码正确 PnP ——
     # 本包 deps.repos 锁定 apriltag_ros master/3.4.0+, 支持嵌套逐 tag 边长)。
     apriltag_ids = [dock_tag_id]
@@ -454,32 +295,11 @@ def launch_setup(context):
                 'camera_frame': camera_frame,
                 'base_frame': base_frame,
                 'base.cmd_vel_topic': cmd_vel_topic,
-                # 两阶段停泊参数 (覆盖 yaml)
-                'dock_target.distance': dock_distance,
-                'final_straight.start_distance': final_straight_distance,
-                'final_straight.yaw_threshold_deg': final_straight_yaw_deg,
             },
             # odom_topic 为空时用 yaml 值 (yaml 权威): 只有显式传参
             # 才覆盖, 避免无参启动时 launch 默认值悄悄顶掉 yaml 里的配置。
         ] + ([{'odom_topic': odom_topic}] if odom_topic else [])
           + ([{'base.l1w_prefix': l1w_prefix}] if l1w_prefix else [])
-          + ([{'stopgo.jog_max': float(jog_max)}] if jog_max else [])
-          + ([{'final_straight.entry_lateral_m': float(entry_lateral_m)}]
-             if entry_lateral_m else [])
-          + ([{'camera.lateral_offset_m': float(camera_lateral_offset_m)}]
-             if camera_lateral_offset_m else [])
-          + ([{'final_straight.lateral_threshold_m': float(final_straight_lateral_threshold)}]
-             if final_straight_lateral_threshold else [])
-          + ([{'final_straight.normal_yaw_threshold_deg': float(final_straight_normal_yaw_deg)}]
-             if final_straight_normal_yaw_deg else [])
-          + ([{'final_straight.tighten_distance': float(final_straight_tighten_distance)}]
-             if final_straight_tighten_distance else [])
-          + ([{'final_straight.far_yaw_threshold_deg': float(final_straight_far_yaw_deg)}]
-             if final_straight_far_yaw_deg else [])
-          + ([{'final_straight.far_lateral_m': float(final_straight_far_lateral_m)}]
-             if final_straight_far_lateral_m else [])
-          + ([{'final_servo.yaw_tol_deg': float(final_servo_yaw_deg)}]
-             if final_servo_yaw_deg else [])
           + ([{'charge.enable': charge_enable.lower() == 'true'}]
              if charge_enable else [])
           + ([{'charge.passive': charge_passive.lower() == 'true'}]
@@ -501,17 +321,13 @@ def launch_setup(context):
 def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument('dual_projection_mode', default_value='',
-            description='raw or rectified; empty uses YAML (known Odin undistorted source selects rectified)'),
+            description='raw or rectified; empty uses YAML'),
         DeclareLaunchArgument('dual_camera_info_topic', default_value='',
             description='Exact detection-image CameraInfo; empty preserves YAML'),
         *[DeclareLaunchArgument('dual_' + name,
-            default_value=DUAL_ARG_DEFAULTS.get(name, ''),
+            default_value='',
             description='Override dual.' + name + '; empty preserves YAML')
           for name in DUAL_TUNING_ARGS],
-        DeclareLaunchArgument('image_topic', default_value='/image_raw',
-                             description='Camera image topic for apriltag_ros'),
-        DeclareLaunchArgument('camera_info_topic', default_value='/camera_info',
-                             description='Camera info topic (source for sync bridge)'),
         DeclareLaunchArgument('family', default_value='36h11',
                              description='AprilTag family (36h11, 25h9, etc.)'),
         DeclareLaunchArgument('tag_size', default_value='0.15',
@@ -523,49 +339,6 @@ def generate_launch_description():
                              description='Camera optical frame name'),
         DeclareLaunchArgument('cmd_vel_topic', default_value='cmd_vel',
                              description='Velocity command topic'),
-        DeclareLaunchArgument('dock_distance', default_value='0.55',
-                             description='最终停泊距离 (m), 底盘距 tag'),
-        DeclareLaunchArgument('final_straight_distance', default_value='0.85',
-                             description='直行阶段起点距离 (m), 到此距离后纯直行不再调角 (须 > dock_distance)'),
-        DeclareLaunchArgument('final_straight_yaw_deg', default_value='3.0',
-                             description='直行入口方位门槛 (deg): 进入直行距离时方位误差超此值报导航失败; '
-                                         '近场(dist ≤ tighten_distance)的方位修正门槛同此值'),
-        DeclareLaunchArgument('entry_lateral_m', default_value='',
-                             description='直行入口横向门槛 (m): 进入直行距离时 |横向| 超此值报导航失败 '
-                                         '(空 = 使用 yaml 的 final_straight.entry_lateral_m)'),
-        DeclareLaunchArgument('camera_lateral_offset_m', default_value='0',
-                             description='相机光学中心相对底盘中心线的横向偏移 (m, + = 相机偏左): '
-                                         '加回量测 lat 补偿安装误差, 直行前触发左移修正。'
-                                         '默认 0 —— 当前相机 (odin1 RTSP) 光心与底盘中心线齐平, '
-                                         '0.03 那个值是上一个相机的, 填非零等于凭空注入假横偏。'
-                                         '换装偏心相机时按实测填; 传空串则用 yaml 的 '
-                                         'camera.lateral_offset_m'),
-        DeclareLaunchArgument('final_straight_lateral_threshold', default_value='',
-                             description='近场横移修正/捷径横向门槛 (m, 比入口 entry_lateral_m 更紧): '
-                                         '量测补偿加回偏置后防止真实偏移被捷径放行直行 '
-                                         '(空 = 使用 yaml 的 final_straight.lateral_threshold_m)'),
-        DeclareLaunchArgument('final_straight_normal_yaw_deg', default_value='',
-                             description='近场法线(normal)对准门槛 (deg): 收紧到 ~2° 让先对齐法线再横移成立; '
-                                         '之前用 stopgo.yaw_threshold_deg(10°) 太松导致横移走错方向 '
-                                         '(空 = 使用 yaml 的 final_straight.normal_yaw_threshold_deg; 摆头可放宽 3~5°)'),
-        DeclareLaunchArgument('final_straight_tighten_distance', default_value='',
-                              description='远/近分界 (m): dist ≤ 此值进入近场精调(法线对准+横移+直行), '
-                                          '> 此值远场粗对准+纯前进 (1.5m 处 normal 噪声放大, 远场不横移) '
-                                          '(空 = 使用 yaml 的 final_straight.tighten_distance; 默认 1.3)'),
-        DeclareLaunchArgument('final_straight_far_yaw_deg', default_value='',
-                              description='远场粗对准方位门槛 (deg): dist > tighten_distance 时方位 ≤ 此值即前进, '
-                                          '不做微调/横移 (空 = 使用 yaml 的 final_straight.far_yaw_threshold_deg; '
-                                          '默认 15.0)'),
-        DeclareLaunchArgument('final_straight_far_lateral_m', default_value='',
-                              description='远场粗对准横向门槛 (m): dist > tighten_distance 时 |lat| ≤ 此值即前进, '
-                                          '横向偏走近场再修 (空 = 使用 yaml 的 final_straight.far_lateral_m; '
-                                          '默认 0.20)'),
-        DeclareLaunchArgument('final_servo_yaw_deg', default_value='',
-                              description='到位即 DOCKED 的方位门槛 (deg): 直行到位后方位偏差 '
-                                          '≤ 此值即判定成功, 不再累积稳定/追角 '
-                                          '(空 = 使用 yaml 的 final_servo.yaw_tol_deg)'),
-        DeclareLaunchArgument('jog_max', default_value='',
-                             description='走停单步最大 jog 距离 (m); 空 = 使用 config/docking.yaml 的 stopgo.jog_max'),
 
         # ── 狗模式服务前缀 + 充电收尾 ─────────────────────────────
         DeclareLaunchArgument('l1w_prefix', default_value='',
@@ -584,7 +357,7 @@ def generate_launch_description():
 
         # ── 双二维码 (dual.*) ────────────────────────────────────
         DeclareLaunchArgument('wall_tag_size', default_value='',
-                              description='墙码边长 (m, 36h11:0): dual 启用时 apriltag 按此解 PnP '
+                              description='墙码边长 (m, 36h11:0): apriltag 按此解 PnP '
                                           '(空 = 使用 yaml 的 dual.wall_tag_size, 默认 0.15)'),
         DeclareLaunchArgument('pile_tag_id', default_value='',
                               description='桩码 ID (贴充电桩底座, 现场已确认 51): '
@@ -594,51 +367,42 @@ def generate_launch_description():
                               description='桩码边长 (m): '
                                           '(空 = 使用 yaml 的 dual.pile_tag_size, 默认 0.05)'),
 
-        # ── RTSP 相机模式 (机器狗) ──────────────────────────────
+        # ── RTSP 相机 ───────────────────────────────────────────
         DeclareLaunchArgument('rtsp_url',
                              default_value=DEFAULT_RTSP_URL,
-                             description='RTSP 地址。非空时用 rtsp_camera 桥替代 '
-                                         'camera_info_bridge + 外部相机话题 (机器狗模式)。'
-                                         '默认指向 mediamtx 的 front 通道 (实测默认配置); '
-                                         '传空串回到外部相机话题模式'),
-        DeclareLaunchArgument('use_odin', default_value='false',
-                             description='用 odin1 相机 (/odin1/image/undistorted '
-                                         '去畸变流 + 包内 odin_camera_info.yaml 内参 '
-                                         '+ frame_id 重打 + 静态TF) 替代普通相机话题'),
+                             description='RTSP 地址, 默认指向 mediamtx 的 front 通道 '
+                                         '(实测默认配置)'),
         DeclareLaunchArgument('camera_info_file', default_value=DEFAULT_RTSP_CAMERA_INFO,
-                             description='相机内参 YAML (默认=包内 rtsp 标定文件绝对路径; '
-                                         'use_odin 时若未显式覆盖则自动换成包内 '
-                                         'odin_camera_info.yaml; 由 '
-                                         'scripts/calibrate_rtsp 生成)'),
+                             description='相机内参 YAML (默认=包内 rtsp 标定文件绝对路径, '
+                                         '由 scripts/calibrate_rtsp 生成)'),
         DeclareLaunchArgument('camera_downscale', default_value='0',
-                             description='输出降采样倍数 (0=自动: RTSP 到 ~640 宽; '
-                                         'use_odin 到 800x648)。odin 全分辨率传 1'),
+                             description='输出降采样倍数 (0=自动: RTSP 到 ~640 宽)。'
+                                         '全分辨率传 1'),
         DeclareLaunchArgument('camera_backend', default_value='ffmpeg',
                              description='RTSP 拉流后端: ffmpeg | gstreamer '
                                          '(Jetson 硬解, FFmpeg 解码冻结时用)'),
         DeclareLaunchArgument('nodes', default_value='all',
-                             description='起哪些节点: all = 相机+检测+控制器 (默认, '
-                                         '与历史行为一字不差); camera = 只起相机链路 '
-                                         '(rtsp_camera + 同步桥), 供 Web 在停泊栈未起时'
-                                         '看画面, 由 docking_supervisor 按需使用'),
+                             description='起哪些节点: all = 相机+检测+控制器 (默认); '
+                                         'camera = 只起相机链路 (rtsp_camera), 供 Web '
+                                         '在停泊栈未起时看画面, 由 docking_supervisor '
+                                         '按需使用'),
         DeclareLaunchArgument('odom_topic',
-                             default_value='/odin1/odometry_highfreq',
-                             description='里程计话题 (默认 odin1 高频里程计, 实测默认配置; '
-                                         '空 = 使用 config/docking.yaml 的 odom_topic, '
-                                         '机器狗为 /dog/odom)'),
+                             default_value='/dog/odom',
+                             description='机器狗本体里程计 (l1w_control 发布; '
+                                         '空 = 使用 config/docking.yaml 的 odom_topic)'),
         DeclareLaunchArgument('base_frame', default_value='base_link',
                              description='机器人基座坐标系 (静态 TF 父系 + docking 测量系)'),
         DeclareLaunchArgument('camera_mount_x', default_value='0.0',
-                             description='相机安装位置 x (m, base_link 系, rtsp/odin 模式)'),
+                             description='相机安装位置 x (m, base_link 系)'),
         DeclareLaunchArgument('camera_mount_y', default_value='0.0',
-                             description='相机安装位置 y (m, base_link 系, rtsp/odin 模式)'),
+                             description='相机安装位置 y (m, base_link 系)'),
         DeclareLaunchArgument('camera_mount_z', default_value='0.0',
-                             description='相机安装高度 z (m, base_link 系, rtsp/odin 模式)'),
+                             description='相机安装高度 z (m, base_link 系)'),
         DeclareLaunchArgument('camera_mount_yaw_deg', default_value='0.0',
-                             description='相机朝向偏航 (deg, 0=正前, rtsp/odin 模式)'),
+                             description='相机朝向偏航 (deg, 0=正前)'),
         DeclareLaunchArgument('camera_mount_pitch_deg', default_value='0.0',
-                             description='相机俯仰 (deg, 正=低头, 负=抬头, rtsp/odin 模式)'),
+                             description='相机俯仰 (deg, 正=低头, 负=抬头)'),
         DeclareLaunchArgument('camera_mount_roll_deg', default_value='0.0',
-                             description='相机横滚 (deg, rtsp/odin 模式)'),
+                             description='相机横滚 (deg)'),
         OpaqueFunction(function=launch_setup),
     ])

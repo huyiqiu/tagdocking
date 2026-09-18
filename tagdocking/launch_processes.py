@@ -149,7 +149,6 @@ def tree_is_running(command, owned_pid=None) -> bool:
 _STRAY_SUFFIXES = (
     'lib/tagdocking/rtsp_camera',
     'lib/tagdocking/docking_node',
-    'lib/tagdocking/camera_info_bridge',
     'apriltag_ros/apriltag_node',
 )
 
