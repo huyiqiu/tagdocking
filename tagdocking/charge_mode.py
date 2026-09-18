@@ -54,9 +54,9 @@ class ChargeMode:
       DISABLED    charge.enable=false
     """
 
-    IDLE, STATIC, SITTING, DAMPING, DONE, RECOVERING, FAILED, DISABLED = range(8)
+    IDLE, STATIC, DAMPING, DONE, RECOVERING, FAILED, DISABLED = range(7)
     _PHASE_NAMES = {
-        IDLE: 'IDLE', STATIC: 'STATIC', SITTING: 'SITTING',
+        IDLE: 'IDLE', STATIC: 'STATIC',
         DAMPING: 'DAMPING', DONE: 'DONE', RECOVERING: 'RECOVERING',
         FAILED: 'FAILED', DISABLED: 'DISABLED',
     }
@@ -70,7 +70,6 @@ class ChargeMode:
         if self._enable and not self._static_ok:
             node.get_logger().info('充电收尾: static_stand 已跳过, DOCKED 后直接阻尼 (passive, 电机泄力)')
         self._static_ack_ns = int(float(node._p('charge.static_ack_timeout_sec')) * 1e9)
-        self._lie_settle_ns = int(float(node._p('charge.lie_down_settle_sec')) * 1e9)
         self._damp_settle_ns = int(float(node._p('charge.passive_settle_sec')) * 1e9)
         self._retries = int(node._p('charge.retries'))
         self._service_wait_ns = int(float(node._p('charge.service_wait_sec')) * 1e9)
@@ -81,7 +80,6 @@ class ChargeMode:
 
         prefix = node._p('base.l1w_prefix')
         self._cli_static = node.create_client(Trigger, f'{prefix}/static_stand')
-        self._cli_lie = node.create_client(Trigger, f'{prefix}/lie_down')
         self._cli_passive = node.create_client(Trigger, f'{prefix}/passive')
         self._cli_stand = node.create_client(Trigger, f'{prefix}/stand_up')
 
@@ -226,13 +224,6 @@ class ChargeMode:
         self._step_req_ns = now_ns
         self._step_tries = 1
         self._step_future = self._cli_static.call_async(Trigger.Request())
-
-    def _enter_sitting(self, now_ns: int) -> None:
-        """(已弃用) 趴下步 — 当前流程不再使用 lie_down, 保留仅为兼容旧代码路径。"""
-        self._phase = self.SITTING
-        self._step_req_ns = now_ns
-        self._step_tries = 1
-        self._step_future = self._cli_lie.call_async(Trigger.Request())
 
     def _enter_damping(self, now_ns: int) -> None:
         if not bool(self._node._p('charge.passive')):

@@ -516,13 +516,12 @@ class DockingNode(Node):
         self.declare_parameter('posture.stable_frame_timeout_sec', 2.5)
         self.declare_parameter('posture.service_wait_sec', 1.0)
 
-        # 充电收尾 (DOCKED 后): 静止→匍匐趴下→阻尼泄力。与 posture.enable
+        # 充电收尾 (DOCKED 后): 静止→阻尼泄力。与 posture.enable
         # 无关 —— 关掉中途锁定/解锁, 停泊完成后仍执行整个序列。
         self.declare_parameter('charge.enable', True)
         self.declare_parameter('charge.passive', True)  # 阻尼步; false=仅锁定(站立)
         self.declare_parameter('charge.static_stand', True)  # 先锁定再阻尼; false=跳过锁定直接阻尼
         self.declare_parameter('charge.static_ack_timeout_sec', 3.0)
-        self.declare_parameter('charge.lie_down_settle_sec', 4.0)
         self.declare_parameter('charge.passive_settle_sec', 2.0)
         self.declare_parameter('charge.retries', 1)
         self.declare_parameter('charge.service_wait_sec', 1.0)

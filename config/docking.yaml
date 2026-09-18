@@ -89,7 +89,6 @@ docking_node:
     charge.passive: true                      # 阻尼(泄力)步开关 — 运行期可调 (锁定完成那一刻读参); false 时收尾止于锁定 (仅站立)
     charge.static_stand: false                # DOCKED 后先 static_stand 锁定再阻尼; false=跳过静止锁定, 直接阻尼 (passive, 站立泄力)
     charge.static_ack_timeout_sec: 3.0        # s — static_stand 等待确认
-    charge.lie_down_settle_sec: 4.0           # s — (已弃用) 趴下动作时长, 当前流程不再使用 lie_down
     charge.passive_settle_sec: 2.0            # s — passive 服务受理后等待 (非硬件阻尼反馈)
     charge.retries: 1                         # 次 — 每步服务重试
     charge.service_wait_sec: 1.0              # s — 无桥宽限, 超时降级告警 (DOCKED 仍为成功)
