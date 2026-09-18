@@ -74,13 +74,12 @@ OUTCOME_TOPIC = '/docking_node/outcome'
 CAMERA_INFO_TOPIC = '/camera_sync/camera_info'
 DETECTIONS_TOPIC = '/detections'
 
-# 状态族 —— 与 state_machine.py:44-62 一一对应。改那边记得同步这里。
-# 注意 retrying 是**活动态**不是终态 (节点驱动的盲退重锁, max_retries=2),
+# 状态族 —— 与 state_machine.py:44-59 一一对应 (_ACTIVE_STATES/
+# _SUCCESS_STATES/_ERROR_STATES)。改那边记得同步这里。
 # idle 既不在活动态里也不在终态里。
-ACTIVE_STATES = frozenset({
-    'search_tag', 'align', 'approach', 'final_servo', 'retrying', 'undocking'})
+ACTIVE_STATES = frozenset({'search_tag', 'approach', 'undocking'})
 TERMINAL_STATES = frozenset({
-    'docked', 'undocked', 'tag_lost', 'timeout', 'motion_failed', 'cancelled'})
+    'docked', 'undocked', 'timeout', 'motion_failed', 'cancelled'})
 
 # 就绪门整体预算。实测冷启动 5~8 秒 (RTSP 连接 ~2s + 管线 0.1~0.5s + DDS 发现)。
 READY_TIMEOUT_SEC = 20.0
@@ -365,7 +364,7 @@ class StackSupervisor(Node):
             owned = self._owned_pid
             state = self._state
 
-        # 正在动就先让它自己停下来: cancel_docking (docking_node.py:2423-2431)
+        # 正在动就先让它自己停下来: cancel_docking (docking_node.py:1711 起)
         # 同步调 publish_stop()。比直接发信号温和, 且走的是节点自己的停车路径。
         if state in ACTIVE_STATES:
             self.get_logger().info(f'收栈前先取消 (当前 {state})')
@@ -413,22 +412,24 @@ class StackSupervisor(Node):
 
         **这道门是整个设计里最要紧的一处**, 它关掉的是一条今天被掩盖着的竞态。
 
-        `docking_node.py:754-766` 查相机外参用的是**零超时、不重试**的 lookup:
+        `docking_node.py` 的 `_lookup_camera_offset` (:442-455) 查相机外参用的是
+        **零超时、不重试**的 lookup:
 
             tf = self._tf_buffer.lookup_transform(
                 base_frame, camera_frame, Time(seconds=0),
                 timeout=Duration(seconds=0))
 
-        失败即 `_dual.failure`, 调用点 (:1145-1150 和 :1396) 直接 abort_motion →
-        MOTION_FAILED。而 `_on_start_docking` (:2411-2421) **没有任何就绪检查**,
-        唯一的拒绝理由是 'already active'。
+        失败即 `_dual.failure`, 两个调用点 (:822-828 与 :1030-1041) 直接
+        abort_motion → MOTION_FAILED。而 `_on_start_docking` (:1700-1706)
+        **没有任何就绪检查**, 唯一的拒绝理由是 'already active'。
 
         今天这条竞态碰不到: 栈开机起一次, 然后在 IDLE 上坐几个小时才有人停泊。
         **改成按需后, start_docking 会紧贴在进程刚起来的几秒内发生 —— 正好踩进
         竞态。** 不能改 docking_node (硬约束), 所以只能由 supervisor 在外面守门。
 
         `service_is_ready()` **不算**就绪 —— 三个服务在 __init__ 里就建好了
-        (:545-550), 比相机/TF/odom 早好几秒。它只当"进程还活着"的前置条件用。
+        (docking_node.py:384-390), 比相机/TF/odom 早好几秒。它只当"进程
+        还活着"的前置条件用。
         """
         deadline = time.monotonic() + self._ready_timeout
         tf_buf, probe = self._make_probe()
@@ -481,9 +482,9 @@ class StackSupervisor(Node):
         detections。用完即拆。
 
         **为什么这四项都不常驻** (这条是量出来的, 别为了"省事"挪回 __init__):
-        `/odin1/odometry_highfreq` 实测 ~385Hz。把它常驻订阅在这里, 光是
-        rclpy 反序列化 Odometry (两个 36 元协方差数组) 就吃掉 **48% 一个核**
-        —— 实测分线程画像: 主线程 26.6%, 两个 executor 线程各 8.5%。而这个
+        odom 实测很贵 —— 之前用 odin1 的高频里程计时 (~385Hz), 光是常驻订阅
+        它、反序列化 Odometry (两个 36 元协方差数组) 就吃掉 **48% 一个核**;
+        现在换 /dog/odom 频率低些, 但道理不变: 这个
         订阅的全部产出是把 `_odom_seen` 置成 True 一次, 只在就绪门开着的那
         5~8 秒里被读。也就是说: 为一个每次停泊只需要一瞬的布尔量, 常驻烧掉
         三分之一个核 —— 在一个**为省 CPU 而做的节点**里, 这一项就把满栈
@@ -561,9 +562,9 @@ class StackSupervisor(Node):
         if not self._cam_info_seen:
             missing.append('camera_info 未收到')
 
-        # 4. odom 在。缺它 dual 路径 (:1393-1395) 会瞬间 MOTION_FAILED。
-        #    这一路由 odin 驱动常驻发布, 与本栈无关, 基本瞬时满足 —— 它的作用
-        #    是"odom 真的存在"这项别漏检, 而不是等待。
+        # 4. odom 在。缺它 dual 路径 (docking_node.py:1026-1029 与 :1376-1381)
+        #    会瞬间 MOTION_FAILED。这一路常驻发布、与本栈无关, 基本瞬时满足
+        #    —— 它的作用是"odom 真的存在"这项别漏检, 而不是等待。
         if not self._odom_seen:
             missing.append(f'odom ({self._odom_topic}) 未收到')
 
@@ -572,8 +573,8 @@ class StackSupervisor(Node):
             missing.append('detections 无流量')
 
         # 6. 相机外参可解 —— 这一项是上面那条竞态的**直接对应物**:
-        #    查的就是 docking_node.py:759-761 会查的那对 frame。前五项证明的是
-        #    各自的发现完成了, 这一项才真正回答"外参到底在不在 TF 里"。
+        #    查的就是 docking_node.py:446-449 会查的那对 frame。前五项证明的
+        #    是各自的发现完成了, 这一项才真正回答"外参到底在不在 TF 里"。
         if tf_buf is not None and not self._tf_ok(tf_buf):
             missing.append('相机外参 TF 未就绪')
         return missing
@@ -948,7 +949,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description='tagdocking 停泊栈按需启停')
     parser.add_argument('--ready-timeout', type=float, default=READY_TIMEOUT_SEC)
     parser.add_argument('--idle-delay', type=float, default=IDLE_STOP_DELAY_SEC)
-    parser.add_argument('--odom-topic', default='/odin1/odometry_highfreq')
+    parser.add_argument('--odom-topic', default='/dog/odom')
     # ros2 run 会塞 --ros-args …; 用 parse_known_args 忽略。
     args, _ = parser.parse_known_args(argv)
 

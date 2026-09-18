@@ -215,21 +215,17 @@
 <script>
 // 状态分族 —— 与 state_machine.py 的 _ACTIVE_STATES / _SUCCESS_STATES /
 // _ERROR_STATES 保持一致。改那边记得同步这里。
-const ACTIVE = new Set(['search_tag','align','approach','final_servo','retrying','undocking']);
+const ACTIVE = new Set(['search_tag','approach','undocking']);
 const OK     = new Set(['docked','undocked']);
-const ERR    = new Set(['tag_lost','timeout','motion_failed','cancelled']);
+const ERR    = new Set(['timeout','motion_failed','cancelled']);
 
 const DESC = {
   idle: '空闲，等待指令',
   search_tag: '搜索二维码',
-  align: '对准中',
   approach: '接近中',
-  final_servo: '末端精调',
   docked: '停泊完成',
-  retrying: '失败重试中',
   undocking: '泊出中',
   undocked: '泊出完成',
-  tag_lost: '二维码丢失',
   timeout: '超时',
   motion_failed: '运动失败',
   cancelled: '已取消',
