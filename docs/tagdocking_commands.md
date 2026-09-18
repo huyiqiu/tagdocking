@@ -75,7 +75,7 @@ rtsp_url                  RTSP 拉流地址 (默认 rtsp://127.0.0.1:8555/front)
 camera_info_file          rtsp 内参 YAML (默认包内绝对路径 rtsp_camera_info.yaml)
 family / tag_size         AprilTag 族 (36h11) 与墙码边长 (0.15)
 dock_tag_id / camera_frame / base_frame
-cmd_vel_topic / l1w_prefix / odom_topic   (odom 默认 /dog/odom)
+cmd_vel_topic / l1w_prefix / odom_topic   (odom 默认 /odin1/odometry_highfreq)
 camera_downscale          0 (关降采样 —— 远距离小 tag 检测下限, launch 注释有说明)
 camera_backend            rtsp 解码后端 (gstreamer/ffmpeg)
 camera_mount_x/y/z/yaw_deg/pitch_deg/roll_deg   rtsp 相机安装位姿静态 TF

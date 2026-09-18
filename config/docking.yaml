@@ -312,5 +312,7 @@ docking_node:
 
     # ── Topics ──
     detection_topic: "/detections"
-    # 机器狗本体里程计 (l1w_control publish_odom 发布, IMU+运动学航位推算)
-    odom_topic: "/dog/odom"
+    # 机器狗本体里程计 (odin driver 高频航位推算)。l1w 桥的 /dog/odom 已随
+    # v1.0 底盘链路退役; launch 的 odom_topic 默认值与此一致, 只有显式传空串
+    # 才会落到这里 —— 改一处记得对齐另一处。
+    odom_topic: "/odin1/odometry_highfreq"

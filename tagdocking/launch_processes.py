@@ -114,9 +114,10 @@ def stop_launch_tree(command, owned_pid=None, grace_sec=8.0):
     """SIGINT → SIGTERM → SIGKILL 逐级收掉整棵树, 连同被 init 收养的游兵。
 
     grace_sec 默认 8 秒。这个数不是拍的, 是三段时间叠起来的:
-    docking_node 的信号处理器 (docking_node.py:2504-2527) 收到 SIGINT/SIGTERM 后
-    **阻塞整整 1 秒**, 以 10ms 间隔把零速度刷 100 遍; 然后 rclpy.shutdown() 走
-    析构; 然后 `ros2 launch` 还要等它所有子节点都退干净才自己退。既有单元给这
+    docking_node 的信号处理器 (_handle_signal) 收到 SIGINT/SIGTERM 后
+    **阻塞整整 1 秒**, 以 10ms 间隔把零速度刷 100 遍; 然后 KeyboardInterrupt
+    打断 spin, main 的 finally 按序停线程、销毁节点、关上下文; 然后
+    `ros2 launch` 还要等它所有子节点都退干净才自己退。既有单元给这
     整条链留的是 `TimeoutStopSec=15`, 8 秒是其中留给第一级(体面退出)的份额。
     绝不能直接上 SIGKILL —— 那会绕过刷零速度那一整套, 最后一条非零速度就一直
     挂着, 只能等底盘看门狗兜底。

@@ -83,6 +83,10 @@ class DockingNode(Node):
         self._tf_node = Node('docking_tf_receiver')
         self._tf_buffer = tf2_ros.Buffer()
         self._tf_listener = tf2_ros.TransformListener(self._tf_buffer, self._tf_node)
+        # 执行器在主线程创建而不是线程里: 收栈时 main 才有句柄先 shutdown 再
+        # join (见 main() finally 的顺序注释), 否则 TF 线程的 spin 没人能停。
+        self._tf_executor = SingleThreadedExecutor()
+        self._tf_executor.add_node(self._tf_node)
         self._tf_spin = threading.Thread(target=self._spin_tf_receiver, daemon=True)
         self._tf_spin.start()
 
@@ -431,11 +435,10 @@ class DockingNode(Node):
 
         必须用专用执行器: Humble 的 rclpy.spin() 不传 executor 时用的是
         全局单例, 与主线程共用会报 "generator already executing"。
+        执行器本体在 __init__ 里创建 (句柄要交给 main 的收尾), 这里只转。
         """
         try:
-            executor = SingleThreadedExecutor()
-            executor.add_node(self._tf_node)
-            executor.spin()
+            self._tf_executor.spin()
         except Exception:
             pass
 
@@ -1806,10 +1809,14 @@ class DockingNode(Node):
                 except Exception:
                     pass
                 time.sleep(0.01)
-            try:
-                rclpy.shutdown()
-            except Exception:
-                pass
+            # 绝不在这里 rclpy.shutdown(): 处理器跑在主线程上, 此刻主 spin 和
+            # TF 接收线程都还在转, 上下文在它们脚下被抽掉, rmw (zenoh) 的会话
+            # 拆除就会与在途 wait_set/回调竞速 —— 实测 zenoh rx 线程
+            # "Received Data for unknown expr_id" 刷屏, 直至 "terminate called
+            # without an active exception" (SIGABRT)。这里只负责把零速度刷完;
+            # 打断 spin 交给异常, 收尾顺序交给 main() 的 finally:
+            # 停线程 → 销毁节点 → 最后才关上下文。
+            raise KeyboardInterrupt
 
         signal.signal(signal.SIGINT, _handle_signal)
         signal.signal(signal.SIGTERM, _handle_signal)
@@ -1829,13 +1836,21 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     except Exception:
-        # 信号处理器(_handle_signal)会调用 rclpy.shutdown() 以便打断 spin,
-        # 但这会让正在转的 spin 下一轮 wait_set 初始化抛 RCLError
-        # ("context is not valid")。上下文已被有意关闭时属正常退出路径,
-        # 吞掉以免 launch 报 process died; 仅真异常(rclpy 仍 ok)才重新抛出。
+        # spin 里的真异常: 上下文已被有意关闭时属正常退出路径, 吞掉以免
+        # launch 报 process died; 仅 rclpy 仍 ok 的才重新抛出。
         if rclpy.ok():
             raise
     finally:
+        # 收尾顺序是这段代码的正确性所在 (信号处理器只刷零速度并抛
+        # KeyboardInterrupt, 见 _handle_signal):
+        #   1. 先停 TF 接收线程: shutdown 唤醒它的 spin, join 到真正退出;
+        #   2. 再销毁节点: 此时已没有线程握着这些句柄;
+        #   3. 最后才 shutdown 上下文: rmw (zenoh) 的会话拆除发生在所有本地
+        #      wait_set 都停下之后。上下文在还有线程在 spin 时被关掉, 拆除会
+        #      与在途回调竞速 —— zenoh rx "unknown expr_id" 刷屏直至 SIGABRT,
+        #      实测即旧版在信号处理器里直接 shutdown 的死法。
+        node._tf_executor.shutdown()
+        node._tf_spin.join(timeout=2.0)
         try:
             node.destroy_node()
         except Exception:
@@ -1844,8 +1859,7 @@ def main(args=None):
             node._tf_node.destroy_node()
         except Exception:
             pass
-        # The signal handler may have already shut down the context; calling
-        # rclpy.shutdown() again raises "Context must be initialized". Guard it
-        # so launch gets a clean exit instead of SIGKILL-ing us into zombies.
+        # 上下文此刻必然还没人关过 (处理器不再关), 正常路径 ok() 为真;
+        # 退出竞态下可能已被关, 静默放行。
         if rclpy.ok():
             rclpy.shutdown()

@@ -7,7 +7,7 @@ Starts:
   3. docking_node (tagdocking controller)
 
 Usage:
-  # 完整停泊栈 (机器狗默认配置: mediamtx front 流 + /dog/odom):
+  # 完整停泊栈 (机器狗默认配置: mediamtx front 流 + /odin1/odometry_highfreq):
   ros2 launch tagdocking docking.launch.py
 
   # 只起相机链路 (Web 看画面用, 由 docking_supervisor 按需调用):
@@ -387,7 +387,7 @@ def generate_launch_description():
                                          '在停泊栈未起时看画面, 由 docking_supervisor '
                                          '按需使用'),
         DeclareLaunchArgument('odom_topic',
-                             default_value='/dog/odom',
+                             default_value='/odin1/odometry_highfreq',
                              description='机器狗本体里程计 (l1w_control 发布; '
                                          '空 = 使用 config/docking.yaml 的 odom_topic)'),
         DeclareLaunchArgument('base_frame', default_value='base_link',

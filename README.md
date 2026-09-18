@@ -132,7 +132,7 @@ apriltag_node ──► /detections (墙码 tag36h11:0 + 桩码 tag36h11:51)
       ▼
 20Hz 控制循环: SEARCH_TAG 角度步进 / APPROACH 双码走停
       │
-DualTagDocking ◄┘► ActionExecutor ◄── /dog/odom (航位推算闭环)
+DualTagDocking ◄┘► ActionExecutor ◄── /odin1/odometry_highfreq (航位推算闭环)
 (光学系对准,              │                 (jog/turn/lateral 常速盲动)
  候选枚举打分)            ▼
                    OmniAdapter ──► /cmd_vel (vx/vy/wz, l1w_control 桥)
@@ -150,7 +150,7 @@ DualTagDocking ◄┘► ActionExecutor ◄── /dog/odom (航位推算闭环)
 - 相机提供 RTSP 流（默认 `rtsp://127.0.0.1:8555/front`），先用 `scripts/calibrate_rtsp`
   标定（见 2.6）
 - Tag 贴在停靠目标上，且 TF 树连通（`base_link → 相机光学系 → tag36h11:0`）
-- 机器人发布里程计（默认话题 `/dog/odom`，launch 参数 `odom_topic` 可覆盖）
+- 机器人发布里程计（默认话题 `/odin1/odometry_highfreq`，launch 参数 `odom_topic` 可覆盖）
 - 机器人已被外部服务（Nav2 / 业务节点 / 遥控）送到 Tag 视野范围内
 
 ### 2.2 编译
@@ -192,7 +192,7 @@ docking.launch.py --show-args`）：
 | --- | --- |
 | `rtsp_url` | `rtsp://127.0.0.1:8555/front` |
 | `camera_info_file` | `<包share>/config/rtsp_camera_info.yaml`（绝对路径） |
-| `odom_topic` | `/dog/odom` |
+| `odom_topic` | `/odin1/odometry_highfreq` |
 | `camera_downscale` | `0` |
 | `tag_size` | `0.15` |
 
@@ -271,7 +271,8 @@ Web 自己既不 spawn 也不发信号，进程生命周期归 **`docking_superv
 即便这样也只有改动前空转的一半不到。
 
 > supervisor 自己必须便宜，否则这件事就白做了。第一版把 `camera_info` / odom /
-> `detections` 做成常驻订阅，其中旧 odin1 高频里程计（已弃用，现 `/dog/odom`）
+> `detections` 做成常驻订阅，其中 odin1 高频里程计 `/odin1/odometry_highfreq`
+> (曾短暂让位给低频 `/dog/odom`, 该话题随 v1.0 底盘链路退役后又换回)
 > 实测 **~385Hz** ——
 > 光是 rclpy 反序列化 `Odometry`（两个 36 元协方差数组）就吃掉 **48% 一个核**，
 > 等于把省下来的又烧回去三分之一。对照实验（空回调 + 同样的 executor 组合）只有
@@ -371,7 +372,7 @@ ros2 launch tagdocking docking.launch.py
 
 只支持全向底盘（`OmniAdapter`）：输出 `Twist(linear.x, linear.y, angular.z)`
 到 `base.cmd_vel_topic`（默认 `cmd_vel`），横向偏差直接横移消除。L1W 机器狗
-经 l1w_control 桥接 `/cmd_vel` + `/dog/odom`，无需任何选择参数。
+经 l1w_control 桥接 `/cmd_vel`，里程计取 `/odin1/odometry_highfreq`，无需任何选择参数。
 
 ### 2.5 自定义 Tag
 
@@ -444,7 +445,7 @@ ros2 launch tagdocking docking.launch.py \
 |------|------|
 | `rtsp_url` | RTSP 地址（默认 `rtsp://127.0.0.1:8555/front`） |
 | `camera_info_file` | 内参 YAML（`calibrate_rtsp` 生成；默认即包内 `config/rtsp_camera_info.yaml` 的绝对路径，文件不存在时启动告警） |
-| `odom_topic` | 狗的里程计话题（默认 `/dog/odom`） |
+| `odom_topic` | 狗的里程计话题（默认 `/odin1/odometry_highfreq`） |
 | `camera_mount_x/y/z` | 相机在 base_link 下的安装位置（米） |
 | `camera_mount_yaw/pitch/roll_deg` | 相机安装姿态（0=正前水平；低头用正 pitch，抬头用负 pitch） |
 | `camera_downscale` | 输出降采样（0=自动到 ~640 宽，防大帧打爆 DDS） |
@@ -1283,7 +1284,7 @@ undock.timeout_sec: 30.0              # 泊出整体超时(里程计不走时兜
 ```yaml
 pose_buffer.size: 30                  # 缓冲位姿数
 detection_topic: "/detections"        # apriltag_ros 检测话题
-odom_topic: "/dog/odom"               # 狗本体里程计 (l1w_control 发布; launch 参数可覆盖)
+odom_topic: "/odin1/odometry_highfreq"  # 狗本体里程计 (odin driver 发布; launch 参数可覆盖)
 ```
 
 ---
@@ -1569,7 +1570,7 @@ ros2 param get  /docking_node stopgo.heading_hold_budget_deg
 | `camera_frame` | `camera_color_optical_frame` | 相机光学坐标系名（x 右 / y 下 / z 前） |
 | `base_frame` | `base_link` | 底盘坐标系名，所有"距离/横偏"都是相对它说的 |
 | `detection_topic` | `/detections` | AprilTag 检测结果话题 |
-| `odom_topic` | `/dog/odom` | 里程计话题。走停的每一步都靠它闭环掐断，配错等于全盲 |
+| `odom_topic` | `/odin1/odometry_highfreq` | 里程计话题。走停的每一步都靠它闭环掐断，配错等于全盲 |
 | `pose_buffer.size` | 30 | 时间戳位姿环形缓冲长度（帧） |
 | **— 墙码 `tag.*` —** | | |
 | `tag.family` | `36h11` | AprilTag 家族 |

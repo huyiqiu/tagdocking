@@ -640,8 +640,16 @@ def main(args=None):
             node.destroy_node()
         except Exception:
             pass
+        # SIGINT 有两条路到达本进程 (supervisor 逐 pid 发 + ros2 launch 收到后
+        # 又向子进程转发一遍), 第二发把上下文关掉的时机能正好落在 ok() 检查与
+        # shutdown() 之间 —— ok() 通过而 shutdown 抛 "rcl_shutdown already
+        # called"。关都关了, 静默放行, 别让体面退出带一个 traceback 和退出码 1
+        # (launch 会报 process died, 排查的人会当成崩溃)。
         if rclpy.ok():
-            rclpy.shutdown()
+            try:
+                rclpy.shutdown()
+            except Exception:
+                pass
 
 
 if __name__ == '__main__':

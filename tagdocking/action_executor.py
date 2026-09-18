@@ -76,7 +76,7 @@ class ActionExecutor:
         self._turn_settle_ns = int(turn_settle_sec * 1e9)
         self._small_turn_rad = small_turn_rad
         # 盲转停止滞后补偿 — 与 scripts/test_turn_angle 同款的两板斧。
-        # 判停依据是 /dog/odom 累计角, 但从"odom 判停"到"底盘真停"之间存在
+        # 判停依据是里程计累计角, 但从"odom 判停"到"底盘真停"之间存在
         # 控制周期(50ms)+里程计延迟+底盘减速惯性: 实测 0.3rad/s 全速盲转
         # 每次多转 ~5-7°(对接日志: 目标 ±9.7° 实转 15-17°, 误差符号每步翻转,
         # 法线对准 2° 门槛永远进不去 → 原地摆头极限环, 横移分支永远触发不了)。

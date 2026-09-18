@@ -21,7 +21,7 @@
 #
 #   rtsp_url                rtsp://127.0.0.1:8555/front
 #   camera_info_file        <包share>/config/rtsp_camera_info.yaml (绝对路径)
-#   odom_topic              /dog/odom
+#   odom_topic              /odin1/odometry_highfreq
 #   camera_downscale        0
 #   tag_size                0.15
 #

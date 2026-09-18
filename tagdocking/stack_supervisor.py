@@ -56,7 +56,8 @@ from std_srvs.srv import SetBool, Trigger
 import tf2_ros
 
 from tagdocking.launch_processes import (
-    DOCKING_LAUNCH_CMD, launch_tree, process_snapshot, stop_launch_tree)
+    DOCKING_LAUNCH_CMD, launch_tree, matches_launch, process_snapshot,
+    stop_launch_tree)
 
 
 START_SH = '/home/nvidia/whale-nav/src/tagdocking/scripts/start_docking.sh'
@@ -281,21 +282,32 @@ class StackSupervisor(Node):
         接管 (owned_pid=None, 靠 argv 匹配认): 不重启它, 但照常能停它、照常挂
         空闲定时器。这也是手工起栈仍然安全的原因。
         """
-        tree = launch_tree(process_snapshot(), DOCKING_LAUNCH_CMD)
+        snapshot = process_snapshot()
+        tree = launch_tree(snapshot, DOCKING_LAUNCH_CMD)
         if not tree:
             return False
+        # 接管时认 mode: 匹配到的 launch 根 argv 里带着当初的 nodes:= 参数。
+        # **必须认准, 不能一律猜 full**: 猜成 full 而实际是 camera, 下一个
+        # dock 请求会走"热栈复用"直接转发到一个没有 docking_node 的栈上 ——
+        # 服务永远不可用, 且在 30s 占用到期前每次点都如此。反过来猜成 camera
+        # 而实际是 full, 只是点停泊时多付一次收了重起 (冷启动本来就是常态路径)。
+        # 两个以上 launch 根并存属病态, 此时按 full 处理 (宁多起勿错转)。
+        roots = [info[3] for info in snapshot.values()
+                 if matches_launch(info[3], DOCKING_LAUNCH_CMD)]
+        mode = 'full'
+        if roots and all(
+                any(a.strip().lower() == 'nodes:=camera' for a in argv)
+                for argv in roots):
+            mode = 'camera'
         with self._lock:
             self._owned_pid = None
             self._stack = 'ready'
-            # 接管时认不出对方当初是 camera 还是 all 起的 —— argv 里有 nodes:=,
-            # 但手工起的那条没有。一律当满栈: 猜低了会在有人点停泊时白白重起
-            # 一次, 猜高了只是少省一点 CPU。
-            self._mode = 'full'
-            self._detail = f'接管既有栈 ({len(tree)} 个进程)'
+            self._mode = mode
+            self._detail = f'接管既有栈 ({len(tree)} 个进程, mode={mode})'
             self._holds.add('adopted')
             self._release_at = time.monotonic() + self._idle_delay
         self.get_logger().info(
-            f'接管既有停泊栈: {sorted(tree)} —— 不重启, 空闲后照常收')
+            f'接管既有停泊栈 (mode={mode}): {sorted(tree)} —— 不重启, 空闲后照常收')
         return True
 
     # ── 起栈 / 收栈 ─────────────────────────────────────────────────
@@ -949,7 +961,11 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description='tagdocking 停泊栈按需启停')
     parser.add_argument('--ready-timeout', type=float, default=READY_TIMEOUT_SEC)
     parser.add_argument('--idle-delay', type=float, default=IDLE_STOP_DELAY_SEC)
-    parser.add_argument('--odom-topic', default='/dog/odom')
+    # 必须与 docking.launch.py 的 odom_topic 默认值保持一致 —— 就绪门拿它建
+    # 探针, 判 "odom 在不在"。两边脱节的那次 (launch 改成 /odin1/odometry_highfreq,
+    # 这里还留着旧值 /dog/odom), 门对着一个没人发的话题干等 20s 超时, 把刚拉起的
+    # 健康栈又原样收掉 —— web 上表现为"点停泊 → 栈未能就绪"。
+    parser.add_argument('--odom-topic', default='/odin1/odometry_highfreq')
     # ros2 run 会塞 --ros-args …; 用 parse_known_args 忽略。
     args, _ = parser.parse_known_args(argv)
 
