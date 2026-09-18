@@ -2,9 +2,9 @@
 """台架测试替身: 模拟 zsibot_l1_control (l1w_control) 的模式接口与门控。
 
 节点名就叫 l1w_control, docking 侧默认 base.l1w_prefix=/l1w_control 无需改配置。
-用途: 无狗桌面上跑通"停→锁→稳定帧→规划→解锁→走"全闭环 —— 配合
-docking.launch.py (camera_info_bridge 相机路径或回放 /detections) 时, 本替身
-积分 /cmd_vel 发布 /dog/odom, ActionExecutor 才能里程计判停。
+用途: 无狗桌面上跑通停泊闭环 —— 本替身积分 /cmd_vel 发布 /dog/odom,
+ActionExecutor 才能里程计判停; 视觉侧用回放 /detections 或 mock 检测
+(只够验证话题/状态机链路, 见 README §8)。
 
 镜像真桥的契约 (zsibot_l1_control_node.cpp):
   ~/static_stand (Trigger)  → posture=static_stand, motion_enabled=false (锁定)
@@ -26,9 +26,9 @@ docking.launch.py (camera_info_bridge 相机路径或回放 /detections) 时, �
 
 用法:
   ros2 run tagdocking mock_l1w_control            # 或 python3 scripts/mock_l1w_control
-  # 断言看日志: [MOCK] STATIC_STAND #N / STAND_UP #N 每停/每次起步恰一次;
-  # 停泊成功后 LI_DOWN #1 → PASSIVE #1 (充电收尾); 门控窗内出现非零
-  # cmd_vel 会打 [MOCK] !!! VIOLATION。
+  # 断言看日志: [MOCK] PASSIVE #1 在停泊成功后恰一次 (充电收尾;
+  # charge.static_stand:=true 时其前还有 STATIC_STAND #1); 泊出起步
+  # STAND_UP #1; 门控窗内出现非零 cmd_vel 会打 [MOCK] !!! VIOLATION。
 """
 
 import math

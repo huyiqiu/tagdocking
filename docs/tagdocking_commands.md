@@ -33,7 +33,7 @@ cd ~/whale-nav/src/tagdocking
   的默认值(见 §3)。临时改值在模式后追加,余下参数原样转给 `ros2 launch`:
 
   ```bash
-  ./scripts/start_docking.sh docking dual_dock_distance:=0.50
+  ./scripts/start_docking.sh docking dual_dock_distance:=0.45
   ```
 
 - Web 端口用环境变量覆盖:`TAGDOCKING_WEB_PORT=8090`
@@ -65,43 +65,36 @@ ros2 launch tagdocking docking.launch.py 参数:=值 ...    # 命令行覆盖
 | 层 | 位置 | 说明 |
 | --- | --- | --- |
 | ① 命令行 `key:=value` | — | 最高 |
-| ② launch 内置实测表 `DUAL_ARG_DEFAULTS` | `launch/docking.launch.py` | 仅 2 个:`dual_settle_sec: 1.0`、`dual_dock_distance: 0.47`。**yaml 对这两个已失效** —— 进了这张表就脱离 yaml,改 `config/docking.yaml` 不再生效,只能改这里或命令行 |
-| ③ YAML 权威值 | `src/tagdocking/config/docking.yaml` | 其余所有参数 |
+| ② launch 内置默认值 | `launch/docking.launch.py` | 相机链路几个有实值(rtsp_url/camera_info_file/odom_topic/camera_downscale/tag_size);所有 `dual_*` 默认**空串 = 回落 yaml** |
+| ③ YAML 权威值 | `src/tagdocking/config/docking.yaml` | 双码全部调参语义与默认值 |
 
-### 3.2 单码 / 通用参数(部分)
+### 3.2 通用参数(部分)
 
 ```text
 rtsp_url                  RTSP 拉流地址 (默认 rtsp://127.0.0.1:8555/front)
 camera_info_file          rtsp 内参 YAML (默认包内绝对路径 rtsp_camera_info.yaml)
-image_topic / camera_info_topic   apriltag 图像/内参话题
 family / tag_size         AprilTag 族 (36h11) 与墙码边长 (0.15)
 dock_tag_id / camera_frame / base_frame
-base_type                 diff_drive | omni | quadruped (空 = yaml 的 base.type)
-dock_distance             0.55 — 单码模式底盘停泊距离 (双码不用它, 见 dual_dock_distance)
-final_straight_distance / final_straight_yaw_deg / entry_lateral_m   单码直行段
-jog_max / l1w_prefix / odom_topic / cmd_vel_topic
-use_odin                  Odin1 相机模式 (内参回退判据见 README §2.7)
+cmd_vel_topic / l1w_prefix / odom_topic   (odom 默认 /dog/odom)
 camera_downscale          0 (关降采样 —— 远距离小 tag 检测下限, launch 注释有说明)
 camera_backend            rtsp 解码后端 (gstreamer/ffmpeg)
-camera_mount_x/y/z/yaw_deg/pitch_deg/roll_deg   rtsp/odin 相机安装位姿静态 TF
-camera_lateral_offset_m   0 — 相机横向偏移补偿 (0.03 是上一个相机的, 别凭空填)
+camera_mount_x/y/z/yaw_deg/pitch_deg/roll_deg   rtsp 相机安装位姿静态 TF
+wall_tag_size / pile_tag_id / pile_tag_size     双码码边长与桩码 ID
 nodes                     只能 all | camera (拼错当场报错, 不静默退回)
-posture_enable / static_settle_sec                 站立姿态
 charge_enable / charge_passive / charge_static_stand   充电收尾 (DOCKED 后泄力)
 ```
 
 ### 3.3 dual_* 批量参数 (双码)
 
-45+ 个由 `DUAL_TUNING_ARGS` 批量声明的 launch 参数,**空串 = 保留 yaml 权威值**。
+38 个由 `DUAL_TUNING_ARGS` 批量声明的 launch 参数,**空串 = 保留 yaml 权威值**。
 常用的: `observation_distance`、`observation_tolerance`、`forward_step`、
 `reverse_step`、`lateral_step`、`yaw_step_deg`、`yaw_fine_step_deg`、
 `straight_yaw_tol_deg`、`dock_distance`、`dock_tolerance`、
 `straight_start_distance`、`align_tolerance_deg`、`align_hold_sec`、
-`lateral_tolerance_m`、`exit_lateral_tolerance_m`、`feedback_min_improvement`、
-`feedback_fail_windows`、`no_candidate_windows`、`reverse_limit/count`、
-`standoff_reverse_limit/count`、`observe_timeout_sec`、`pile_lock_distance`、
-`crouch_enable`(经由单独的 `dual_crouch_enable`)……完整清单见
-`docking.launch.py --show-args`。
+`lateral_tolerance_m`、`exit_lateral_tolerance_m`、`prealign_tolerance_deg`、
+`prealign_step_deg`、`prealign_max_steps`、`reverse_limit/count`、
+`standoff_reverse_limit/count`、`observe_timeout_sec`、`settle_sec`……
+完整清单见 `docking.launch.py --show-args`。
 
 ```bash
 # 例: 命令行覆盖看门狗门槛与站位
@@ -112,10 +105,9 @@ charge_enable / charge_passive / charge_static_stand   充电收尾 (DOCKED 后�
 
 ```bash
 ros2 run tagdocking rtsp_camera --ros-args \
-    -p rtsp_url:="rtsp://127.0.0.1:8589/test" \
+    -p rtsp_url:="rtsp://127.0.0.1:8555/front" \
     -p camera_info_file:=$HOME/whale-nav/install/tagdocking/share/tagdocking/config/rtsp_camera_info.yaml
 
-ros2 run tagdocking camera_info_bridge      # odin 模式相机桥 (合成 CameraInfo + 静态 TF)
 ros2 run tagdocking docking_node            # 控制器 (一般经 launch/supervisor)
 ros2 run tagdocking docking_supervisor      # 按需启停守护
 ros2 run tagdocking docking_web --port 8090 # Web 控制台
@@ -126,12 +118,8 @@ ros2 run tagdocking docking_web --port 8090 # Web 控制台
 ```bash
 # RTSP 相机内参 (无 ROS 依赖, OpenCV 直接拉流 + 棋盘格)
 # 输出 YAML 喂给 rtsp_camera 的 camera_info_file → 落到 config/rtsp_camera_info.yaml
-python3 scripts/calibrate_rtsp --url rtsp://192.168.1.100:8554/live \
+python3 scripts/calibrate_rtsp --url rtsp://127.0.0.1:8555/front \
     [--size 9x6] [--square 0.025] [--frames 20] [--backend gstreamer]
-
-# USB 相机棋盘格标定 (GUI, 需 ssh -X 转发 X11; 提交后存 config/calibration/ost.yaml)
-ssh -X nvidia@<车>
-python3 scripts/calibrate_camera
 ```
 
 ## 6. 台架 / 执行器测试脚本 (python3 直跑)

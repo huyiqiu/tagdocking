@@ -111,8 +111,8 @@ class DockingNode(Node):
         # 一直转圈搜索。攒够一段时间就明确报错。
         self._dual_expired_since_ns = 0
         self._dual_expired_worst_ms = 0.0
-        # 趴下前的单码粗对准 (见 _dual_prealign): 双码枚举的步长上限只有几度,
-        # 它是精调器不是收敛器; 锁定时残留的十几度方位必须先用单码大步收掉。
+        # 移交双码前的墙码粗对准 (见 _dual_prealign): 双码枚举的步长上限只有几度,
+        # 它是精调器不是收敛器; 锁定时残留的十几度方位必须先用墙码大步收掉。
         self._dual_prealigned = False
         self._dual_prealign_steps = 0
         self._dual_prealign_active = False
@@ -320,7 +320,7 @@ class DockingNode(Node):
         # 唯一约束: > 死区 0.10。代码另有 max(rate, min_angular_rate) 结构
         # 性抬底, 配进死区也不会静默失效。调大恶化单周期粒度。
         self.declare_parameter('stopgo.heading_hold_rate', 0.12)
-        # 接通门槛: 0.5m·sin(2°)=17.5mm < dual.dock_tolerance(20mm), 即
+        # 接通门槛: 0.47m·sin(2°)=16.4mm < dual.dock_tolerance(20mm), 即
         # "残余航向的终点横向代价刚好小于停泊容差"这一点。
         self.declare_parameter('stopgo.heading_hold_engage_deg', 2.0)
         # 断开门槛**绝不取 0**: 命令→odom 报告有 0.1-0.15s 滞后, 瞄 0 必
@@ -1028,7 +1028,7 @@ class DockingNode(Node):
                                   CODE_MOTION_STALLED)
             return
         self._lookup_camera_offset()
-        # 步骤 1.5: 趴下前先用单码 (墙码) 把方位粗对准到 ±prealign_tolerance。
+        # 步骤 1.5: 移交双码前先用墙码把方位粗对准到 ±prealign_tolerance。
         # 双码枚举的单步上限只有几度, 它是精调器不是收敛器 —— 锁定那一刻
         # 残留多少方位误差, 双码就得一步几度地啃回来。现场锁定时方位差
         # 20.4°, 双码要 ~30 步 × 2.4s ≈ 70s, 顶着观测超时走。
@@ -1268,17 +1268,17 @@ class DockingNode(Node):
 
     def _dual_prealign(self, tag_visible: bool, tag_pose,
                        now_ns: int) -> bool:
-        """趴下前用单码 (墙码) 把方位粗对准。True = 可以进入双码。
+        """移交双码前用墙码把方位粗对准。True = 可以进入双码。
 
         为什么需要它: 双码 _correction 枚举的单步上限是 yaw_cap (远场 8°、近场
         3°), 每步还要停稳-重测-重规划 ~2.4s。它的定位是"精调器" —— 用两码的
         地平面几何把 theta/e 双自由度收进毫米/度级, 而不是从十几度的初始误差
-        开始收敛。现场 `二维码已锁定：距离=1.371m` 之后直接趴下进双码, 锁定
+        开始收敛。现场 `二维码已锁定：距离=1.371m` 之后直接移交双码, 锁定
         时的方位误差 (实测 20.4°) 没有任何粗对准, 双码只能一步几度地啃, ~30 步
-        × 2.4s ≈ 70s 顶着 dual.observe_timeout_sec (90s) 走, 必然失败。
+        × 2.4s ≈ 70s 顶着 dual.observe_timeout_sec (120s) 走, 必然失败。
 
-        为什么放在趴下之前: 站立视角看墙码 (0.15m, 挂墙上) 最清楚, 桩码本来就
-        看不见 —— 粗对准只需要墙码, 没有理由先趴下再转。
+        为什么用墙码: 墙码 (0.15m, 挂墙上) 正对视角最清楚, 桩码本来就
+        看不见 —— 粗对准只需要墙码。
 
         为什么用单码而非双码的 geometry(): 粗对准只要收一个自由度 (车头朝向
         墙码), 墙码 bearing = atan2(lat, dist) 是直接量测, 不依赖两码基线、
@@ -1330,7 +1330,7 @@ class DockingNode(Node):
         # _dual_prealign_active 让 _launch_pending_seq / _launch_step 把这一步
         # 当成"非双码"处理: 不查 dual.pending_valid (双码这会儿还没规划过,
         # 没有 pending_plan), 也不记进 dual 的动作预算/合格状态。看门狗照装 ——
-        # 底盘不动 (死区/锁定) 必须现在就炸, 而不是拖到双码去误判几何。
+        # 底盘不动 (死区/门控) 必须现在就炸, 而不是拖到双码去误判几何。
         self._dual_prealign_active = True
         self._pending_seq = [ActionPlan(kind='yaw',
                                         turn_angle=math.copysign(step, bearing))]
@@ -1446,7 +1446,7 @@ class DockingNode(Node):
         if reason:
             if self._dual_prealign_active:
                 # 现场必须能一眼分清"粗对准阶段底盘没动"和"双码精调出问题":
-                # 前者是站立单码转向 (死区/锁定/服务), 后者是匍匐双码几何。
+                # 前者是墙码粗对准转向 (死区/门控/服务), 后者是双码几何。
                 reason = '单码粗对准阶段 — ' + reason
             self._adapter.publish_stop()
             self._executor.cancel()
