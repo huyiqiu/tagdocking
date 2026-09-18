@@ -10,13 +10,11 @@
       (charge.static_stand=false 时跳过锁定, 直接阻尼)
     → DONE
 
-与 posture.enable 完全无关: 即使关闭了中途的锁定/解锁 (呼吸抑制),
-DOCKED 后也必须执行整个序列 —— 呼吸抑制管的是"停-看循环里的量测稳定",
-充电收尾管的是"泊完后把狗放好", 两者互不相干。
+与停-看循环的量测稳定 (稳定帧门) 互不相干: 那套管"停-看循环里的
+量测稳定", 充电收尾管的是"泊完后把狗放好"。
 
 所有调用全部非阻塞 (只用 call_async, 由 20Hz 控制循环在 DOCKED 态轮询
-tick 推进), 绝不在回调里 sleep / spin_until_future_complete —— 与
-posture_mode 同一套约定。
+tick 推进), 绝不在回调里 sleep / spin_until_future_complete。
 
 泊出衔接: 收尾完成后狗站立锁定/阻尼且 cmd_vel 被桥门控 (motion_enabled=False),
 直接盲退发不出速度。start_undock 后由 _run_undock 调 motion_ready():
@@ -83,8 +81,7 @@ class ChargeMode:
         self._cli_passive = node.create_client(Trigger, f'{prefix}/passive')
         self._cli_stand = node.create_client(Trigger, f'{prefix}/stand_up')
 
-        # 与桥的 latched 发布 (transient_local) 匹配, 启动即收到当前快照
-        # (与 posture_mode 同一套 QoS 约定)。
+        # 与桥的 latched 发布 (transient_local) 匹配, 启动即收到当前快照。
         qos = QoSProfile(
             depth=1,
             reliability=ReliabilityPolicy.RELIABLE,
@@ -94,7 +91,7 @@ class ChargeMode:
         self._motion_sub = node.create_subscription(
             Bool, f'{prefix}/motion_enabled', self._on_motion_enabled, qos)
 
-        # 桥状态回传 (None=无回传哨兵, 与 posture_mode 同义)
+        # 桥状态回传 (None=无回传哨兵)
         self._posture_state: str | None = None
         self._motion_enabled: bool | None = None
 
@@ -174,7 +171,7 @@ class ChargeMode:
     def motion_ready(self, now_ns: int) -> bool:
         """True → 泊出盲退可以发车 (狗不在锁定/阻尼门控态)。
 
-        _run_undock Case 2 每 tick 调用, 与 posture.motion_ready 串联。
+        _run_undock Case 2 每 tick 调用。
         收尾进行中收到泊出请求 → 立即中断序列转 stand_up 恢复。
         """
         if not self._gated():
@@ -281,8 +278,8 @@ class ChargeMode:
     def _gated(self) -> bool:
         """狗的 cmd_vel 是否被桥门控 (锁定/阻尼过)。
 
-        判据只看 /motion_enabled —— 它就是桥的 cmd_vel 门控本身
-        (posture_mode 模块头同一套约定), 且 transient_local latched,
+        判据只看 /motion_enabled —— 它就是桥的 cmd_vel 门控本身,
+        且 transient_local latched,
         新进程一订阅就拿到当前快照。
 
         原先末行还要求 _phase in (STATIC, DAMPING, DONE): 那是进程内记忆。

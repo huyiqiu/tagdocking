@@ -368,8 +368,9 @@ class DualTagDocking:
 
     def stopped(self, now):
         self.reset_filter()
-        self.settle_until_ns = now + int(max(1.5, self.p('settle_sec'),
-            float(self._node._p('posture.static_settle_sec'))) * 1e9)
+        # 下限 1.5s: 覆盖 RTSP 延迟 + 步态呼吸衰减 (原 posture.static_settle_sec
+        # 参与 max, 但 yaml 给 1.2 恒被 1.5 盖过 —— 直接折叠)。
+        self.settle_until_ns = now + int(max(1.5, self.p('settle_sec')) * 1e9)
 
     def fresh(self, now, stamp=None):
         stamp = self.stamp if stamp is None else stamp

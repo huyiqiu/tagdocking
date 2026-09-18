@@ -59,7 +59,6 @@ from .action_executor import ActionExecutor, HeadingHold
 from .state_machine import (DockingStateMachine, DockingState,
                             CODE_TAG_NOT_FOUND, CODE_VISION_NO_PROGRESS,
                             CODE_MOTION_GATED, CODE_MOTION_STALLED)
-from .posture_mode import PostureMode
 from .charge_mode import ChargeMode
 from .dual_docking import DualTagDocking, DEFAULTS as DUAL_DEFAULTS
 from .dual_camera import CameraModel
@@ -147,11 +146,8 @@ class DockingNode(Node):
         self._sm = DockingStateMachine(self)
         self._sm._max_retries = int(self._p('retry.max_retries'))
 
-        # ── 静止站立(锁定)管理器: 每个停看点的"停"升级为 ──────────────
-        # 停→static_stand 锁定(不喘)→稳定帧→规划→stand_up 解锁→走。
+        # 充电收尾 (DOCKED 后 静止→阻尼泄力)
         # 需要 self._p 与 self._sm, 必须在定时器启动前创建。
-        self._posture = PostureMode(self)
-        # 充电收尾 (DOCKED 后 静止→趴下→阻尼), 与 posture.enable 无关
         self._charge = ChargeMode(self)
         # 已规划待发的机动序列: 规划在锁定下完成后暂存, 由 _launch_pending_seq
         # 在恢复运动模式 (motion_enabled=True) 后原样启动, 解锁等待期间
@@ -491,24 +487,16 @@ class DockingNode(Node):
         # odom yaw 疯了"的诊断闸。正常一趟需 5-10°, 定低会静默关掉功能。
         self.declare_parameter('stopgo.heading_hold_budget_deg', 15.0)
 
-        # ── 静止站立 (posture) — 走停 × 呼吸抑制 ──────────────────────
-        # 每个停看点的"停"升级为: static_stand 锁定(不喘) → 等稳定帧 →
-        # 规划 → stand_up 解锁 → 走。接口在 zsibot_l1_control (l1w_control);
-        # 无桥 (备用桥/纯台架) 时 service_wait_sec 宽限后自动降级停用。
+        # ── 停看点量测稳定 — 停→量测最短间隔 + 稳定帧 ─────────────────
+        # 接口前缀 base.l1w_prefix 指向 zsibot_l1_control (l1w_control),
+        # charge_mode 收尾 (静止锁定/阻尼) 仍走它。
         self.declare_parameter('base.l1w_prefix', '/l1w_control')
-        self.declare_parameter('posture.enable', False)
-        # 停→量测最短间隔: 覆盖 RTSP 延迟 (0.1~0.5s) + CMD_LOCK_MODE 过渡 +
-        # 呼吸衰减。与 stopgo.turn_settle_sec 同一起点, 实际取两者较大值。
-        self.declare_parameter('posture.static_settle_sec', 1.2)
-        self.declare_parameter('posture.lock_ack_timeout_sec', 2.0)
-        self.declare_parameter('posture.unlock_ack_timeout_sec', 2.0)
-        self.declare_parameter('posture.unlock_retries', 2)
+        # 停→量测最短间隔: 覆盖 RTSP 延迟 (0.1~0.5s) + 步态呼吸衰减。
+        # (posture 静止站立序列已随 v1.0 移除, 稳定只靠时间窗 + 稳定帧。)
         self.declare_parameter('posture.min_stable_frames', 3)
         self.declare_parameter('posture.stable_frame_timeout_sec', 2.5)
-        self.declare_parameter('posture.service_wait_sec', 1.0)
 
-        # 充电收尾 (DOCKED 后): 静止→阻尼泄力。与 posture.enable
-        # 无关 —— 关掉中途锁定/解锁, 停泊完成后仍执行整个序列。
+        # 充电收尾 (DOCKED 后): 静止→阻尼泄力。
         self.declare_parameter('charge.enable', True)
         self.declare_parameter('charge.passive', True)  # 阻尼步; false=仅锁定(站立)
         self.declare_parameter('charge.static_stand', True)  # 先锁定再阻尼; false=跳过锁定直接阻尼
@@ -1191,15 +1179,6 @@ class DockingNode(Node):
 
         state = self._sm.state
 
-        # 机动中被外部切入静止站立 (如网页台"静止站立"按钮): cmd_vel 已被桥
-        # 拒绝、里程计不会再走, 立即中止而不是静默耗完接近超时。
-        # (external_lock 要求 motion_enabled==False, 解锁刚完成时 posture_state
-        # 的滞后残留不会误判。)
-        if self._executor.is_active and self._posture.external_lock:
-            self.get_logger().error('机动期间被外部切入静止站立 → MOTION_FAILED')
-            self._sm.abort_motion('外部锁定打断机动', CODE_MOTION_GATED)
-            state = self._sm.state
-
         # On leaving the stop-and-go states (e.g. APPROACH→SEARCH_TAG re-lock,
         # or any error/terminal transition), abort any half-finished action so
         # it cannot resume later against a stale odometry reference.
@@ -1223,15 +1202,7 @@ class DockingNode(Node):
         if (state == DockingState.SEARCH_TAG
                 and self._prev_state != DockingState.SEARCH_TAG):
             self._reset_search()
-        # 终态恢复运动模式 (DOCKED 除外): 释放 cmd_vel 给遥控/网页台。
-        # DOCKED 按约定保持静止站立 (泊出时由 _run_undock 先解锁);
-        # UNDOCKED 时狗本就在运动模式。
-        if (self._prev_state != state and state in (
-                DockingState.TAG_LOST, DockingState.TIMEOUT,
-                DockingState.MOTION_FAILED, DockingState.CANCELLED)):
-            self._posture.release(now_ns, reason=f'进入终态 {state.name}')
-        # 入 DOCKED → 启动充电收尾 (静止→趴下→阻尼)。与 posture.enable 无关:
-        # 呼吸抑制只管停-看循环的量测稳定, 泊完把狗放到桩上必须做。
+        # 入 DOCKED → 启动充电收尾 (静止→阻尼泄力)。
         if (self._prev_state != state and state == DockingState.DOCKED):
             self._adapter.publish_stop()
             self._executor.cancel()
@@ -1383,15 +1354,6 @@ class DockingNode(Node):
                 throttle_duration_sec=1.0)
             return
 
-        # ── Case 2.4: 静止站立锁定 + 停振窗口 (呼吸抑制) ───────────────
-        # 停稳边界 (_mark_stopped) 已请求 static_stand; 这里等 posture_state
-        # 变为 static_stand 且距停稳 >= posture.static_settle_sec (覆盖 RTSP
-        # 延迟 + CMD_LOCK_MODE 过渡), 之后才解冻量测 —— 量测窗内狗完全静止,
-        # tag 位姿不再被步态呼吸晃动。降级/停用时本门直接放行。
-        if not self._posture.lock_settled(now_ns):
-            self._adapter.publish_stop()
-            return
-
         # ── settle 窗口刚结束：解冻并清空运动期的一切旧数据 ────────────
         # 强制下一次规划只用小车停稳后新采的新鲜帧。清空后本 tick 不规划，
         # 等 _on_detections（已解冻）收到一帧停稳后的检测重新播种滤波。
@@ -1447,7 +1409,7 @@ class DockingNode(Node):
         # ── 稳定帧门: 规划只认停稳解冻后连续 accepted 的新鲜帧 ──────────
         # EMA 已被解冻重新播种, 再要求 N 帧一致只多花 ~0.2-0.5s (6-10fps),
         # 却能把单帧噪声挡在规划之外。等不满时超时放行 (防闪烁卡死),
-        # 设 1 即关闭。与 posture.enable 无关 —— 感知侧去噪永远值得。
+        # 设 1 即关闭 —— 感知侧去噪永远值得。
         min_frames = int(self._p('posture.min_stable_frames'))
         if min_frames > 1 and self._stable_frames < min_frames:
             if self._stable_window_start_ns == 0:
@@ -1704,11 +1666,6 @@ class DockingNode(Node):
             self._sm.retry_search()
             self._adapter.publish_stop()
             return
-        # 上一轮失败/到站时狗可能仍处于静止站立 (DOCKED 约定), cmd_vel 会被
-        # 桥拒绝 → 里程计不走 → 15s 重试超时。先恢复运动模式再盲退。
-        if not self._posture.motion_ready(now_ns):
-            self._adapter.publish_stop()
-            return
         self._executor.start_jog(
             -dist, rate, blind=True,
             odom_scale=self._p('stopgo.jog_backward_odom_scale'))
@@ -1763,20 +1720,13 @@ class DockingNode(Node):
             self._undock_code = CODE_MOTION_STALLED
             self.get_logger().warn('泊出：等待里程计...', throttle_duration_sec=1.0)
             return
-        # DOCKED 按约定保持静止站立; 盲退前必须 stand_up 并等 motion_enabled,
-        # 否则 cmd_vel 被桥拒绝 → 泊出超时。phase0→1 链式段已解锁不再处理。
-        # 充电收尾后狗趴着/阻尼 (posture.enable=false 时 posture 不管):
-        # 先由 charge 管理器 stand_up 恢复运动, 它不门控时直接放行。
+        # DOCKED 收尾后狗锁定/阻尼泄力, cmd_vel 被桥拒绝 → 泊出超时。
+        # 先由 charge 管理器 stand_up 恢复运动模式, 它不门控时直接放行。
         if not self._charge.motion_ready(now_ns):
             self._adapter.publish_stop()
             self._undock_note = (f'cmd_vel 被桥门控, 等 stand_up '
                                  f'(charge={self._charge.phase_name})')
             # 卡在门控: 盲重试没用, 得去查桥/电机泄力。
-            self._undock_code = CODE_MOTION_GATED
-            return
-        if not self._posture.motion_ready(now_ns):
-            self._adapter.publish_stop()
-            self._undock_note = 'cmd_vel 被桥门控, 等 posture 解锁'
             self._undock_code = CODE_MOTION_GATED
             return
         self._undock_phase = 0
@@ -1869,12 +1819,6 @@ class DockingNode(Node):
             self._adapter.publish_stop()
             return
 
-        # ── Case 2.6: 检测期同样静止站立 (首次进入/重进搜索时自武装补锁) ──
-        # 锁定下检测, 二维码位姿不被呼吸晃动; 降级/停用时直接放行。
-        if not self._posture.lock_settled(now_ns):
-            self._adapter.publish_stop()
-            return
-
         # ── Case 3: 空闲且已稳定 — 检测期 ─────────────────────────
         if not self._has_odom:
             self._adapter.publish_stop()
@@ -1914,12 +1858,6 @@ class DockingNode(Node):
             self._sm.abort_motion(
                 'dual bounded wall search exhausted one revolution',
                 CODE_TAG_NOT_FOUND)
-            return
-
-        # 停留期满仍未见到 → 先恢复运动模式再转下一步。解锁等待期间保持
-        # 停留状态 (不重置 _search_detect_start), 否则每步多等一个 pause_time。
-        if not self._posture.motion_ready(now_ns):
-            self._adapter.publish_stop()
             return
 
         # 停留期满仍未见到 → 转下一步。诊断：这段停留里 /detections 到了几条？
@@ -2053,9 +1991,6 @@ class DockingNode(Node):
             self._adapter.publish_stop()
             self._dual.stopped(now_ns)
             self._reset_visual_state()
-            return False
-        if not self._posture.motion_ready(now_ns):
-            self._adapter.publish_stop()
             return False
         seq, self._pending_seq = self._pending_seq, None
         self._maneuver_queue = list(seq)
@@ -2208,13 +2143,12 @@ class DockingNode(Node):
             self._adapter.publish_stop()
 
     def _mark_stopped(self, now_ns: int):
-        """停稳边界: 视觉 settle 时钟 + 静止站立锁定请求 (每停只武装一次)。
+        """停稳边界: 视觉 settle 时钟起点。
 
         泊出 phase0→1 的链式段故意不走这里 —— 无缝盲链中间没有停看点,
-        锁定只发生在确实要"停下来看"的时刻。
+        settle 时钟只发生在确实要"停下来看"的时刻。
         """
         self._executor.mark_stop_time(now_ns)
-        self._posture.on_stop(now_ns)
         # 粗对准那一步到此结束 —— 标志必须在"停稳"这个唯一收口处清掉, 而不是
         # 只在动作正常完成时清: 队列排空一步都没起来 (步长太小被跳过) 也走这里。
         # 漏清的后果是静默的: 之后真正的双码动作会被当成粗对准步, 既不查

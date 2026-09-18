@@ -101,10 +101,10 @@ def test_closed_loop_center_and_advance_under_realistic_time_budget(offset,headi
         robot[0] += math.cos(robot[2])*f-math.sin(robot[2])*l
         robot[1] += math.sin(robot[2])*f+math.cos(robot[2])*l
         robot[2] += a
-        now += max(abs(f)/.08,abs(l)/.12,abs(a)/.15)+.4  # posture unlock
+        now += max(abs(f)/.08,abs(l)/.12,abs(a)/.15)+.4  # stop-and-go overhead
         c.action_completed()
         c.stopped(round(now*1e9))
-        now += 1.5+.4  # settle and posture/readout overhead
+        now += 1.5+.4  # settle and readout overhead
     pytest.fail('did not reach aligned forward motion')
 
 

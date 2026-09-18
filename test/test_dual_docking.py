@@ -16,7 +16,6 @@ class Node:
                             'base.type': 'omni', 'dual.dock_distance': .5,
                             'dual.straight_start_distance': 1.70,
                             'dual.align_tolerance_deg': 3., 'dual.align_hold_sec': .5,
-                            'posture.static_settle_sec': 1.2,
                             'dock_target.distance': .55, 'dual.wall_tag_size': .15,
                             'dual.pile_tag_size': .05})
         self.params.update(overrides)

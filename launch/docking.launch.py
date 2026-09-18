@@ -148,10 +148,8 @@ def launch_setup(context):
     # 走停单步最大 jog 距离 — 空值时用 yaml 权威值 (同 base_type 的约定)
     jog_max = LaunchConfiguration('jog_max').perform(context).strip()
 
-    # 静止站立 (posture.*) — 空值时用 yaml 权威值
+    # 狗模式服务前缀 — 空值时用 yaml 权威值
     l1w_prefix = LaunchConfiguration('l1w_prefix').perform(context).strip()
-    posture_enable = LaunchConfiguration('posture_enable').perform(context).strip()
-    static_settle_sec = LaunchConfiguration('static_settle_sec').perform(context).strip()
     # 充电收尾 (charge.*) — 空值时用 yaml 权威值
     charge_enable = LaunchConfiguration('charge_enable').perform(context).strip()
     charge_passive = LaunchConfiguration('charge_passive').perform(context).strip()
@@ -479,10 +477,6 @@ def launch_setup(context):
         ] + ([{'base.type': base_type}] if base_type else [])
           + ([{'odom_topic': odom_topic}] if odom_topic else [])
           + ([{'base.l1w_prefix': l1w_prefix}] if l1w_prefix else [])
-          + ([{'posture.enable': posture_enable.lower() == 'true'}]
-             if posture_enable else [])
-          + ([{'posture.static_settle_sec': float(static_settle_sec)}]
-             if static_settle_sec else [])
           + ([{'stopgo.jog_max': float(jog_max)}] if jog_max else [])
           + ([{'final_straight.entry_lateral_m': float(entry_lateral_m)}]
              if entry_lateral_m else [])
@@ -593,16 +587,10 @@ def generate_launch_description():
         DeclareLaunchArgument('jog_max', default_value='',
                              description='走停单步最大 jog 距离 (m); 空 = 使用 config/docking.yaml 的 stopgo.jog_max'),
 
-        # ── 静止站立 (posture.*) — 走停 × 呼吸抑制 ────────────────
+        # ── 狗模式服务前缀 + 充电收尾 ─────────────────────────────
         DeclareLaunchArgument('l1w_prefix', default_value='',
                               description='狗模式服务前缀 (空 = 使用 yaml 的 '
                                           'base.l1w_prefix; 默认 /l1w_control)'),
-        DeclareLaunchArgument('posture_enable', default_value='',
-                              description='停稳切静止站立总开关 true/false '
-                                          '(空 = 使用 yaml 的 posture.enable)'),
-        DeclareLaunchArgument('static_settle_sec', default_value='',
-                              description='停→量测最短间隔 (s, 空 = 使用 yaml 的 '
-                                          'posture.static_settle_sec)'),
         DeclareLaunchArgument('charge_enable', default_value='',
                               description='充电收尾总开关 true/false '
                                           '(空 = 使用 yaml 的 charge.enable)'),

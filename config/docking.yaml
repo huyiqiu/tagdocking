@@ -61,30 +61,11 @@ docking_node:
     # <prefix>/motion_enabled。备用桥 zsibot_bridge 无这些接口, 停用降级。
     base.l1w_prefix: "/l1w_control"
 
-    # ── 静止站立 (posture) — 走停 × 呼吸抑制 ──
-    # 每个停看点的"停"升级为完整闭环:
-    #   停 → static_stand 锁定 (CMD_LOCK_MODE, 身体不喘)
-    #      → 等 posture_state==static_stand 且距停稳 >= static_settle_sec
-    #      → 解冻清旧位姿 → 等待 >= min_stable_frames 帧连续 accepted
-    #      → 量测 + 重规划 (锁定下进行)
-    #      → stand_up 恢复运动 → 等 motion_enabled==True → 起步
-    # 锁定期间 cmd_vel 会被桥拒绝, 因此必须 stand_up 后才能走; DOCKED 保持
-    # 锁定 (泊出自动先解锁); 取消/超时/失败终态自动恢复运动模式。
-    posture.enable: false                     # 呼吸抑制总开关 (默认关) — 运行期可调: ros2 param set <节点> posture.enable true 即开 (也可 launch 传 posture_enable:=true); 无桥时也会自动降级停用
-    posture.static_settle_sec: 1.2            # s — 停→量测最短间隔 (RTSP 延迟 + 锁定过渡 + 呼吸衰减; 与 turn_settle_sec 同起点取 max)
-    posture.lock_ack_timeout_sec: 2.0         # s — 等 posture_state 确认; 超时本次停降级为未锁定继续
-    posture.unlock_ack_timeout_sec: 2.0       # s — 等 motion_enabled==True (含固件退出 LOCK 滞后)
-    posture.unlock_retries: 2                 # 次 — stand_up 重发上限, 耗尽 → MOTION_FAILED
-    posture.min_stable_frames: 3              # 帧 — 规划前所需连续 accepted 新鲜帧 (1=关闭)
-    posture.stable_frame_timeout_sec: 2.5     # s — 等不满 N 帧就带当前位姿规划 (防闪烁卡死)
-    posture.service_wait_sec: 1.0             # s — 服务发现宽限, 超过后判定无桥并停用
-
     # ── 充电收尾 (charge) — DOCKED 后 静止(锁定)→阻尼 ──
     # 停泊成功后狗站在充电桩上方, 锁定后切阻尼泄力, 保持站立 (不趴下):
     #   static_stand (静止锁定) → passive (阻尼泄电机, 站立)
-    # 与 posture.enable 完全无关: 呼吸抑制只管停-看循环的量测稳定,
-    # 关闭它不影响收尾 — DOCKED 后照做。收尾完成后 cmd_vel 被桥门控
-    # (锁定/阻尼态), 泊出 /start_undock 会自动 stand_up 恢复运动再盲退。
+    # 收尾完成后 cmd_vel 被桥门控 (锁定/阻尼态), 泊出 /start_undock 会
+    # 自动 stand_up 恢复运动再盲退。
     charge.enable: true                       # 充电收尾总开关
     charge.passive: true                      # 阻尼(泄力)步开关 — 运行期可调 (锁定完成那一刻读参); false 时收尾止于锁定 (仅站立)
     charge.static_stand: false                # DOCKED 后先 static_stand 锁定再阻尼; false=跳过静止锁定, 直接阻尼 (passive, 站立泄力)

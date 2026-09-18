@@ -116,7 +116,7 @@ def test_pending_expiry_does_not_start_or_qualify():
     stops = []
     node._adapter = NS(publish_stop=lambda: stops.append(True))
     node._reset_visual_state = lambda: None
-    # No posture/executor attributes: reaching either is a test failure.
+    # No executor attributes: reaching it is a test failure.
     assert not node._launch_pending_seq('omni', n+int(1e9))
     assert node._pending_seq is None and stops and not c.progress
 
@@ -133,7 +133,6 @@ def test_stop_precedes_terminal_confirmation():
                         cancel=lambda: events.append('cancel'))
     events = []
     node._adapter = NS(publish_stop=lambda: events.append('stop'))
-    node._posture = NS(lock_settled=lambda n: True)
     node._frozen = False
     node._pending_seq = None
     node._has_odom = True
@@ -651,7 +650,6 @@ def test_prealign_flag_is_cleared_at_every_stop_boundary():
     n = prealign_node()
     n._dual_prealign_active = True
     n._executor = NS(mark_stop_time=lambda ns: None)
-    n._posture = NS(on_stop=lambda ns: None)
     n._mark_stopped(int(21e9))
     assert not n._dual_prealign_active
     assert n._dual.settle_until_ns > int(21e9)   # 双码 settle 照常武装
