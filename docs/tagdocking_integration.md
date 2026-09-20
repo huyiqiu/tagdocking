@@ -12,10 +12,11 @@
 栈由 supervisor 自动管理，上层无需干预。
 
 ```bash
-sudo systemctl restart whale-nav-tagdocking-supervisor.service   # 重启（不打断进行中的停泊）
-sudo systemctl restart whale-nav-tagdocking-web.service
-sudo systemctl reset-failed <服务> && sudo systemctl restart <服务>   # failed 时先清再起
-systemctl is-active whale-nav-tagdocking-supervisor.service
+sudo systemctl enable whale-nav-tagdocking-supervisor.service   # 设置开机启动
+sudo systemctl enable whale-nav-tagdocking-web.service
+
+sudo systemctl start whale-nav-tagdocking-supervisor.service
+sudo systemctl start whale-nav-tagdocking-web.service
 ```
 
 ## 触发（HTTP）
