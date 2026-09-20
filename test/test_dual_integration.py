@@ -96,6 +96,55 @@ def test_passive_acceptance_switch_and_one_shot(outcome):
     assert c._phase == (c.DONE if outcome in ('ok', 'disabled') else c.FAILED)
 
 
+def test_motion_ready_stands_up_before_docking_and_resets_recovery():
+    cls = method_class('charge_mode.py', 'ChargeMode', {})
+    c = cls.__new__(cls)
+    logs, calls, failures = [], [], []
+    c._node = NS(get_logger=lambda: NS(info=logs.append))
+    c._sm = NS(abort_motion=lambda reason, code: failures.append((reason, code)))
+    c._enable = True
+    c._phase = c.IDLE
+    c._motion_enabled = False
+    c._posture_state = 'not_standing'
+    c._static_ack_ns = int(3e9)
+    c._retries = 1
+    c._step_tries = 0
+    c._step_future = None
+    c._cli_stand = NS(call_async=lambda request: calls.append(request) or NS())
+
+    assert not c.motion_ready(int(10e9), operation='停泊')
+    assert c._phase == c.RECOVERING and len(calls) == 1
+    assert '停泊请求' in logs[-1]
+
+    c._motion_enabled = True
+    assert c.motion_ready(int(11e9), operation='停泊')
+    assert c._phase == c.IDLE and c._step_future is None
+    assert not failures and '运动模式已恢复' in logs[-1]
+
+
+def test_motion_ready_docking_timeout_reports_motion_gated():
+    cls = method_class('charge_mode.py', 'ChargeMode', {})
+    c = cls.__new__(cls)
+    failures = []
+    c._node = NS(get_logger=lambda: NS(info=lambda text: None))
+    c._sm = NS(abort_motion=lambda reason, code: failures.append((reason, code)))
+    c._enable = True
+    c._phase = c.IDLE
+    c._motion_enabled = False
+    c._posture_state = 'not_standing'
+    c._static_ack_ns = int(3e9)
+    c._retries = 0
+    c._step_tries = 0
+    c._step_future = None
+    c._cli_stand = NS(call_async=lambda request: NS())
+
+    assert not c.motion_ready(int(10e9), operation='停泊')
+    assert not c.motion_ready(int(13.1e9), operation='停泊')
+    assert c._phase == c.FAILED
+    assert failures and failures[0][1] == CODE_MOTION_GATED
+    assert '停泊前 stand_up 超时' in failures[0][0]
+
+
 def test_launch_applies_dual_params_unconditionally():
     source = (ROOT / 'launch' / 'docking.launch.py').read_text()
     # dual 恒开: launch 不再有 dual_enable 开关, 也不再写 'dual.enable';
@@ -214,6 +263,7 @@ def intake():
     # 这里必须补齐, 否则 reset/cancel 族用例 AttributeError):
     n._dual_watch = None
     n._dual_prealign_active = False
+    n._dock_motion_pending = False
     n._dual_prealigned = False
     n._dual_prealign_steps = 0
     n._dual_reject_last = None
@@ -482,6 +532,7 @@ def test_start_cancel_services_clear_queue_and_watchdog(intake):
     n._sm.state = DockingState.SEARCH_TAG
     n.now += 50_000_000
     n._on_start_docking(None, NS())
+    assert n._dock_motion_pending
     n.supply(old)
     n.detect(old)
     assert n._dual.frames == 0 and n._pose_buffer.empty
@@ -489,6 +540,30 @@ def test_start_cancel_services_clear_queue_and_watchdog(intake):
     n.supply(n.now)
     n.detect()
     assert n._dual.frames == 1
+
+
+def test_docking_motion_gate_waits_then_starts_from_fresh_search():
+    cls = method_class('docking_node.py', 'DockingNode', {})
+    n = cls.__new__(cls)
+    n._dock_motion_pending = True
+    n._sm = NS(state=DockingState.SEARCH_TAG)
+    events, operations = [], []
+    ready = iter((False, True))
+    n._adapter = NS(publish_stop=lambda: events.append('stop'))
+    n._charge = NS(motion_ready=lambda now, operation: (
+        operations.append(operation) or next(ready)))
+    n._reset_search = lambda: events.append('reset_search')
+    n._prev_state = DockingState.IDLE
+    n.get_logger = lambda: NS(info=lambda text: events.append(text))
+
+    assert not n._prepare_docking_motion(int(10e9))
+    assert n._dock_motion_pending and events == ['stop']
+    assert not n._prepare_docking_motion(int(11e9))
+    assert not n._dock_motion_pending
+    assert n._prev_state == DockingState.SEARCH_TAG
+    assert events[1:3] == ['stop', 'reset_search']
+    assert operations == ['停泊', '停泊']
+    assert n._prepare_docking_motion(int(12e9))
 
 
 def test_dual_fixed_key_log_suppression_and_stage_change():

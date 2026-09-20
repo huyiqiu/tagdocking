@@ -101,6 +101,62 @@ def test_wall_only_bounded_reverse():
     assert 'budget' in c.failure
 
 
+def test_far_acquire_drives_forward_without_missing_confirm():
+    # 2m+ 外桩码 (5cm) 在检测半径外时隐时现, 每次短暂重现清零 missing_ns,
+    # 连续缺失永远攒不满 missing_confirm_sec。旧代码把"太远前进"也挂在这
+    # 道确认门后, 于是原地不动直到 8s 窗口看门狗判 vision_no_progress
+    # (2026-09-20 现场 2.6m 起停)。太远是无歧义的 —— 必须立即按墙码深度
+    # 前进, 不等连续缺失确认。
+    c = controller()
+    # count=3 → wall_frames 够门槛, 但 missing_time 仅 0.4s << missing_confirm 1.5s
+    n = frames(c, depth=2.6, missing=True, count=3)
+    assert c.missing_ns and (c.stamp-c.missing_ns)*1e-9 < c.p('missing_confirm_sec')
+    step = plan(c, n)
+    assert step is not None and not c.failure           # 不再原地等到看门狗判死
+    assert step[0].jog_distance == c.p('forward_step')  # 按墙码深度前进逼近
+    assert step[0].turn_angle == 0 and step[0].lateral_distance == 0
+    assert c.stage == 'acquire'
+
+
+def test_far_visible_pile_is_ignored_until_wall_reaches_observation_window():
+    # 2.4m 处 5cm 桩码偶然连续出现也不能触发双码校准；旧代码在这里直接
+    # acquire→observe 并按噪声几何横移，桩码再次消失后 8s 看门狗判死。
+    c = controller()
+    n = frames(c, depth=2.46, count=4)
+    step = plan(c, n)
+    assert step is not None and not c.failure
+    assert c.stage == 'acquire'
+    assert step[0].jog_distance == c.p('forward_step')
+    assert step[0].turn_angle == 0 and step[0].lateral_distance == 0
+    assert c.pile is None and c.pending_pile is None  # 此步严格只依据墙码
+
+
+def test_far_observe_state_falls_back_to_wall_only_approach():
+    # 防御历史/异常状态：即使已误入 observe，只要仍在观察窗外就退回 acquire，
+    # 不能原地等待 pile missing 超时。
+    c = controller()
+    c.stage = 'observe'
+    c.observe_started_ns = int(9e9)
+    n = frames(c, depth=2.4, missing=True, count=3)
+    step = plan(c, n)
+    assert step is not None and not c.failure
+    assert c.stage == 'acquire' and c.observe_started_ns == 0
+    assert step[0].jog_distance == c.p('forward_step')
+
+
+def test_dual_calibration_starts_only_inside_observation_upper_bound():
+    c = controller()
+    upper = c.p('observation_distance') + c.p('observation_tolerance')
+    n = frames(c, depth=upper + .01, count=4)
+    assert plan(c, n)[0].jog_distance > 0
+    assert c.stage == 'acquire'
+
+    c = controller()
+    n = frames(c, depth=upper, count=4)
+    plan(c, n)
+    assert c.stage in ('observe', 'approach')
+
+
 def test_each_tag_not_average_and_yaw_cap():
     c = controller()
     n = frames(c, x=.12, pile_x=-.12)

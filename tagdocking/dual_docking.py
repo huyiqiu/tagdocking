@@ -1050,6 +1050,33 @@ class DualTagDocking:
                 self._locked_turns = 0
                 return self._advance(d)
             return turn
+
+        # 观察窗外只信尺寸更大的墙码并向前接近，不使用远场偶现且噪声很大的
+        # 5cm 桩码做双码校准。此前 acquire 只要凑够 min_frames 就无距离门地
+        # 进入 observe，2.4m 处偶现的桩码会触发横移；再次丢码后 observe 又没有
+        # 前进入口，最终被 missing_timeout 看门狗判死。观察窗上沿约 1.9m，正好
+        # 对应桩码约 1.0m 的可靠识别距离。即使历史状态已进 observe，也退回
+        # acquire 兜底，直到真正进入观察窗。
+        obs = self.p('observation_distance')
+        if (self.stage in ('acquire', 'observe')
+                and d > obs + self.p('observation_tolerance')):
+            if self.stage == 'observe':
+                self._node.get_logger().info(
+                    f'dual 远场退出 observe: 墙码 z={d:.3f}m > 观察窗上沿 '
+                    f'{obs + self.p("observation_tolerance"):.2f}m，改按墙码前进')
+            self.stage = 'acquire'
+            self.observe_started_ns = 0
+            self.frames = 0
+            self.pile = None
+            self.hold_ns = self.missing_ns = 0
+            self.qualified_ns = self.committed_ns = 0
+            self.feedback_pending = None
+            self.feedback_anchor = None
+            self.feedback_count = self.feedback_bad = 0
+            self.feedback_trail = []
+            return self._emit_forward(ActionPlan(kind='forward', jog_distance=min(
+                self.p('forward_step'), (d-obs)/self.r[0][2])))
+
         if self.pile is None:
             missing_time = (self.stamp-self.missing_ns)*1e-9 if self.missing_ns else 0
             if (self.stage == 'approach' and self.progress and self.qualified_ns
@@ -1062,21 +1089,20 @@ class DualTagDocking:
                     f'≤ 直行包络 {self.straight_envelope:.2f}m, 丢失确认 '
                     f'{missing_time:.1f}s) — 此后只按墙码直行')
                 return self._advance(d)
-            if self.stage == 'acquire' and missing_time >= self.p('missing_confirm_sec'):
-                # 桩码 5cm 可见性半径有限, 不可见有两种原因, 按墙码距离分流 ——
-                # 太远 (d > 观察点) → 前进逼近, 走进桩码检测半径;
-                # 已在观察距离内仍不可见 → 初始太近 (出视野), 后退找回。
-                obs = self.p('observation_distance')
-                if d > obs + self.p('observation_tolerance'):
-                    return self._emit_forward(ActionPlan(kind='forward', jog_distance=min(
-                        self.p('forward_step'), (d-obs)/self.r[0][2])))
-                return self._reverse()
+            if self.stage == 'acquire':
+                # 观察窗外已在上面的统一距离门直接前进；走到这里说明已进入
+                # 观察距离但桩码仍持续不可见，方向可能有歧义，需连续缺失确认
+                # 滤除抖动后再后退找回。
+                if missing_time >= self.p('missing_confirm_sec'):
+                    return self._reverse()
             if self.window_ns and now-self.window_ns > self.p('missing_timeout_sec')*1e9:
                 return self._fail('pile missing / invalid outside qualified final entry')
             return None
         if self.frames < max(3, int(self.p('min_frames'))):
             return None
         if self.stage == 'acquire':
+            # 上面的距离门保证这里只会在观察窗内进入双码校准；远场桩码即使
+            # 偶然连续出现，也只用于可见性诊断，不会提前触发转向/横移。
             self.stage = 'observe'
             self.observe_started_ns = now
             # 一次性: 进入 observe 那一刻两码的逐边余量 —— "站位处桩码还剩

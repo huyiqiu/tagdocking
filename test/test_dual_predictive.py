@@ -399,14 +399,19 @@ def test_standoff_guard_pulls_back_while_still_correcting():
     assert c.stage == 'observe'
 
 
-def test_standoff_guard_is_near_side_only_and_never_pushes_forward_misaligned():
-    """只守近端。太远无害 (两码都在视野里); 航向没对就前进 = 沿错误方向走远。"""
+def test_far_prealign_uses_wall_only_before_standoff_correction():
+    """观察窗外先按墙码接近，不使用远场小桩码的噪声几何做双码纠偏。
+
+    外层单码粗对准已把墙码方位收进 ±5°；这里 1.95m、约 3° 的短前进只产生
+    毫米级横向分量，而提前横移/转向会被 5cm 桩码的远场抖动放大并触发丢码。
+    """
     c = controller()
-    now = frames(c, depth=1.95, x=.1)         # 站位过远 (窗上沿 1.9) + 未对准
+    now = frames(c, depth=1.95, x=.1)         # 观察窗上沿 1.9m 外
     step = plan(c, now)
-    assert step, '过远且未对准时应继续纠偏, 而不是无动作'
-    assert step[0].turn_angle or step[0].lateral_distance, '应纠偏, 不应前进'
-    assert step[0].jog_distance >= 0 or step[0].lateral_distance
+    assert step, '观察窗外应继续按墙码前进, 而不是无动作'
+    assert step[0].jog_distance > 0
+    assert step[0].turn_angle == 0 and step[0].lateral_distance == 0
+    assert c.stage == 'acquire' and c.pile is None
 
 
 @pytest.mark.parametrize('stage', ['approach', 'locked'])

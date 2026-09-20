@@ -136,6 +136,9 @@ class DockingNode(Node):
         # 充电收尾 (DOCKED 后 静止→阻尼泄力)
         # 需要 self._p 与 self._sm, 必须在定时器启动前创建。
         self._charge = ChargeMode(self)
+        # 新一轮停泊在真正搜索/运动前必须先确认桥已开放 cmd_vel。False 表示
+        # 无待检查；True 时由控制循环非阻塞调用 motion_ready()，必要时 stand_up。
+        self._dock_motion_pending = False
         # 已规划待发的机动序列: 规划在锁定下完成后暂存, 由 _launch_pending_seq
         # 在恢复运动模式 (motion_enabled=True) 后原样启动, 解锁等待期间
         # 不重测/重规划。
@@ -813,6 +816,11 @@ class DockingNode(Node):
         """Main 20 Hz control loop — stop-and-go paradigm."""
         now_ns = self.get_clock().now().nanoseconds
 
+        # 停泊开场先恢复运动模式。stand_up 会引起机身和相机明显运动，等待期间
+        # 不处理检测、不推进 SEARCH_TAG 超时；恢复完成后清空视觉并从新鲜帧开始。
+        if not self._prepare_docking_motion(now_ns):
+            return
+
         self._retry_dual_detections(now_ns)
 
         # Gather inputs
@@ -1066,6 +1074,31 @@ class DockingNode(Node):
             self._pending_seq = list(seq)
             self._launch_pending_seq(now_ns)
         return
+
+    def _prepare_docking_motion(self, now_ns: int) -> bool:
+        """停泊开场的非阻塞运动门控；False 表示本 tick 必须停止推进。
+
+        Trigger/Action 回调只负责置位，stand_up 服务及状态确认均由 20Hz 控制
+        循环完成，避免阻塞 ROS 回调。刚恢复的 tick 同样返回 False，并清空
+        stand_up 运动期间的视觉帧；下一 tick 才正式开始 SEARCH_TAG。
+        """
+        if not self._dock_motion_pending:
+            return True
+        if self._sm.state != DockingState.SEARCH_TAG:
+            self._dock_motion_pending = False
+            return True
+
+        self._adapter.publish_stop()
+        if not self._charge.motion_ready(now_ns, operation='停泊'):
+            return False
+
+        self._dock_motion_pending = False
+        self._reset_search()
+        # SEARCH_TAG 的进入动作已在这里完成，避免下一 tick 再次 reset 后把刚到的
+        # 新鲜帧清掉；搜索和状态机评估从下一 tick 一起开始。
+        self._prev_state = DockingState.SEARCH_TAG
+        self.get_logger().info('停泊准备完成: motion_enabled=True，开始搜索二维码')
+        return False
 
     def _run_undock(self, now_ns: int):
         """泊出的一个 tick: 盲退 → 原地转 180° → UNDOCKED。
@@ -1724,12 +1757,14 @@ class DockingNode(Node):
         self._executor.cancel()
         self._reset_maneuver()
         self._charge.reset()
+        self._dock_motion_pending = True
         return response
 
     def _on_cancel_docking(self, request, response):
         self._sm.cancel()
         self._executor.cancel()
         self._reset_maneuver()
+        self._dock_motion_pending = False
         self._adapter.publish_stop()
         response.success = True
         response.message = 'cancelled'
@@ -1744,6 +1779,7 @@ class DockingNode(Node):
             self._charge.pile_charge_off()
             self._executor.cancel()
             self._reset_maneuver()
+            self._dock_motion_pending = False
             self._undock_phase = 0
             self._undock_note = ''
             self._undock_code = ''
@@ -1763,6 +1799,7 @@ class DockingNode(Node):
         self._executor.cancel()
         self._reset_maneuver()
         self._charge.reset()
+        self._dock_motion_pending = True
 
         feedback = Dock.Feedback()
 
@@ -1772,6 +1809,7 @@ class DockingNode(Node):
                 self._sm.cancel()
                 self._executor.cancel()
                 self._reset_maneuver()
+                self._dock_motion_pending = False
                 self._adapter.publish_stop()
                 return Dock.Result(success=False, message='cancelled')
 
@@ -1804,6 +1842,7 @@ class DockingNode(Node):
         self._sm.cancel()
         self._executor.cancel()
         self._reset_maneuver()
+        self._dock_motion_pending = False
         self._adapter.publish_stop()
         return CancelResponse.ACCEPT
 

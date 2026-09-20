@@ -13,14 +13,13 @@
 与停-看循环的量测稳定 (稳定帧门) 互不相干: 那套管"停-看循环里的
 量测稳定", 充电收尾管的是"泊完后把狗放好"。
 
-所有调用全部非阻塞 (只用 call_async, 由 20Hz 控制循环在 DOCKED 态轮询
+所有调用全部非阻塞 (只用 call_async, 由 20Hz 控制循环在相应状态轮询
 tick 推进), 绝不在回调里 sleep / spin_until_future_complete。
 
-泊出衔接: 收尾完成后狗站立锁定/阻尼且 cmd_vel 被桥门控 (motion_enabled=False),
-直接盲退发不出速度。start_undock 后由 _run_undock 调 motion_ready():
-中断序列 → stand_up (CMD_STAND_UP) → 等 motion_enabled==True 才放行,
-含重试, 耗尽则 abort_motion 落 MOTION_FAILED (狗已泄力无法泊出, 必须
-显式失败而不是干等超时)。
+运动衔接: 狗处于锁定/阻尼态时 cmd_vel 被桥门控 (motion_enabled=False),
+停泊与泊出开始前都由控制循环调 motion_ready(): stand_up (CMD_STAND_UP)
+→ 等 motion_enabled==True 才放行。恢复全程非阻塞、含重试；耗尽则
+abort_motion 落 MOTION_FAILED，避免速度白发后误报里程计/视觉故障。
 
 门控判据只信桥 latched 的 motion_enabled, 不看本进程的 _phase —— 栈是
 按需启停的 (supervisor 到终态 30s 后收栈), 泊出那一下往往由一个全新的
@@ -186,26 +185,32 @@ class ChargeMode:
                 self._phase = self.DONE
                 self._node.get_logger().info('passive accepted and settling elapsed; verify damping / charge current externally')
 
-    def motion_ready(self, now_ns: int) -> bool:
-        """True → 泊出盲退可以发车 (狗不在锁定/阻尼门控态)。
+    def motion_ready(self, now_ns: int, operation: str = '泊出') -> bool:
+        """True → 停泊/泊出可以发车 (狗不在锁定/阻尼门控态)。
 
-        _run_undock Case 2 每 tick 调用。
-        收尾进行中收到泊出请求 → 立即中断序列转 stand_up 恢复。
+        控制循环每 tick 调用；门控时异步请求 stand_up，等待桥发布
+        motion_enabled=True 后才放行。operation 仅用于现场诊断文案。
         """
         if not self._gated():
+            if self._phase == self.RECOVERING:
+                self._phase = self.IDLE if self._enable else self.DISABLED
+                self._step_tries = 0
+                self._step_future = None
+                self._node.get_logger().info(
+                    f'{operation}准备: motion_enabled=True, 运动模式已恢复')
             return True
 
         if self._phase != self.RECOVERING:
-            self._begin_recover(now_ns)
+            self._begin_recover(now_ns, operation)
             return False
 
-        # RECOVERING: 等 motion_enabled 变 True; 超时重发, 耗尽则中止泊出。
+        # RECOVERING: 等 motion_enabled 变 True; 超时重发, 耗尽则中止本次任务。
         if now_ns - self._step_req_ns > self._static_ack_ns:
             if self._step_tries <= self._retries:
                 self._send_stand(now_ns)
                 return False
             self._sm.abort_motion(
-                f'stand_up 超时, 无法从锁定/阻尼恢复运动模式 '
+                f'{operation}前 stand_up 超时, 无法从锁定/阻尼恢复运动模式 '
                 f'(重发 {self._step_tries} 次 × {self._static_ack_ns * 1e-9:.1f}s, '
                 f'motion_enabled={self._motion_enabled} '
                 f'posture_state={self._posture_state!r})',
@@ -291,7 +296,7 @@ class ChargeMode:
         self._phase = self.FAILED
         self._node.get_logger().warn(msg)
 
-    # ── 内部: 泊出恢复 ─────────────────────────────────────────────
+    # ── 内部: 运动模式恢复 ─────────────────────────────────────────
 
     def _gated(self) -> bool:
         """狗的 cmd_vel 是否被桥门控 (锁定/阻尼过)。
@@ -313,7 +318,7 @@ class ChargeMode:
             return False
         return True
 
-    def _begin_recover(self, now_ns: int) -> None:
+    def _begin_recover(self, now_ns: int, operation: str) -> None:
         # stand_up 要拿满自己的重试预算: _step_tries 可能残留 static/passive
         # 那一步的计数 (=1), 不清零会让首次 ack 超时就直接 abort ——
         # charge.retries 形同 0, 与模块头写的"含重试"不符。
@@ -322,7 +327,7 @@ class ChargeMode:
         # phase_name 正好自述"这次是从哪个相位被打断的"。原先只在
         # DAMPING/DONE 打印, 重启路径会静默恢复、留不下证据。
         self._node.get_logger().info(
-            f'泊出请求 → 中断充电收尾 ({self.phase_name}), '
+            f'{operation}请求 → 中断充电收尾 ({self.phase_name}), '
             f'恢复运动模式 (stand_up)')
         self._phase = self.RECOVERING
         self._send_stand(now_ns)

@@ -27,8 +27,8 @@ docking_node:
     # ── 充电收尾 (charge) — DOCKED 后 静止(锁定)→阻尼 ──
     # 停泊成功后狗站在充电桩上方, 锁定后切阻尼泄力, 保持站立 (不趴下):
     #   static_stand (静止锁定) → passive (阻尼泄电机, 站立)
-    # 收尾完成后 cmd_vel 被桥门控 (锁定/阻尼态), 泊出 /start_undock 会
-    # 自动 stand_up 恢复运动再盲退。
+    # cmd_vel 被桥门控 (锁定/阻尼态) 时，停泊 /start_docking 与泊出
+    # /start_undock 都会自动 stand_up，确认 motion_enabled=true 后再运动。
     charge.enable: true                       # 充电收尾总开关
     charge.passive: true                      # 阻尼(泄力)步开关 — 运行期可调 (锁定完成那一刻读参); false 时收尾止于锁定 (仅站立)
     charge.static_stand: false                # DOCKED 后先 static_stand 锁定再阻尼; false=跳过静止锁定, 直接阻尼 (passive, 站立泄力)
