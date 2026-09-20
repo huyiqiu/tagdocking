@@ -638,7 +638,12 @@ def main(args=None):
         node._stop.set()
         try:
             node.destroy_node()
-        except Exception:
+        except BaseException:
+            # 第二发 SIGINT 常正好落在 destroy_node() 的 C 调用 (destroy_when_not_in_use)
+            # 里, 抛的是 KeyboardInterrupt —— 它是 BaseException 而非 Exception,
+            # except Exception 抓不住, 会穿到 C 层清理触发 "FATAL: exception not
+            # rethrown" → abort() → 退出码 -6, launch 当成崩溃。这里连 BaseException
+            # 一起吞掉, 让关机体面退出。
             pass
         # SIGINT 有两条路到达本进程 (supervisor 逐 pid 发 + ros2 launch 收到后
         # 又向子进程转发一遍), 第二发把上下文关掉的时机能正好落在 ok() 检查与
@@ -648,7 +653,7 @@ def main(args=None):
         if rclpy.ok():
             try:
                 rclpy.shutdown()
-            except Exception:
+            except BaseException:
                 pass
 
 

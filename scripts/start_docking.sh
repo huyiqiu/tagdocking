@@ -63,6 +63,21 @@ set +u
 source "$ROS_SETUP"
 # shellcheck disable=SC1090
 source "$WS_SETUP"
+# ── DDS 传输环境: 必须与发布 odom 的 whale-nav 栈完全一致 ─────────────
+# odin 驱动 (发 /odin1/odometry_highfreq) 跑在 ROS_DOMAIN_ID=99 +
+# RMW_IMPLEMENTATION=rmw_zenoh_cpp 下。systemd 起的服务不继承 ~/.bashrc,
+# 不 source 这个 hook 就落在默认 domain 0 + fastrtps —— 与 odom 发布端既
+# 不同域也不同中间件, 永远发现不了话题, 停泊栈就绪检查必然超时
+# ("仍缺: odom 未收到")。这里 source 的是 whale_nav.sh 用的同一份 hook,
+# 保持单一真相来源: 站点日后改域/改 rmw, 两边同步不漂移。
+WHALE_NAV_ENV="/home/nvidia/whale-nav/scripts/whale_nav_env.sh"
+if [[ -f "$WHALE_NAV_ENV" ]]; then
+  # shellcheck disable=SC1090
+  source "$WHALE_NAV_ENV"
+else
+  echo "[start_docking] 警告: 找不到 $WHALE_NAV_ENV —— 未设置 ROS_DOMAIN_ID/RMW," >&2
+  echo "                停泊栈可能发现不了 /odin1 里程计话题。" >&2
+fi
 set -u
 
 start_supervisor() {
@@ -80,7 +95,17 @@ case "$MODE" in
     exec ros2 launch tagdocking docking.launch.py "$@"
     ;;
   supervisor)
-    exec ros2 run tagdocking docking_supervisor "$@"
+    # 不经 `ros2 run`: 它会 fork 出 docking_supervisor 这个 python 子进程, 于是
+    # systemd 的 MainPID 是 ros2 CLI 包装器, 而不是真正的 supervisor。KillMode=process
+    # + KillSignal=SIGINT 只打到包装器, supervisor python 收不到信号 —— 包装器被
+    # SIGKILL 后 python 变孤儿留在 cgroup 里, 它的空闲定时器照跑。每次 restart 都
+    # 叠一个孤儿, 多个 supervisor 并存互抢同一棵栈 (一个起栈、另一个 adopt、再一个
+    # "无人占用"把它 SIGINT 收掉), 正在停泊的栈就被中途打断。
+    # 直接 exec 装出来的可执行文件, 让 python 自己就是 MainPID: SIGINT 直达
+    # main() 的 _on_signal → node.shutdown() 有序收栈 (给 docking_node 留刷零速度的
+    # 时间) 后干净退出, 不留孤儿。这也正是手工 `./scripts/docking_supervisor` 能好
+    # 好工作的原因 —— 那条路本来就没有 ros2 run 包装器。
+    exec /home/nvidia/whale-nav/install/tagdocking/lib/tagdocking/docking_supervisor "$@"
     ;;
   web)
     exec ros2 run tagdocking docking_web --port "${WEB_PORT}"

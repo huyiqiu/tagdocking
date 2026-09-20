@@ -212,7 +212,7 @@ speed 默认 0.3 rad/s (≈ 17°/s).
                         help='旋转角度（度）。正=逆时针/左转, 负=顺时针/右转')
     parser.add_argument('--speed', type=float, default=0.3,
                         help='旋转角速度 (rad/s)，默认 0.3。降低可减少惯性误差')
-    parser.add_argument('--cmd-vel-topic', default='cmd_vel', help=argparse.SUPPRESS)
+    parser.add_argument('--cmd-vel-topic', default='/cmd_vel', help=argparse.SUPPRESS)
     parser.add_argument('--odom-topic', default='/odom', help=argparse.SUPPRESS)
     cli = parser.parse_args(argv)
 
