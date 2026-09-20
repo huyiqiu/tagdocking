@@ -337,7 +337,7 @@ def generate_launch_description():
         DeclareLaunchArgument('camera_frame',
                              default_value='camera_color_optical_frame',
                              description='Camera optical frame name'),
-        DeclareLaunchArgument('cmd_vel_topic', default_value='cmd_vel',
+        DeclareLaunchArgument('cmd_vel_topic', default_value='cmd_vel_dock',
                              description='Velocity command topic'),
 
         # ── 狗模式服务前缀 + 充电收尾 ─────────────────────────────

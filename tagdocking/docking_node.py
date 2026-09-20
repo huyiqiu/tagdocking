@@ -352,6 +352,19 @@ class DockingNode(Node):
         self.declare_parameter('charge.retries', 1)
         self.declare_parameter('charge.service_wait_sec', 1.0)
 
+        # 充电桩联动 (狗控制器 firefly 上的 XG 充电桩脚本, 经 SSH 一次性触发):
+        # DOCKED 后使能充电 (dog_lying_down), 泊出前断电 (dog_status_unknown)。
+        # 厂商二进制不自退出且状态锁存在桩端, 故用远端 timeout 兜一次性下发。
+        self.declare_parameter('charge.pile.enable', True)
+        self.declare_parameter('charge.pile.ssh_target', 'firefly@192.168.168.168')
+        self.declare_parameter(
+            'charge.pile.dir',
+            '/home/firefly/charge/charge_pile_xg_lib_v1.0.3b/dog_send_three_states')
+        self.declare_parameter('charge.pile.enable_bin', 'dog_lying_down')
+        self.declare_parameter('charge.pile.disable_bin', 'dog_status_unknown')
+        self.declare_parameter('charge.pile.run_timeout_sec', 6.0)
+        self.declare_parameter('charge.pile.ssh_connect_timeout_sec', 6)
+
         # Detection topic
         self.declare_parameter('detection_topic', '/detections')
         self.declare_parameter('odom_topic', '/odom_combined')
@@ -878,6 +891,8 @@ class DockingNode(Node):
             self._adapter.publish_stop()
             self._executor.cancel()
             self._charge.begin(now_ns)
+            # 停泊完成 → 一次性使能充电桩 (SSH dog_lying_down, 非阻塞)。
+            self._charge.pile_charge_on()
         # 进终态那一沿发一次结果 (成功/失败都发)。必须在 _prev_state 被覆盖
         # 之前算, _publish_outcome 要用它判这一轮是停泊还是泊出。
         if self._prev_state != state and self._sm.is_terminal:
@@ -1725,6 +1740,8 @@ class DockingNode(Node):
         response.success = ok
         response.message = f'state={self._sm.state_name}' if ok else 'docking active'
         if ok:
+            # 泊出前 → 一次性关闭充电桩 (SSH dog_status_unknown, 非阻塞), 先断电再动。
+            self._charge.pile_charge_off()
             self._executor.cancel()
             self._reset_maneuver()
             self._undock_phase = 0

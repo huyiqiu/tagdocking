@@ -18,7 +18,7 @@ docking_node:
     # ── Base ──
     # 机器狗 (ZSL-1) 是全向底盘: 横向偏差直接横移修正,
     # 经 l1w_control 的 /cmd_vel (vx/vy/wz) 下发。
-    base.cmd_vel_topic: "cmd_vel"
+    base.cmd_vel_topic: "/cmd_vel_dock"
     # 狗模式服务/状态话题前缀 (zsibot_l1_control, 节点名 l1w_control):
     # <prefix>/static_stand、<prefix>/stand_up、<prefix>/posture_state、
     # <prefix>/motion_enabled。备用桥 zsibot_bridge 无这些接口, 停用降级。
@@ -36,6 +36,20 @@ docking_node:
     charge.passive_settle_sec: 2.0            # s — passive 服务受理后等待 (非硬件阻尼反馈)
     charge.retries: 1                         # 次 — 每步服务重试
     charge.service_wait_sec: 1.0              # s — 无桥宽限, 超时降级告警 (DOCKED 仍为成功)
+
+    # ── 充电桩联动 (charge.pile) — SSH 到狗控制器 firefly 一次性触发 XG 充电桩脚本 ──
+    # DOCKED 后使能充电 (dog_lying_down), 泊出前断电 (dog_status_unknown)。
+    # 充电逻辑全在充电桩 MCU 一侧: 狗只发一个"狗状态"枚举, 桩子据极片接触自动
+    # 进入/退出充电, 状态锁存在桩端。厂商二进制是 while(1) 监控循环、永不自退出,
+    # 故用远端 `timeout` 兜住: 到时被杀而充电状态已锁存, 不影响充放电 (等价于
+    # 一次性指令、无需常驻)。免密 SSH + sudo NOPASSWD 已在 firefly 配好。
+    charge.pile.enable: true                  # 充电桩联动总开关 (台架无狗时可关, 关掉则不 SSH)
+    charge.pile.ssh_target: "firefly@192.168.168.168"
+    charge.pile.dir: "/home/firefly/charge/charge_pile_xg_lib_v1.0.3b/dog_send_three_states"
+    charge.pile.enable_bin: "dog_lying_down"      # 使能充电 (桩子进入充电)
+    charge.pile.disable_bin: "dog_status_unknown" # 关闭充电 (桩子给极片断电)
+    charge.pile.run_timeout_sec: 6.0          # s — 远端 timeout: 够多次 1Hz 重发确保送达后即结束
+    charge.pile.ssh_connect_timeout_sec: 6    # s — ssh ConnectTimeout, 连不上狗时快速失败告警
 
     # ── Stop-and-Go Parameters ──
     stopgo.jog_linear_rate: 0.08             # m/s — constant speed during forward jog

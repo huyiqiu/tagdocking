@@ -32,6 +32,9 @@ docking_node 发起, 它没参与过泊入, _phase 是 IDLE。桥 (zsibot_l1_con
 错误状态、绝不卡死控制循环。
 """
 
+import subprocess
+import threading
+
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 from std_msgs.msg import Bool, String
 from std_srvs.srv import Trigger
@@ -71,6 +74,21 @@ class ChargeMode:
         self._damp_settle_ns = int(float(node._p('charge.passive_settle_sec')) * 1e9)
         self._retries = int(node._p('charge.retries'))
         self._service_wait_ns = int(float(node._p('charge.service_wait_sec')) * 1e9)
+
+        # 充电桩使能/断电 (狗控制器 firefly 上的 XG 充电桩脚本, 经 SSH 一次性触发)。
+        # 这套与上面的"充电收尾姿态序列"完全正交: 收尾管 l1w_control 的锁定/阻尼
+        # 姿态, 这里管充电桩极片带不带电。充电状态锁存在桩子 MCU 一侧 (发一次
+        # dog_lying_down 即进入充电, 发一次 dog_status_unknown 即断电), 故只需
+        # 一次性把命令送达, 无需常驻 —— 用远端 timeout 兜住不自退出的厂商二进制。
+        self._pile_enable = bool(node._p('charge.pile.enable'))
+        self._pile_target = str(node._p('charge.pile.ssh_target'))
+        self._pile_dir = str(node._p('charge.pile.dir')).rstrip('/')
+        self._pile_on_bin = str(node._p('charge.pile.enable_bin'))
+        self._pile_off_bin = str(node._p('charge.pile.disable_bin'))
+        self._pile_run_timeout = float(node._p('charge.pile.run_timeout_sec'))
+        self._pile_ssh_ctimeout = int(float(node._p('charge.pile.ssh_connect_timeout_sec')))
+        if not self._pile_enable:
+            node.get_logger().info('充电桩联动已停用 (charge.pile.enable=false)')
 
         self._phase = self.DISABLED if not self._enable else self.IDLE
         if not self._enable:
@@ -313,6 +331,61 @@ class ChargeMode:
         self._step_tries += 1
         self._step_req_ns = now_ns
         self._step_future = self._cli_stand.call_async(Trigger.Request())
+
+    # ── 充电桩使能/断电 (SSH 一次性, 非阻塞) ───────────────────────
+
+    def pile_charge_on(self) -> None:
+        """DOCKED 入口: 触发充电桩使能 (dog_lying_down)。一次性、非阻塞。
+
+        桩子收到 DOG_LYING_DOWN + 极片接触良好即自动进入充电并锁存, 无需保活。
+        """
+        self._run_pile_cmd(self._pile_on_bin, '使能充电 (dog_lying_down)')
+
+    def pile_charge_off(self) -> None:
+        """泊出前: 触发充电桩断电 (dog_status_unknown)。一次性、非阻塞。
+
+        桩子收到 DOG_STATUS_UNKNOWN 即给极片断电并锁存。
+        """
+        self._run_pile_cmd(self._pile_off_bin, '关闭充电 (dog_status_unknown)')
+
+    def _run_pile_cmd(self, bin_name: str, label: str) -> None:
+        if not self._pile_enable:
+            return
+        # 厂商二进制是 while(1) 监控循环、永不自退出; 远端 timeout 到时发信号
+        # 结束它 —— 充电状态已在桩端锁存, 进程被杀不影响充放电。
+        remote = (f'sudo timeout {self._pile_run_timeout:g} '
+                  f'{self._pile_dir}/{bin_name} '
+                  f'> /tmp/charge_pile_last.log 2>&1')
+        argv = ['ssh', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=no',
+                '-o', f'ConnectTimeout={self._pile_ssh_ctimeout}',
+                self._pile_target, remote]
+        self._node.get_logger().info(f'充电桩: {label} → ssh {self._pile_target}')
+        try:
+            proc = subprocess.Popen(
+                argv, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        except Exception as exc:
+            self._node.get_logger().warn(f'充电桩: {label} 启动失败: {exc}')
+            return
+        # 后台收尸只为记日志, 绝不阻塞 20Hz 控制循环。
+        threading.Thread(
+            target=self._reap_pile, args=(proc, label), daemon=True).start()
+
+    def _reap_pile(self, proc: 'subprocess.Popen', label: str) -> None:
+        wait_s = self._pile_run_timeout + self._pile_ssh_ctimeout + 10
+        try:
+            _, err = proc.communicate(timeout=wait_s)
+        except Exception as exc:
+            proc.kill()
+            self._node.get_logger().warn(f'充电桩: {label} 等待异常, 已终止本地 ssh: {exc}')
+            return
+        rc = proc.returncode
+        # 124=远端 timeout 到时结束 (厂商二进制永不自退出, 这是正常结局);
+        # 137/143=SIGKILL/SIGTERM 收尾, 同属预期。其余 (如 255=SSH 连不上) 才告警。
+        if rc in (0, 124, 137, 143):
+            self._node.get_logger().info(f'充电桩: {label} 已下发 (exit={rc})')
+        else:
+            tail = (err or '').strip().splitlines()[-1:]
+            self._node.get_logger().warn(f'充电桩: {label} 失败 exit={rc} {tail}')
 
     # ── 内部 ───────────────────────────────────────────────────────
 
